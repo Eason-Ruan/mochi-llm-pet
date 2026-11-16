@@ -150,6 +150,31 @@ class DEvidenceValidationTests(unittest.TestCase):
         self.assertEqual(summary["status"], "passed")
         self.assertEqual(summary["trace_count_totals"]["failed_events"], 2)
 
+    def test_suite_rejects_unrelated_failed_and_timeout_receipts(self):
+        for kind, field, prefix in (
+            ("delivery.failed", "failed_events", "FAILED"),
+            ("delivery.timeout", "timeout_events", "TIMEOUT"),
+        ):
+            with self.subTest(kind=kind):
+                events = self.make_events()
+                events[-1]["kind"] = kind
+                events[-1]["task_version"] = 3
+                self.write_suite(events)
+
+                report_path = self.root / "report.json"
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                report["cases"][0]["outcomes"]["displays"] = 0
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+
+                summary = summarize_suite(self.root)
+                self.assertEqual(summary["status"], "failed")
+                errors = summary["cases"][0]["evidence_errors"]
+                self.assertTrue(
+                    any(f"{prefix}_TASK_MISMATCH" in error for error in errors),
+                    errors,
+                )
+                self.assertEqual(summary["trace_count_totals"][field], 0)
+
     def record_fixture_manifest(self):
         """Bind a synthetic test report to temporary source snapshots."""
         self.write_suite(self.make_events())
@@ -244,6 +269,186 @@ class DEvidenceValidationTests(unittest.TestCase):
         self.assertEqual(summary["status"], "failed")
         self.assertTrue(any("INPUT_CHANGED_DURING_RUN" in error
                             for error in summary["run_provenance"]["errors"]))
+
+
+class DScenarioPathValidationTests(unittest.TestCase):
+    """Reject unsafe scenario IDs before replay writes or summary reads."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_scenario_path_rejects_unsafe_ids(self):
+        from d_summarize_suite import safe_scenario_path
+
+        unsafe_ids = (
+            "D:",
+            r"D:\outside",
+            "../outside",
+            r"..\outside",
+            "/outside",
+            ".",
+            "..",
+            "",
+        )
+
+        for scenario_id in unsafe_ids:
+            with self.subTest(scenario_id=scenario_id):
+                with self.assertRaises(ValueError):
+                    safe_scenario_path(self.root, scenario_id)
+
+    def test_scenario_path_accepts_safe_id(self):
+        from d_summarize_suite import safe_scenario_path
+
+        actual = safe_scenario_path(
+            self.root, "cancel-before-due", "trace.jsonl"
+        )
+        expected = (
+            self.root / "cancel-before-due" / "trace.jsonl"
+        ).resolve()
+
+        self.assertEqual(actual, expected)
+
+
+class DDeliveryOutcomeValidationTests(unittest.TestCase):
+    """Failed/timeout receipts must refer to an earlier valid request."""
+
+    OUTCOMES = (
+        ("delivery.failed", "failed_events", "FAILED"),
+        ("delivery.timeout", "timeout_events", "TIMEOUT"),
+    )
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def make_pair(self, kind):
+        request = {
+            "run_id": "outcome-test-run",
+            "scenario_id": "outcome-check",
+            "delivery_id": "delivery-A",
+            "task_id": "water",
+            "task_version": 2,
+            "seq": 1,
+            "kind": "delivery.requested",
+        }
+        receipt = dict(request, kind=kind, seq=2)
+        return request, receipt
+
+    def count_events(self, events):
+        path = self.root / "trace.jsonl"
+        path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        return count_deliveries(path)
+
+    def assert_receipt_rejected(self, metrics, field, error_code):
+        self.assertEqual(metrics[field], 0)
+        self.assertTrue(
+            any(error_code in error for error in metrics["evidence_errors"]),
+            metrics["evidence_errors"],
+        )
+
+    def test_valid_failed_and_timeout_receipts_are_counted(self):
+        for kind, field, _ in self.OUTCOMES:
+            with self.subTest(kind=kind):
+                metrics = self.count_events(self.make_pair(kind))
+                self.assertEqual(metrics[field], 1)
+                self.assertEqual(metrics["request_events"], 1)
+                self.assertEqual(metrics["without_display_receipt"], 1)
+                self.assertEqual(metrics["evidence_errors"], [])
+
+    def test_orphan_failed_and_timeout_receipts_are_rejected(self):
+        for kind, field, prefix in self.OUTCOMES:
+            with self.subTest(kind=kind):
+                _, receipt = self.make_pair(kind)
+                metrics = self.count_events([receipt])
+                self.assert_receipt_rejected(
+                    metrics, field, f"{prefix}_WITHOUT_PRIOR_REQUEST"
+                )
+
+    def test_failed_and_timeout_task_or_version_mismatch_is_rejected(self):
+        for kind, field, prefix in self.OUTCOMES:
+            for identity_field, value in (
+                ("task_id", "another-task"),
+                ("task_version", 3),
+            ):
+                with self.subTest(kind=kind, identity_field=identity_field):
+                    request, receipt = self.make_pair(kind)
+                    receipt[identity_field] = value
+                    metrics = self.count_events([request, receipt])
+                    self.assert_receipt_rejected(
+                        metrics, field, f"{prefix}_TASK_MISMATCH"
+                    )
+
+    def test_failed_and_timeout_cannot_match_another_delivery_key(self):
+        for kind, field, prefix in self.OUTCOMES:
+            for key_field in ("run_id", "scenario_id", "delivery_id"):
+                with self.subTest(kind=kind, key_field=key_field):
+                    request, receipt = self.make_pair(kind)
+                    receipt[key_field] = "different-id"
+                    metrics = self.count_events([request, receipt])
+                    self.assert_receipt_rejected(
+                        metrics, field, f"{prefix}_WITHOUT_PRIOR_REQUEST"
+                    )
+
+    def test_failed_and_timeout_invalid_sequence_is_rejected(self):
+        for kind, field, prefix in self.OUTCOMES:
+            for seq in (0, 1, -1, None, True, "2"):
+                with self.subTest(kind=kind, seq=seq):
+                    request, receipt = self.make_pair(kind)
+                    receipt["seq"] = seq
+                    metrics = self.count_events([request, receipt])
+                    self.assert_receipt_rejected(
+                        metrics, field, f"{prefix}_ORDER_MISMATCH"
+                    )
+
+    def test_failed_and_timeout_before_request_are_rejected(self):
+        for kind, field, prefix in self.OUTCOMES:
+            with self.subTest(kind=kind):
+                request, receipt = self.make_pair(kind)
+                metrics = self.count_events([receipt, request])
+                self.assert_receipt_rejected(
+                    metrics, field, f"{prefix}_WITHOUT_PRIOR_REQUEST"
+                )
+
+    def test_failed_and_timeout_cannot_use_an_invalid_request(self):
+        for kind, field, prefix in self.OUTCOMES:
+            for request_field, value in (
+                ("task_id", None),
+                ("task_version", 0),
+                ("seq", None),
+            ):
+                with self.subTest(kind=kind, request_field=request_field):
+                    request, receipt = self.make_pair(kind)
+                    request[request_field] = value
+                    metrics = self.count_events([request, receipt])
+                    self.assert_receipt_rejected(
+                        metrics, field, f"{prefix}_WITHOUT_PRIOR_REQUEST"
+                    )
+
+    def test_failure_timeout_then_success_preserves_retry_history(self):
+        request, failed = self.make_pair("delivery.failed")
+        events = [
+            request,
+            failed,
+            dict(request, seq=3),
+            dict(request, kind="delivery.timeout", seq=4),
+            dict(request, seq=5),
+            dict(request, kind="delivery.displayed", seq=6),
+        ]
+        metrics = self.count_events(events)
+        self.assertEqual(metrics["request_events"], 3)
+        self.assertEqual(metrics["unique_deliveries"], 1)
+        self.assertEqual(metrics["retry_events"], 2)
+        self.assertEqual(metrics["failed_events"], 1)
+        self.assertEqual(metrics["timeout_events"], 1)
+        self.assertEqual(metrics["displayed_deliveries"], 1)
+        self.assertEqual(metrics["without_display_receipt"], 0)
+        self.assertEqual(metrics["evidence_errors"], [])
 
 
 if __name__ == "__main__":

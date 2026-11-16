@@ -4,6 +4,7 @@ Run from the repository root:
     python scripts/d_summarize_suite.py output/m0/d-suite-v1
 """
 
+import re
 import json
 import sys
 from collections import Counter
@@ -20,6 +21,24 @@ COUNT_FIELDS = (
     "failed_events",
 )
 
+def safe_scenario_path(root, scenario_id, *parts):
+    if (
+        not isinstance(scenario_id, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", scenario_id) is None
+    ):
+        raise ValueError(f"Invalid scenario ID: {scenario_id!r}")
+
+    root = Path(root).resolve()
+    target = (root / scenario_id).joinpath(*parts).resolve()
+
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError(
+            f"Scenario path escapes run directory: {scenario_id!r}"
+        ) from None
+
+    return target
 
 def summarize_suite(suite_path):
     suite_path = Path(suite_path)
@@ -36,11 +55,14 @@ def summarize_suite(suite_path):
     metrics_case_count = 0
     for case in cases:
         scenario_id = case["scenario_id"]
-        if (not scenario_id or scenario_id in {".", ".."}
-                or "/" in scenario_id or "\\" in scenario_id or scenario_id in seen):
+        trace_path = safe_scenario_path(
+            suite_path, scenario_id, "trace.jsonl"
+        )
+
+        if scenario_id in seen:
             raise ValueError(f"Invalid or repeated scenario ID: {scenario_id!r}")
+
         seen.add(scenario_id)
-        trace_path = suite_path / scenario_id / "trace.jsonl"
         row = {
             "scenario_id": scenario_id,
             "case_status": case["status"],

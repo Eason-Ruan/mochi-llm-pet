@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from d_run_evidence import finish_manifest, save_manifest, start_manifest
-from d_summarize_suite import summarize_suite
+from d_summarize_suite import safe_scenario_path, summarize_suite
 
 
 D_FILES = (
@@ -36,9 +36,12 @@ def run_recorded_replay(*, output, scenario=None, adapters="d-adapters.json"):
     scenarios = {}
     for path in paths:
         scenario_id = load_scenario(path).scenario_id
-        if (not scenario_id or scenario_id in {".", "..", "inputs"}
-                or "/" in scenario_id or "\\" in scenario_id or scenario_id in scenarios):
-            raise ValueError(f"Unsafe or duplicated scenario ID: {scenario_id!r}")
+        safe_scenario_path(output, scenario_id)
+
+        if scenario_id in scenarios:
+            raise ValueError(
+                f"Unsafe or duplicated scenario ID: {scenario_id!r}"
+            )
         scenarios[scenario_id] = path.resolve().relative_to(ROOT).as_posix()
     if not scenarios:
         raise ValueError("No scenarios were selected")

@@ -1,0 +1,239 @@
+{
+  "result_schema_version": "0.4",
+  "experiment_id": "result-format-demo",
+  "configuration_id": "none-demo",
+  "dataset_version": null,
+  "cohort_manifest_ref": null,
+  "evidence_type": "synthetic_example",
+  "example_only": true,
+  "as_of": "2026-11-16T05:00:00Z",
+  "results": [
+    {
+      "metric_id": "delivery.soft_window_first_display_rate",
+      "definition_version": "0.4",
+      "cohort_id": "window-demo",
+      "metric_type": "ratio",
+      "status": "computed",
+      "assessment": "not_evaluated",
+      "value_scope": "eligible_cohort",
+      "value": 0.5,
+      "unit": "fraction",
+      "currency": null,
+      "numerator": 1,
+      "denominator": 2,
+      "numerator_unit": "occurrence",
+      "denominator_unit": "occurrence",
+      "statistic": "scalar",
+      "quantile": null,
+      "quantile_method": null,
+      "sample_count": null,
+      "counts": {
+        "total_occurrences": 3,
+        "eligible_occurrences": 2
+      },
+      "excluded": {
+        "cancelled_before_first_display": 1
+      },
+      "evidence_missing": {
+        "delivery_evidence": {
+          "unit": "occurrence",
+          "count": 0,
+          "reason_counts": {}
+        }
+      },
+      "not_invited_reason_counts": null,
+      "coverage": {
+        "usable_occurrence_evidence": {
+          "unit": "occurrence",
+          "numerator": 2,
+          "denominator": 2,
+          "value": 1.0,
+          "status": "computed"
+        }
+      },
+      "warnings": []
+    },
+    {
+      "metric_id": "interruption.user_reported_rate",
+      "definition_version": "0.4",
+      "cohort_id": "experience-demo",
+      "metric_type": "ratio",
+      "status": "preliminary",
+      "assessment": "not_evaluated",
+      "value_scope": "observed_respondents",
+      "value": 0.6666666666666666,
+      "unit": "fraction",
+      "currency": null,
+      "numerator": 2,
+      "denominator": 3,
+      "numerator_unit": "rated_experience",
+      "denominator_unit": "rated_experience",
+      "statistic": "scalar",
+      "quantile": null,
+      "quantile_method": null,
+      "sample_count": null,
+      "counts": {
+        "eligible_experiences": 6,
+        "invited": 5,
+        "rated": 3,
+        "declined": 1,
+        "not_seen": 0,
+        "timed_out": 1,
+        "response_pending": 0,
+        "technical_error": 0,
+        "not_invited": 1,
+        "invitation_pending": 0
+      },
+      "excluded": {},
+      "evidence_missing": {
+        "experience_records": {
+          "unit": "experience",
+          "count": 0,
+          "reason_counts": {}
+        }
+      },
+      "not_invited_reason_counts": {
+        "no_user_interaction_before_deadline": 1
+      },
+      "coverage": {
+        "invitation": {
+          "unit": "experience",
+          "numerator": 5,
+          "denominator": 6,
+          "value": 0.8333333333333334,
+          "status": "computed"
+        },
+        "rated_response": {
+          "unit": "experience",
+          "numerator": 3,
+          "denominator": 5,
+          "value": 0.6,
+          "status": "computed"
+        },
+        "overall_rated": {
+          "unit": "experience",
+          "numerator": 3,
+          "denominator": 6,
+          "value": 0.5,
+          "status": "computed"
+        }
+      },
+      "warnings": [
+        {
+          "code": "NONRESPONSE_COVERAGE",
+          "message": "Only rated respondents contribute; do not generalize to every eligible experience."
+        }
+      ]
+    },
+    {
+      "metric_id": "cost.per_verified_displayed_occurrence",
+      "definition_version": "0.4",
+      "cohort_id": "cost-demo",
+      "metric_type": "cost",
+      "status": "computed",
+      "assessment": "not_evaluated",
+      "value_scope": "eligible_cohort",
+      "value": 0.6,
+      "unit": "currency_per_verified_displayed_occurrence",
+      "currency": "USD",
+      "numerator": 1.2,
+      "denominator": 2,
+      "numerator_unit": "currency",
+      "denominator_unit": "verified_displayed_occurrence",
+      "statistic": "scalar",
+      "quantile": null,
+      "quantile_method": null,
+      "sample_count": null,
+      "counts": {
+        "input_requests": 4,
+        "verified_displayed_occurrences": 2,
+        "late_displays": 1,
+        "user_completed_tasks": 1
+      },
+      "excluded": {},
+      "evidence_missing": {
+        "cost_accounting": {
+          "unit": "call",
+          "count": 0,
+          "reason_counts": {}
+        },
+        "delivery_evidence": {
+          "unit": "occurrence",
+          "count": 0,
+          "reason_counts": {}
+        }
+      },
+      "not_invited_reason_counts": null,
+      "coverage": {
+        "accounted_calls": {
+          "unit": "call",
+          "numerator": 5,
+          "denominator": 5,
+          "value": 1.0,
+          "status": "computed"
+        },
+        "occurrence_outcomes": {
+          "unit": "occurrence",
+          "numerator": 4,
+          "denominator": 4,
+          "value": 1.0,
+          "status": "computed"
+        }
+      },
+      "warnings": []
+    },
+    {
+      "metric_id": "latency.hard_due_p95",
+      "definition_version": "0.4",
+      "cohort_id": "latency-demo",
+      "metric_type": "duration",
+      "status": "preliminary",
+      "assessment": "not_evaluated",
+      "value_scope": "measured_subset",
+      "value": 900.0,
+      "unit": "ms",
+      "currency": null,
+      "numerator": null,
+      "denominator": null,
+      "numerator_unit": null,
+      "denominator_unit": null,
+      "statistic": "percentile",
+      "quantile": 0.95,
+      "quantile_method": "nearest_rank",
+      "sample_count": 3,
+      "counts": {
+        "eligible_timing_targets": 4,
+        "measured": 3,
+        "missing_latency": 1,
+        "timed_out": 0,
+        "early_render_violations": 0
+      },
+      "excluded": {},
+      "evidence_missing": {
+        "latency_measurements": {
+          "unit": "timing_target",
+          "count": 1,
+          "reason_counts": {
+            "missing_required_value": 1
+          }
+        }
+      },
+      "not_invited_reason_counts": null,
+      "coverage": {
+        "latency_measurements": {
+          "unit": "timing_target",
+          "numerator": 3,
+          "denominator": 4,
+          "value": 0.75,
+          "status": "computed"
+        }
+      },
+      "warnings": [
+        {
+          "code": "LATENCY_COVERAGE_GAP",
+          "message": "P95 uses three observed latencies [100, 200, 900] ms; one eligible target is missing."
+        }
+      ]
+    }
+  ]
+}

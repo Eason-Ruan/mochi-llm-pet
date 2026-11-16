@@ -7,8 +7,9 @@ import json
 import sys
 from pathlib import Path
 
+
 def count_deliveries(trace_path):
-    """Read a trace and return counts, without printing or writing a report."""
+    """Count requests and validated receipts; report unusable receipt evidence."""
     trace_path = Path(trace_path)
     request_events = 0
     timeout_events = 0
@@ -54,31 +55,39 @@ def count_deliveries(trace_path):
                     )
             else:
                 requests[key] = (identity, seq)
-        elif kind == "delivery.displayed":
+        else:
+            # A receipt is usable only when it matches an earlier valid request.
+            receipt_type = {
+                "delivery.displayed": "DISPLAY",
+                "delivery.timeout": "TIMEOUT",
+                "delivery.failed": "FAILED",
+            }[kind]
             request = requests.get(key)
             if request is None:
                 evidence_errors.append(
-                    f"DISPLAY_WITHOUT_PRIOR_REQUEST at seq {seq}: "
+                    f"{receipt_type}_WITHOUT_PRIOR_REQUEST at seq {seq}: "
                     f"{event['delivery_id']} has no earlier valid request"
                 )
                 continue
             if request[0] != identity:
                 evidence_errors.append(
-                    f"DISPLAY_TASK_MISMATCH at seq {seq}: "
+                    f"{receipt_type}_TASK_MISMATCH at seq {seq}: "
                     f"{event['delivery_id']} has a different task_id or task_version"
                 )
                 continue
             if type(seq) is not int or seq <= request[1]:
                 evidence_errors.append(
-                    f"DISPLAY_ORDER_MISMATCH at line {line_number}: "
+                    f"{receipt_type}_ORDER_MISMATCH at line {line_number}: "
                     f"{event['delivery_id']} must follow its request"
                 )
                 continue
-            displayed_ids.add(key)
-        elif kind == "delivery.timeout":
-            timeout_events += 1
-        elif kind == "delivery.failed":
-            failed_events += 1
+
+            if kind == "delivery.displayed":
+                displayed_ids.add(key)
+            elif kind == "delivery.timeout":
+                timeout_events += 1
+            else:
+                failed_events += 1
 
     return {
         "trace_path": str(trace_path),
