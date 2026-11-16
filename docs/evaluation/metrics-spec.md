@@ -93,6 +93,19 @@ Subtract timestamps only when they share a comparable monotonic clock in the sam
 
 `delivery.requested -> displayed` omits due-to-request scheduling delay and is not full due latency. Coordinate the missing instrumentation with A/B/C; these are required future measurement points, not claims about existing events.
 Use nearest-rank percentiles: the sorted value at rank ceil(p*n), with p=0.50 or 0.95. Report missing/timeouts separately instead of presenting percentiles alone.
+For `latency.hard_due_p95`, `counts.missing_latency` counts distinct eligible timing targets
+whose required latency pair is missing or unusable. It must equal
+`evidence_missing.latency_measurements.count`; an unestablished missing-pair inventory
+uses null in both fields, not an exact count in one and unknown in the other.
+The domain's primary reason counts partition those same targets using section 5.1.1's
+priority order. A missing required timestamp in an otherwise valid, linked record uses
+`missing_required_value`; a missing record, invalid record, or missing linkage retains its
+higher-priority reason. A valid negative due-to-render difference is an early-render
+violation, not missing evidence solely because it is excluded from nonnegative percentiles.
+`not_applicable` for this P95 requires an established `eligible_timing_targets=0` and
+`measured=0`. A nonempty population with no usable timing observations has a null value
+and `insufficient_evidence` when measurement evidence is missing. If measurement was not
+executed, use `not_measured` with unknown measurement/evidence counts instead of zeros.
 Project targets are GUI response <100 ms and hard-reminder P95 <1 s. Current replay evidence does not verify these targets. Review focus-stealing behavior separately.
 
 ### 4.4 Interruption and state estimation

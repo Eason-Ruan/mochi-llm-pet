@@ -82,6 +82,15 @@ The example deliberately contains two preliminary metrics. Its interruption rati
 only three of six experiences, and its latency measurements cover only three of four targets.
 Those statuses must remain preliminary; changing them to computed does not repair coverage.
 
+For P95, `counts.missing_latency` and `evidence_missing.latency_measurements.count` must
+match, including null when that inventory is unknown. Primary reason counts partition the
+same affected timing targets. Missing required timestamps use `missing_required_value`
+unless a higher-priority record/linkage error applies. Early renders remain separate.
+`not_applicable` requires a known empty eligible population and zero measured samples.
+Four eligible targets with four missing pairs require a null `insufficient_evidence`
+result, not `not_applicable`. An experiment that never measured latency remains
+`not_measured`, with unknown measurement/evidence counts.
+
 ## 4. Evidence boundary
 
 The checker validates only the declarations and internal arithmetic in one report. It does

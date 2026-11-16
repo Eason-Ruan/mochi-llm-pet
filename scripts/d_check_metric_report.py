@@ -346,17 +346,20 @@ def check_metric(result, path):
         c = result["counts"]
         need(result["sample_count"] == c["measured"], path, "percentile sample count does not match measured count")
         coverage_matches(result, "latency_measurements", "timing_target", c["measured"], c["eligible_timing_targets"], path)
+        missing = result["evidence_missing"]["latency_measurements"]["count"]
+        need(c["missing_latency"] == missing, path + ".counts.missing_latency",
+             "must match the latency evidence-gap count, including an unknown inventory")
         eligible = c["eligible_timing_targets"]
         if eligible is not None:
             for key in ("missing_latency", "timed_out", "early_render_violations"):
                 if c[key] is not None:
                     need(c[key] <= eligible, path + ".counts." + key, "count exceeds eligible timing targets")
-            missing = result["evidence_missing"]["latency_measurements"]["count"]
             if missing is not None and c["measured"] is not None:
                 need(missing <= eligible - c["measured"], path,
                      "missing timing evidence overlaps declared valid measurements")
         if status == "not_applicable":
-            need(c["measured"] == 0, path, "not-applicable percentile requires no measured samples")
+            need(eligible == 0 and c["measured"] == 0, path,
+                 "not-applicable percentile requires an established empty eligible population and no measured samples")
         if value is not None:
             need(c["eligible_timing_targets"] is not None, path, "latency population must be known")
             if c["measured"] < c["eligible_timing_targets"]:

@@ -214,8 +214,72 @@ class MetricReportTests(unittest.TestCase):
                 self.rejected()
 
     def test_latency_gap_cannot_overlap_valid_measurements(self):
-        self.result(3)["evidence_missing"]["latency_measurements"].update(count=2, reason_counts={"missing_required_value": 2})
+        result = self.result(3)
+        result["counts"]["missing_latency"] = 2
+        result["evidence_missing"]["latency_measurements"].update(count=2, reason_counts={"missing_required_value": 2})
         self.rejected()
+
+    def test_missing_latency_cannot_be_hidden_by_a_zero_evidence_gap(self):
+        result = self.result(3)
+        result["evidence_missing"]["latency_measurements"].update(count=0, reason_counts={})
+        self.rejected()
+        result["counts"]["missing_latency"] = 0
+        result["evidence_missing"]["latency_measurements"].update(count=1, reason_counts={"missing_required_value": 1})
+        self.rejected()
+
+    def test_latency_missing_count_includes_each_primary_evidence_reason(self):
+        result = self.result(3)
+        for reason in sorted(checker.GAP_REASONS):
+            with self.subTest(reason=reason):
+                result["evidence_missing"]["latency_measurements"]["reason_counts"] = {reason: 1}
+                self.assertEqual(checker.validate_report(self.report)["status"], "passed")
+
+    def test_unknown_latency_inventory_cannot_claim_an_exact_missing_count(self):
+        result = self.result(3)
+        result["evidence_missing"]["latency_measurements"].update(count=None, reason_counts=None)
+        result["warnings"].append({"code": "EVIDENCE_INVENTORY_UNKNOWN", "message": "Missing timing inventory is unknown."})
+        self.rejected()
+        result["counts"]["missing_latency"] = None
+        self.assertEqual(checker.validate_report(self.report)["status"], "passed")
+
+    def test_nonempty_latency_population_without_samples_is_insufficient(self):
+        result = self.result(3)
+        self.unavailable(result, "not_applicable")
+        result["sample_count"] = 0
+        result["counts"].update(measured=0, missing_latency=4)
+        result["evidence_missing"]["latency_measurements"].update(count=4, reason_counts={"missing_required_value": 4})
+        result["coverage"]["latency_measurements"].update(numerator=0, value=0.0)
+        self.rejected()
+        self.unavailable(result, "insufficient_evidence")
+        self.assertEqual(checker.validate_report(self.report)["status"], "passed")
+
+    def test_empty_latency_population_can_be_not_applicable(self):
+        result = self.result(3)
+        self.unavailable(result, "not_applicable")
+        result["sample_count"] = 0
+        result["counts"].update(eligible_timing_targets=0, measured=0, missing_latency=0)
+        result["evidence_missing"]["latency_measurements"].update(count=0, reason_counts={})
+        result["coverage"]["latency_measurements"].update(numerator=0, denominator=0, value=None, status="not_applicable")
+        self.assertEqual(checker.validate_report(self.report)["status"], "passed")
+
+    def test_unknown_latency_population_cannot_be_not_applicable(self):
+        result = self.result(3)
+        self.unavailable(result, "not_applicable")
+        result["warnings"].append({"code": "EVIDENCE_INVENTORY_UNKNOWN", "message": "Timing population was not established."})
+        result["sample_count"] = 0
+        result["counts"].update(eligible_timing_targets=None, measured=0, missing_latency=None)
+        result["evidence_missing"]["latency_measurements"].update(count=None, reason_counts=None)
+        result["coverage"]["latency_measurements"].update(numerator=0, denominator=None, value=None, status="insufficient_evidence")
+        self.rejected()
+
+    def test_unexecuted_latency_measurement_remains_not_measured(self):
+        result = self.result(3)
+        self.unavailable(result, "not_measured")
+        result["sample_count"] = None
+        result["counts"].update(measured=None, missing_latency=None, timed_out=None, early_render_violations=None)
+        result["evidence_missing"]["latency_measurements"].update(count=None, reason_counts=None)
+        result["coverage"]["latency_measurements"].update(numerator=None, value=None, status="insufficient_evidence")
+        self.assertEqual(checker.validate_report(self.report)["status"], "passed")
 
     def test_duplicate_metric_cohort_and_version_is_rejected(self):
         self.report["results"].append(copy.deepcopy(self.report["results"][0]))
@@ -269,6 +333,22 @@ class MetricReportTests(unittest.TestCase):
             completed = subprocess.run([sys.executable, str(SCRIPT), str(path)], capture_output=True, text=True)
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(json.loads(completed.stdout)["status"], "failed")
+            self.assertEqual(completed.stderr, "")
+
+    def test_cli_accepts_valid_contract_with_failed_acceptance_assessment(self):
+        self.result(0)["assessment"] = "failed"
+        self.report.update(example_only=False, evidence_type="native_scenario",
+                           dataset_version="fixture-v1", cohort_manifest_ref="fixture-manifest.json")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "valid-contract-failed-assessment.json"
+            path.write_text(json.dumps(self.report), encoding="ascii")
+            completed = subprocess.run([sys.executable, str(SCRIPT), str(path)], capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "passed")
+            self.assertEqual(summary["metric_status_counts"], {"computed": 1})
+            self.assertEqual(summary["source_evidence_verification"], "not_performed")
+            self.assertEqual(checker.load_report(path)["results"][0]["assessment"], "failed")
             self.assertEqual(completed.stderr, "")
 
 
