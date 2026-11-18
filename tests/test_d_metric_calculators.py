@@ -151,11 +151,11 @@ class MetricCalculatorTests(unittest.TestCase):
 
     def test_semantics_eligible_count_matches_dataset(self):
         report, audit = calculate_semantics_report(DATASET)
-        self.assertEqual(audit["eligible_request_count"], 6)
+        self.assertEqual(audit["eligible_request_count"], 0)
         self.assertEqual(audit["double_annotated_samples"], 0)
         for result in report["results"]:
-            self.assertEqual(result["counts"]["eligible_requests"], 6)
-            self.assertEqual(result["coverage"]["prediction_records"]["denominator"], 6)
+            self.assertEqual(result["counts"]["eligible_requests"], 0)
+            self.assertEqual(result["coverage"]["prediction_records"]["denominator"], 0)
 
     def test_semantics_cli_produces_report(self):
         output = self.base / "sem-out"

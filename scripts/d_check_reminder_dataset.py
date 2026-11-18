@@ -30,6 +30,41 @@ def aware_time(value, field):
     return instant
 
 
+def _validate_gold(gold, intent, behavior, fields, context, sample_id, reference):
+    """Validate a gold label structure against intent/behavior; return the TaskDraft or None."""
+    if behavior == "clarify":
+        require(gold is None and bool(fields), f"{sample_id}: clarify needs null gold and missing fields")
+        require(context is None and intent == "create",
+                f"{sample_id}: this pilot's clarification case is a new request")
+        return None
+    require(isinstance(gold, dict) and not fields, f"{sample_id}: parse needs gold and no clarification fields")
+    if intent == "create":
+        require(context is None, f"{sample_id}: create sample must not edit a context task")
+        draft = TaskDraft.model_validate(gold)
+    else:
+        expected_fields = {"task_id", "expected_version"} | ({"draft"} if intent == "edit" else set())
+        require(set(gold) == expected_fields, f"{sample_id}: incorrect gold fields for {intent}")
+        require(type(gold["expected_version"]) is int, f"{sample_id}: version must be an integer")
+        require(isinstance(context, dict) and isinstance(context.get("tasks"), list),
+                f"{sample_id}: edit/cancel requires task context")
+        tasks = [TaskView.model_validate(task) for task in context["tasks"]]
+        require(len({task.task_id for task in tasks}) == len(tasks), f"{sample_id}: duplicate context task IDs")
+        matches = [task for task in tasks if task.task_id == gold["task_id"]]
+        require(len(matches) == 1, f"{sample_id}: target task not found uniquely")
+        task = matches[0]
+        require(task.status == "registered" and task.version == gold["expected_version"],
+                f"{sample_id}: target is not the registered expected version")
+        require(task.confirmed_at is not None and task.confirmed_at <= reference,
+                f"{sample_id}: task must already be confirmed at the reference time")
+        payload = {"draft": gold["draft"]} if intent == "edit" else {}
+        TaskCommand.model_validate(dict(command_id=sample_id, kind=intent,
+            task_id=gold["task_id"], expected_version=gold["expected_version"], payload=payload))
+        draft = TaskDraft.model_validate(gold["draft"]) if intent == "edit" else None
+    if draft is not None:
+        require(draft.earliest_at >= reference, f"{sample_id}: draft begins before this pilot's reference time")
+    return draft
+
+
 def validate_dataset(data):
     """Validate this pilot's format; it intentionally accepts only draft dev data."""
     require(isinstance(data, dict), "Dataset must be an object")
@@ -120,38 +155,12 @@ def validate_dataset(data):
         fields = row.get("clarification_fields")
         require(isinstance(fields, list) and all(isinstance(x, str) and x.strip() for x in fields),
                 f"{sample_id}: invalid clarification_fields")
-        if behavior == "clarify":
-            require(gold is None and bool(fields), f"{sample_id}: clarify needs null gold and missing fields")
-            require(row.get("context") is None and intent == "create",
-                    f"{sample_id}: this pilot's clarification case is a new request")
-            continue
-
-        require(isinstance(gold, dict) and not fields, f"{sample_id}: parse needs gold and no clarification fields")
-        if intent == "create":
-            require(row.get("context") is None, f"{sample_id}: create sample must not edit a context task")
-            draft = TaskDraft.model_validate(gold)
-        else:
-            expected_fields = {"task_id", "expected_version"} | ({"draft"} if intent == "edit" else set())
-            require(set(gold) == expected_fields, f"{sample_id}: incorrect gold fields for {intent}")
-            require(type(gold["expected_version"]) is int, f"{sample_id}: version must be an integer")
-            context = row.get("context")
-            require(isinstance(context, dict) and isinstance(context.get("tasks"), list),
-                    f"{sample_id}: edit/cancel requires task context")
-            tasks = [TaskView.model_validate(task) for task in context["tasks"]]
-            require(len({task.task_id for task in tasks}) == len(tasks), f"{sample_id}: duplicate context task IDs")
-            matches = [task for task in tasks if task.task_id == gold["task_id"]]
-            require(len(matches) == 1, f"{sample_id}: target task not found uniquely")
-            task = matches[0]
-            require(task.status == "registered" and task.version == gold["expected_version"],
-                    f"{sample_id}: target is not the registered expected version")
-            require(task.confirmed_at is not None and task.confirmed_at <= reference,
-                    f"{sample_id}: task must already be confirmed at the reference time")
-            payload = {"draft": gold["draft"]} if intent == "edit" else {}
-            TaskCommand.model_validate(dict(command_id=sample_id, kind=intent,
-                task_id=gold["task_id"], expected_version=gold["expected_version"], payload=payload))
-            draft = TaskDraft.model_validate(gold["draft"]) if intent == "edit" else None
-        if draft is not None:
-            require(draft.earliest_at >= reference, f"{sample_id}: draft begins before this pilot's reference time")
+        context = row.get("context")
+        _validate_gold(gold, intent, behavior, fields, context, sample_id, reference)
+        annotator_a = row.get("annotator_a")
+        if isinstance(annotator_a, dict) and "gold" in annotator_a:
+            _validate_gold(annotator_a["gold"], intent, behavior, fields, context,
+                           f"{sample_id}.annotator_a", reference)
 
     for row in samples:
         context = row.get("context")

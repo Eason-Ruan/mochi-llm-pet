@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "dataset_version": "pilot-en-v0.1",
-  "description": "Six synthetic development samples for D. Draft labels require human review.",
+  "description": "Six synthetic development samples for D. Single-annotator human review is complete; not double-annotated.",
   "split": "dev",
   "origin": "synthetic_fixture",
   "label_origin": "ai_draft",

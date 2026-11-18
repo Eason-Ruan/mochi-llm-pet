@@ -89,7 +89,7 @@ def calculate_semantics_report(dataset_path, predictions_path=None):
     summary = validate_dataset(data)
     require(summary["status"] == "passed", "Dataset structure check failed")
     samples = data["samples"]
-    eligible = [s for s in samples if s["annotation_status"] in {"single_annotator_dev", "double_annotated"}]
+    eligible = [s for s in samples if s["annotation_status"] == "double_annotated"]
     cohort_id = "request-semantics:" + sha256(
         dataset_path.read_bytes()).hexdigest()[:16]
     results = [not_measured_result(mid, cohort_id, len(eligible)) for mid in METRIC_IDS]
@@ -100,8 +100,8 @@ def calculate_semantics_report(dataset_path, predictions_path=None):
         "dataset_version": data["dataset_version"],
         "cohort_manifest_ref": str(dataset_path.name),
         "evidence_type": "synthetic_replay", "example_only": False,
-        "as_of": max((s.get("annotator_a", {}) or {}).get("annotated_at", "1970-01-01T00:00:00+00:00")
-                     for s in eligible),
+        "as_of": max(((s.get("annotator_a") or {}).get("annotated_at", "1970-01-01T00:00:00+00:00")
+                      for s in samples), default="1970-01-01T00:00:00+00:00"),
         "results": results,
     }
     validate_report(report)
@@ -119,7 +119,7 @@ def calculate_semantics_report(dataset_path, predictions_path=None):
             {"request_sample_id": s["request_sample_id"], "intent": s["intent"],
              "expected_behavior": s["expected_behavior"],
              "annotation_status": s["annotation_status"],
-             "assessable_fields": field_list(s.get("gold"))}
+             "assessable_fields": field_list((s.get("annotator_a") or {}).get("gold") or s.get("gold"))}
             for s in eligible
         ],
     }
