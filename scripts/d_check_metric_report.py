@@ -34,6 +34,12 @@ PROFILES = {
         "count", "violation", None, {"delivery_evidence": "occurrence"}),
     "delivery.duplicate_render_violations": (
         "count", "violation", None, {"delivery_evidence": "occurrence"}),
+    "interruption.soft_opportunity_conflict_rate": (
+        "ratio", "fraction", "display", {"state_evidence": "display"}),
+    "estimation.base_estimate_accuracy": (
+        "ratio", "fraction", "sample", {"state_evidence": "sample"}),
+    "work.outcome_confirmation_coverage": (
+        "ratio", "fraction", "session", {"outcome_evidence": "session"}),
 }
 GAP_REASONS = {"missing_record", "invalid_record", "missing_linkage", "missing_required_value"}
 INVITATION_REASONS = {
@@ -388,6 +394,27 @@ def check_metric(result, path):
         need(result["value"] == c["violations"], path, "count value must equal violations count")
         if status == "computed":
             need(full_evidence(result), path, "violation count requires complete delivery evidence")
+
+    elif metric == "interruption.soft_opportunity_conflict_rate":
+        require_counts(result, {"eligible_displays", "conflict_displays"}, path)
+        need(result["denominator"] == result["counts"]["eligible_displays"], path,
+             "conflict rate denominator is eligible opportunity displays")
+        if status == "computed":
+            need(full_evidence(result), path, "conflict rate requires complete state evidence")
+
+    elif metric == "estimation.base_estimate_accuracy":
+        require_counts(result, {"eligible_samples", "correct_samples"}, path)
+        need(result["denominator"] == result["counts"]["eligible_samples"], path,
+             "base-estimate denominator is eligible labeled samples")
+        if status == "computed":
+            need(full_evidence(result), path, "base-estimate accuracy requires complete label evidence")
+
+    elif metric == "work.outcome_confirmation_coverage":
+        require_counts(result, {"eligible_sessions", "confirmed_sessions"}, path)
+        need(result["denominator"] == result["counts"]["eligible_sessions"], path,
+             "outcome coverage denominator is eligible ended sessions")
+        if status == "computed":
+            need(full_evidence(result), path, "outcome coverage requires complete review evidence")
 
     else:
         require_counts(result, {"eligible_timing_targets", "measured", "missing_latency", "timed_out", "early_render_violations"}, path)

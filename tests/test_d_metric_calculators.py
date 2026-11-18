@@ -16,6 +16,8 @@ from d_calculate_cost import calculate_cost_report, write_analysis as write_cost
 from d_calculate_interruption import calculate_interruption_report, write_analysis as write_interruption
 from d_calculate_semantics import calculate_semantics_report, write_analysis as write_semantics
 from d_calculate_delivery_violations import calculate_violations_report, write_analysis as write_violations
+from d_calculate_state_estimation import calculate_state_estimation_report, write_analysis as write_state_estimation
+from d_calculate_work_outcomes import calculate_work_outcomes_report, write_analysis as write_work_outcomes
 from d_replay import run_recorded_replay
 
 
@@ -199,6 +201,46 @@ class MetricCalculatorTests(unittest.TestCase):
         output = self.base / "viol-out"
         result = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "d_calculate_delivery_violations.py"),
+             str(suite), "--output", str(output)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((output / "metric-report.json").exists())
+
+    def test_state_estimation_report_validates(self):
+        report, _ = calculate_state_estimation_report(self.full_suite())
+        self.assertEqual(validate_report(report)["status"], "passed")
+        ids = {r["metric_id"] for r in report["results"]}
+        self.assertEqual(ids, {
+            "interruption.soft_opportunity_conflict_rate",
+            "estimation.base_estimate_accuracy",
+        })
+        for result in report["results"]:
+            self.assertEqual(result["status"], "not_measured")
+            self.assertIsNone(result["value"])
+
+    def test_state_estimation_cli_produces_report(self):
+        suite = self.full_suite()
+        output = self.base / "state-out"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "d_calculate_state_estimation.py"),
+             str(suite), "--output", str(output)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((output / "metric-report.json").exists())
+
+    def test_work_outcomes_report_validates(self):
+        report, _ = calculate_work_outcomes_report(self.full_suite())
+        self.assertEqual(validate_report(report)["status"], "passed")
+        metric = report["results"][0]
+        self.assertEqual(metric["metric_id"], "work.outcome_confirmation_coverage")
+        self.assertEqual(metric["status"], "not_measured")
+        self.assertIsNone(metric["value"])
+
+    def test_work_outcomes_cli_produces_report(self):
+        suite = self.full_suite()
+        output = self.base / "work-out"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "d_calculate_work_outcomes.py"),
              str(suite), "--output", str(output)],
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
