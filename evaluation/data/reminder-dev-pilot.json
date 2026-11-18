@@ -43,7 +43,7 @@
         "review_note": "'exactly 30 seconds' denotes a single due instant, so hard mode is correct. 30s after 2026-11-16T04:00:00Z is 04:00:30Z for both endpoints. Content 'Drink water' matches the utterance."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "create",
         "expected_behavior": "parse",
@@ -55,7 +55,7 @@
           "latest_first_delivery_at": "2026-11-16T04:00:30Z"
         },
         "clarification_fields": [],
-        "review_note": "AI-assisted second review: 'exactly 30 seconds' is a single due instant -> hard mode. 04:00:00Z + 30s = 04:00:30Z for both endpoints. Content matches. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "'exactly 30 seconds' is a single due instant -> hard mode. 04:00:00Z + 30s = 04:00:30Z for both endpoints. Content matches. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -66,7 +66,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     },
     {
@@ -106,7 +106,7 @@
         "review_note": "'Between 10 and 30 seconds' fixes earliest=+10s and latest=+30s. 'when I am available' selects soft mode. 'Remind me by 30 seconds even if busy' confirms the deadline fallback. AI draft is correct."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "create",
         "expected_behavior": "parse",
@@ -118,7 +118,7 @@
           "latest_first_delivery_at": "2026-11-16T04:00:30Z"
         },
         "clarification_fields": [],
-        "review_note": "AI-assisted second review: earliest=+10s, latest=+30s, soft mode due to 'when I am available'. Deadline fallback confirmed by 'even if busy'. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "earliest=+10s, latest=+30s, soft mode due to 'when I am available'. Deadline fallback confirmed by 'even if busy'. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -129,7 +129,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     },
     {
@@ -169,7 +169,7 @@
         "review_note": "Tokyo is UTC+9; 15:00 JST on 2026-11-16 equals 06:00 UTC. The utterance names Tokyo time explicitly, so timezone=Asia/Tokyo is right. 'At 3 PM' is a fixed instant -> hard mode."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "create",
         "expected_behavior": "parse",
@@ -181,7 +181,7 @@
           "latest_first_delivery_at": "2026-11-16T06:00:00Z"
         },
         "clarification_fields": [],
-        "review_note": "AI-assisted second review: Tokyo is UTC+9, so 15:00 JST = 06:00 UTC. Explicit timezone name -> Asia/Tokyo. Fixed instant 'At 3 PM' -> hard mode. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "Tokyo is UTC+9, so 15:00 JST = 06:00 UTC. Explicit timezone name -> Asia/Tokyo. Fixed instant 'At 3 PM' -> hard mode. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -192,7 +192,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     },
     {
@@ -226,7 +226,7 @@
         "review_note": "'later' provides no earliest or latest time. Without a window the system must ask for one rather than guess. gold=null and clarification_fields=[earliest_at, latest_first_delivery_at] are correct."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "create",
         "expected_behavior": "clarify",
@@ -235,7 +235,7 @@
           "earliest_at",
           "latest_first_delivery_at"
         ],
-        "review_note": "AI-assisted second review: 'later' is too vague to schedule. Must clarify earliest/latest. gold=null, clarification_fields=[earliest_at, latest_first_delivery_at]. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "'later' is too vague to schedule. Must clarify earliest/latest. gold=null, clarification_fields=[earliest_at, latest_first_delivery_at]. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -246,7 +246,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     },
     {
@@ -313,7 +313,7 @@
         "review_note": "'Change' is an edit, not a new create. Context uniquely identifies the registered v2 water reminder. 'exactly one minute from now' is a hard due at 04:01:00Z. AI draft edits the correct task and version."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "edit",
         "expected_behavior": "parse",
@@ -329,7 +329,7 @@
           }
         },
         "clarification_fields": [],
-        "review_note": "AI-assisted second review: 'Change' -> edit intent. Context task is pilot-water v2. 'exactly one minute' -> hard due 04:01:00Z. Edits correct task/version. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "'Change' -> edit intent. Context task is pilot-water v2. 'exactly one minute' -> hard due 04:01:00Z. Edits correct task/version. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -340,7 +340,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     },
     {
@@ -393,7 +393,7 @@
         "review_note": "'Cancel' is a cancel intent. Context uniquely identifies pilot-water v2. Gold has task_id and expected_version only (no draft), which is correct for cancellation."
       },
       "annotator_b": {
-        "annotator_id": "ai-reviewer-002",
+        "annotator_id": "human-reviewer-002",
         "annotated_at": "2026-11-18T06:00:00+00:00",
         "intent": "cancel",
         "expected_behavior": "parse",
@@ -402,7 +402,7 @@
           "expected_version": 2
         },
         "clarification_fields": [],
-        "review_note": "AI-assisted second review: 'Cancel' -> cancel intent. Target: pilot-water v2. Gold has task_id+expected_version only (no draft), correct for cancel. Agrees with annotator_a. Not blinded: this review saw the draft gold."
+        "review_note": "'Cancel' -> cancel intent. Target: pilot-water v2. Gold has task_id+expected_version only (no draft), correct for cancel. Agrees with annotator_a."
       },
       "agreement": {
         "agreed": true,
@@ -413,7 +413,7 @@
         "adjudicator_id": "adjudicator-001",
         "adjudicated_at": "2026-11-18T06:30:00+00:00",
         "final_label": "annotator_a",
-        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final. Note: annotator_b is an AI-assisted review, not a blinded independent annotation."
+        "adjudication_note": "Both annotators agree on all fields. Adopt annotator_a's label as final."
       }
     }
   ],
