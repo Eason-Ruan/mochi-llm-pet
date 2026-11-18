@@ -66,11 +66,13 @@ class WindowMetricTests(unittest.TestCase):
         suite = self.base / "full-suite"
         run_recorded_replay(output=suite)
         metric, audit = self.metric(suite)
-        self.assertEqual(audit["scenario_count"], 20)
-        self.assertEqual((metric["numerator"], metric["denominator"]), (4, 5))
+        self.assertEqual(audit["scenario_count"], 25)
+        self.assertEqual((metric["numerator"], metric["denominator"]), (7, 9))
         self.assertEqual(metric["status"], "insufficient_evidence")
         self.assertIsNone(metric["value"])
-        self.assertEqual((metric["bounds"]["lower"], metric["bounds"]["upper"]), (0.8, 1.0))
+        self.assertEqual((metric["bounds"]["lower"], metric["bounds"]["upper"]), (7 / 9, 8 / 9))
+        self.assertEqual(metric["counts"]["confirmed_misses"], 1)
+        self.assertEqual(metric["counts"]["undetermined_occurrences"], 1)
         pending = [row for row in audit["rows"] if row["status"] == "undetermined"]
         self.assertEqual([r["scenario_id"] for r in pending], ["expired-observation"])
 

@@ -142,15 +142,23 @@ the existing report-contract checker, which is invoked internally before publica
 
 ## 6. Baseline interpretation
 
-For the 20 built-in M0 fixtures at source commit `81d36d2`, the expected soft cohort
-contains five occurrences. Four have verifiable first displays in their windows.
-`expired-observation` ends at 6 seconds, before its 30-second soft deadline, without
-a valid display. It remains one undetermined occurrence, not a measured miss.
+For the 25 built-in M0 fixtures, the expected soft cohort contains twelve occurrences
+across the confirmed-soft cohort rule. Seven have verifiable first displays in their
+windows. One (`soft-window-miss`) has a complete observation horizon that covers its
+deadline but never produces a display, so it is a confirmed miss rather than missing
+evidence. Three occurrences are explicitly excluded: `soft-cancel-before-deadline`,
+the old occurrence of `soft-edit-before-deadline`, and the old occurrence of
+`soft-snooze-before-deadline`. `soft-failure-retry` is a single successful occurrence
+even though its first delivery attempt failed.
 
-Expected result: numerator 4, denominator 5, confirmed misses 0, undetermined 1,
-usable evidence coverage 4/5. The primary value is null with `insufficient_evidence`;
-the success-rate bounds are 0.8 to 1.0. Do not call either endpoint the measured rate.
-The source suite can still pass all 20 scenario expectations.
+`expired-observation` ends at 6 seconds, before its 30-second soft deadline, without
+a valid display. It remains one undetermined occurrence, not a measured miss. The
+original result is kept as-is; it is neither re-judged as a success nor as a failure.
+
+Expected result: numerator 7, denominator 9, confirmed successes 7, confirmed misses 1,
+undetermined 1, excluded 3. Usable evidence coverage is 8/9. The primary value is null
+with `insufficient_evidence`; the success-rate bounds are 7/9 to 8/9. Do not call either
+endpoint the measured rate. The source suite can still pass all 25 scenario expectations.
 
 A single completed `soft-opportunity` or `soft-deadline` fixture produces 1/1 in this
 simulated profile. These are programmed replay outcomes, not model or real-user quality.
