@@ -24,6 +24,12 @@ PROFILES = {
         {"cost_accounting": "call", "delivery_evidence": "occurrence"}),
     "latency.hard_due_p95": (
         "duration", "ms", None, {"latency_measurements": "timing_target"}),
+    "semantics.strict_interpretation_accuracy": (
+        "ratio", "fraction", "request", {"interpretation_evidence": "request"}),
+    "semantics.field_accuracy": (
+        "ratio", "fraction", "request", {"interpretation_evidence": "request"}),
+    "semantics.clarification_behavior_accuracy": (
+        "ratio", "fraction", "request", {"interpretation_evidence": "request"}),
 }
 GAP_REASONS = {"missing_record", "invalid_record", "missing_linkage", "missing_required_value"}
 INVITATION_REASONS = {
@@ -153,7 +159,7 @@ def check_metric(result, path):
     for key in ("metric_id", "definition_version", "cohort_id"):
         text(result[key], path + "." + key)
     metric = result["metric_id"]
-    need(metric in PROFILES, path + ".metric_id", "unsupported metric; this starter profile supports four IDs")
+    need(metric in PROFILES, path + ".metric_id", "unsupported metric; this profile supports the declared metric IDs")
     kind, unit, denominator_unit, domains = PROFILES[metric]
     need(result["definition_version"] == VERSION, path, "unsupported definition version")
     need(result["metric_type"] == kind and result["unit"] == unit, path, "incorrect metric type or unit")
@@ -340,6 +346,23 @@ def check_metric(result, path):
                  "verified displays exceed occurrences with established outcomes")
         if status == "computed":
             need(full_evidence(result), path, "cost point estimate requires complete accounting and outcome evidence")
+
+    elif metric in {"semantics.strict_interpretation_accuracy",
+                    "semantics.field_accuracy", "semantics.clarification_behavior_accuracy"}:
+        require_counts(result, {"eligible_requests", "assessed_requests", "correct_requests"}, path)
+        c = result["counts"]
+        if c["eligible_requests"] is not None and c["assessed_requests"] is not None:
+            need(c["assessed_requests"] <= c["eligible_requests"], path,
+                 "assessed requests exceed eligible requests")
+        if c["correct_requests"] is not None and c["assessed_requests"] is not None:
+            need(c["correct_requests"] <= c["assessed_requests"], path,
+                 "correct requests exceed assessed requests")
+        need(result["denominator"] == c["assessed_requests"], path,
+             "semantics denominator is assessed requests")
+        coverage_matches(result, "prediction_records", "request", c["assessed_requests"],
+                         c["eligible_requests"], path)
+        if status == "computed":
+            need(full_evidence(result), path, "semantics point estimate requires complete prediction evidence")
 
     else:
         require_counts(result, {"eligible_timing_targets", "measured", "missing_latency", "timed_out", "early_render_violations"}, path)

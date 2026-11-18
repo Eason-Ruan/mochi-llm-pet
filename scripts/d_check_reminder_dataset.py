@@ -48,6 +48,7 @@ def validate_dataset(data):
     groups = set()
 
     reviewed_count = 0
+    double_annotated_count = 0
     for row in samples:
         require(isinstance(row, dict), "Every sample must be an object")
         sample_id = row.get("request_sample_id")
@@ -63,20 +64,48 @@ def validate_dataset(data):
                     f"{sample_id}: missing {field}")
         reference = aware_time(row.get("reference_time"), f"{sample_id}.reference_time")
         status = row.get("annotation_status")
-        require(status in {"pending_human_review", "single_annotator_dev"},
-                f"{sample_id}: annotation_status must be pending_human_review or single_annotator_dev")
-        if status == "single_annotator_dev":
+        require(status in {"pending_human_review", "single_annotator_dev", "double_annotated"},
+                f"{sample_id}: annotation_status must be pending_human_review, single_annotator_dev, or double_annotated")
+        if status in {"single_annotator_dev", "double_annotated"}:
             reviewed_count += 1
             annotator_a = row.get("annotator_a")
             require(isinstance(annotator_a, dict),
-                    f"{sample_id}: single_annotator_dev requires annotator_a review")
+                    f"{sample_id}: {status} requires annotator_a review")
             for field in ("annotator_id", "annotated_at", "review_note"):
                 require(isinstance(annotator_a.get(field), str) and bool(annotator_a[field].strip()),
                         f"{sample_id}.annotator_a: missing {field}")
             aware_time(annotator_a["annotated_at"], f"{sample_id}.annotator_a.annotated_at")
+        if status == "single_annotator_dev":
             require(row.get("annotator_b") is None and row.get("agreement") is None
                     and row.get("adjudication") is None,
                     f"{sample_id}: single_annotator_dev keeps annotator_b/agreement/adjudication null")
+        elif status == "double_annotated":
+            double_annotated_count += 1
+            annotator_b = row.get("annotator_b")
+            require(isinstance(annotator_b, dict),
+                    f"{sample_id}: double_annotated requires annotator_b review")
+            for field in ("annotator_id", "annotated_at", "review_note"):
+                require(isinstance(annotator_b.get(field), str) and bool(annotator_b[field].strip()),
+                        f"{sample_id}.annotator_b: missing {field}")
+            aware_time(annotator_b["annotated_at"], f"{sample_id}.annotator_b.annotated_at")
+            require(annotator_b["annotator_id"] != annotator_a["annotator_id"],
+                    f"{sample_id}: annotator_b must differ from annotator_a")
+            agreement = row.get("agreement")
+            require(isinstance(agreement, dict),
+                    f"{sample_id}: double_annotated requires agreement record")
+            require(isinstance(agreement.get("agreed"), bool),
+                    f"{sample_id}.agreement.agreed must be a boolean")
+            require(isinstance(agreement.get("agreed_fields"), list),
+                    f"{sample_id}.agreement.agreed_fields must be a list")
+            require(isinstance(agreement.get("disagreed_fields"), list),
+                    f"{sample_id}.agreement.disagreed_fields must be a list")
+            adjudication = row.get("adjudication")
+            require(isinstance(adjudication, dict),
+                    f"{sample_id}: double_annotated requires adjudication record")
+            for field in ("adjudicator_id", "adjudicated_at", "adjudication_note"):
+                require(isinstance(adjudication.get(field), str) and bool(adjudication[field].strip()),
+                        f"{sample_id}.adjudication: missing {field}")
+            aware_time(adjudication["adjudicated_at"], f"{sample_id}.adjudication.adjudicated_at")
         else:
             require(all(field in row and row[field] is None for field in (
                 "annotator_a", "annotator_b", "agreement", "adjudication"
@@ -138,8 +167,14 @@ def validate_dataset(data):
         require(TaskDraft.model_validate(target["draft"]) == TaskDraft.model_validate(seed["gold"]),
                 f"{row['request_sample_id']}: context does not match the seed draft")
 
-    overall_status = "single_annotator_dev" if reviewed_count == len(samples) else (
-        "pending_human_review" if reviewed_count == 0 else "mixed")
+    if double_annotated_count == len(samples):
+        overall_status = "double_annotated"
+    elif reviewed_count == len(samples):
+        overall_status = "single_annotator_dev"
+    elif reviewed_count == 0:
+        overall_status = "pending_human_review"
+    else:
+        overall_status = "mixed"
     return {
         "status": "passed",
         "validation_type": "dataset_structure",
@@ -153,10 +188,10 @@ def validate_dataset(data):
         "split": data["split"],
         "annotation_status": overall_status,
         "human_reviewed_samples": reviewed_count,
-        "double_annotated_samples": 0,
+        "double_annotated_samples": double_annotated_count,
         "model_evaluation": "not_run",
-        "note": "Structure checked only. Single-annotator dev review is not double annotation; "
-                "natural-language meaning still requires independent second review.",
+        "note": "Structure checked only. Double annotation here means two recorded reviewer labels; "
+                "independence and natural-language meaning still require the declared annotation protocol.",
     }
 
 

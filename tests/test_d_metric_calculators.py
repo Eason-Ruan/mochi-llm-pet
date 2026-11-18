@@ -1,4 +1,4 @@
-"""Exercise latency, cost, and interruption calculators against recorded M0 replay evidence."""
+"""Exercise latency, cost, interruption, and semantics calculators."""
 
 import json
 import subprocess
@@ -14,7 +14,11 @@ from d_check_metric_report import load_report, validate_report
 from d_calculate_latency import calculate_latency_report, write_analysis as write_latency
 from d_calculate_cost import calculate_cost_report, write_analysis as write_cost
 from d_calculate_interruption import calculate_interruption_report, write_analysis as write_interruption
+from d_calculate_semantics import calculate_semantics_report, write_analysis as write_semantics
 from d_replay import run_recorded_replay
+
+
+DATASET = ROOT / "evaluation" / "data" / "reminder-dev-pilot.json"
 
 
 def event(at, kind, payload=None):
@@ -122,6 +126,45 @@ class MetricCalculatorTests(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((output / "metric-report.json").exists())
+
+    def test_semantics_report_validates(self):
+        report, audit = calculate_semantics_report(DATASET)
+        self.assertEqual(validate_report(report)["status"], "passed")
+        self.assertEqual(len(report["results"]), 3)
+        ids = {r["metric_id"] for r in report["results"]}
+        self.assertEqual(ids, {
+            "semantics.strict_interpretation_accuracy",
+            "semantics.field_accuracy",
+            "semantics.clarification_behavior_accuracy",
+        })
+
+    def test_semantics_not_measured_without_predictions(self):
+        report, _ = calculate_semantics_report(DATASET)
+        for result in report["results"]:
+            self.assertEqual(result["status"], "not_measured")
+            self.assertIsNone(result["value"])
+            self.assertEqual(result["assessment"], "not_evaluated")
+            self.assertIsNone(result["numerator"])
+            self.assertIsNone(result["denominator"])
+
+    def test_semantics_eligible_count_matches_dataset(self):
+        report, audit = calculate_semantics_report(DATASET)
+        self.assertEqual(audit["eligible_request_count"], 6)
+        self.assertEqual(audit["double_annotated_samples"], 6)
+        for result in report["results"]:
+            self.assertEqual(result["counts"]["eligible_requests"], 6)
+            self.assertEqual(result["coverage"]["prediction_records"]["denominator"], 6)
+
+    def test_semantics_cli_produces_report(self):
+        output = self.base / "sem-out"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "d_calculate_semantics.py"),
+             str(DATASET), "--output", str(output)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((output / "metric-report.json").exists())
+        report = load_report(output / "metric-report.json")
+        self.assertEqual(validate_report(report)["status"], "passed")
 
 
 if __name__ == "__main__":
