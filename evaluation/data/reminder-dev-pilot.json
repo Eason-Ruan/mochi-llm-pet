@@ -26,8 +26,22 @@
       "clarification_fields": [],
       "judgement_note": "Interpret 30 seconds relative to the fixed reference time. Both hard-reminder endpoints are 04:00:30Z. Equivalent wording for drinking water is acceptable.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "create",
+        "expected_behavior": "parse",
+        "gold": {
+          "content": "Drink water",
+          "mode": "hard",
+          "timezone": "Asia/Shanghai",
+          "earliest_at": "2026-11-16T04:00:30Z",
+          "latest_first_delivery_at": "2026-11-16T04:00:30Z"
+        },
+        "clarification_fields": [],
+        "review_note": "'exactly 30 seconds' denotes a single due instant, so hard mode is correct. 30s after 2026-11-16T04:00:00Z is 04:00:30Z for both endpoints. Content 'Drink water' matches the utterance."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null
@@ -52,8 +66,22 @@
       "clarification_fields": [],
       "judgement_note": "The opportunity window and final deadline are explicit. Equivalent wording for stretching is acceptable.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "create",
+        "expected_behavior": "parse",
+        "gold": {
+          "content": "Stretch",
+          "mode": "soft",
+          "timezone": "Asia/Shanghai",
+          "earliest_at": "2026-11-16T04:00:10Z",
+          "latest_first_delivery_at": "2026-11-16T04:00:30Z"
+        },
+        "clarification_fields": [],
+        "review_note": "'Between 10 and 30 seconds' fixes earliest=+10s and latest=+30s. 'when I am available' selects soft mode. 'Remind me by 30 seconds even if busy' confirms the deadline fallback. AI draft is correct."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null
@@ -78,8 +106,22 @@
       "clarification_fields": [],
       "judgement_note": "On 2026-11-16, 15:00 in Tokyo is 06:00 UTC and 14:00 in Beijing. Use the explicitly requested Asia/Tokyo timezone.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "create",
+        "expected_behavior": "parse",
+        "gold": {
+          "content": "Join the online meeting",
+          "mode": "hard",
+          "timezone": "Asia/Tokyo",
+          "earliest_at": "2026-11-16T06:00:00Z",
+          "latest_first_delivery_at": "2026-11-16T06:00:00Z"
+        },
+        "clarification_fields": [],
+        "review_note": "Tokyo is UTC+9; 15:00 JST on 2026-11-16 equals 06:00 UTC. The utterance names Tokyo time explicitly, so timezone=Asia/Tokyo is right. 'At 3 PM' is a fixed instant -> hard mode."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null
@@ -101,8 +143,19 @@
       ],
       "judgement_note": "Later does not define an earliest time or final deadline. Ask for an acceptable time window instead of guessing or scheduling immediately.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "create",
+        "expected_behavior": "clarify",
+        "gold": null,
+        "clarification_fields": [
+          "earliest_at",
+          "latest_first_delivery_at"
+        ],
+        "review_note": "'later' provides no earliest or latest time. Without a window the system must ask for one rather than guess. gold=null and clarification_fields=[earliest_at, latest_first_delivery_at] are correct."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null
@@ -150,8 +203,26 @@
       "clarification_fields": [],
       "judgement_note": "Context uniquely identifies the registered v2 water reminder. Edit that task instead of creating another reminder.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "edit",
+        "expected_behavior": "parse",
+        "gold": {
+          "task_id": "pilot-water",
+          "expected_version": 2,
+          "draft": {
+            "content": "Drink water",
+            "mode": "hard",
+            "timezone": "Asia/Shanghai",
+            "earliest_at": "2026-11-16T04:01:00Z",
+            "latest_first_delivery_at": "2026-11-16T04:01:00Z"
+          }
+        },
+        "clarification_fields": [],
+        "review_note": "'Change' is an edit, not a new create. Context uniquely identifies the registered v2 water reminder. 'exactly one minute from now' is a hard due at 04:01:00Z. AI draft edits the correct task and version."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null
@@ -192,8 +263,19 @@
       "clarification_fields": [],
       "judgement_note": "Cancel the registered v2 task identified by context. Do not create a reminder or mark the task completed.",
       "label_version": "draft-en-0.1",
-      "annotation_status": "pending_human_review",
-      "annotator_a": null,
+      "annotation_status": "single_annotator_dev",
+      "annotator_a": {
+        "annotator_id": "human-reviewer-001",
+        "annotated_at": "2026-11-18T05:00:00+00:00",
+        "intent": "cancel",
+        "expected_behavior": "parse",
+        "gold": {
+          "task_id": "pilot-water",
+          "expected_version": 2
+        },
+        "clarification_fields": [],
+        "review_note": "'Cancel' is a cancel intent. Context uniquely identifies pilot-water v2. Gold has task_id and expected_version only (no draft), which is correct for cancellation."
+      },
       "annotator_b": null,
       "agreement": null,
       "adjudication": null

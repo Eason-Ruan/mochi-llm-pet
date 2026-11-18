@@ -47,6 +47,7 @@ def validate_dataset(data):
     behaviors = Counter()
     groups = set()
 
+    reviewed_count = 0
     for row in samples:
         require(isinstance(row, dict), "Every sample must be an object")
         sample_id = row.get("request_sample_id")
@@ -61,11 +62,25 @@ def validate_dataset(data):
             require(isinstance(row.get(field), str) and bool(row[field].strip()),
                     f"{sample_id}: missing {field}")
         reference = aware_time(row.get("reference_time"), f"{sample_id}.reference_time")
-        require(row.get("annotation_status") == "pending_human_review",
-                f"{sample_id}: this checker does not certify human-reviewed labels")
-        require(all(field in row and row[field] is None for field in (
-            "annotator_a", "annotator_b", "agreement", "adjudication"
-        )), f"{sample_id}: preserve unreviewed annotation placeholders")
+        status = row.get("annotation_status")
+        require(status in {"pending_human_review", "single_annotator_dev"},
+                f"{sample_id}: annotation_status must be pending_human_review or single_annotator_dev")
+        if status == "single_annotator_dev":
+            reviewed_count += 1
+            annotator_a = row.get("annotator_a")
+            require(isinstance(annotator_a, dict),
+                    f"{sample_id}: single_annotator_dev requires annotator_a review")
+            for field in ("annotator_id", "annotated_at", "review_note"):
+                require(isinstance(annotator_a.get(field), str) and bool(annotator_a[field].strip()),
+                        f"{sample_id}.annotator_a: missing {field}")
+            aware_time(annotator_a["annotated_at"], f"{sample_id}.annotator_a.annotated_at")
+            require(row.get("annotator_b") is None and row.get("agreement") is None
+                    and row.get("adjudication") is None,
+                    f"{sample_id}: single_annotator_dev keeps annotator_b/agreement/adjudication null")
+        else:
+            require(all(field in row and row[field] is None for field in (
+                "annotator_a", "annotator_b", "agreement", "adjudication"
+            )), f"{sample_id}: preserve unreviewed annotation placeholders")
         intent = row.get("intent")
         behavior = row.get("expected_behavior")
         require(intent in {"create", "edit", "cancel"}, f"{sample_id}: invalid intent")
@@ -123,6 +138,8 @@ def validate_dataset(data):
         require(TaskDraft.model_validate(target["draft"]) == TaskDraft.model_validate(seed["gold"]),
                 f"{row['request_sample_id']}: context does not match the seed draft")
 
+    overall_status = "single_annotator_dev" if reviewed_count == len(samples) else (
+        "pending_human_review" if reviewed_count == 0 else "mixed")
     return {
         "status": "passed",
         "validation_type": "dataset_structure",
@@ -134,11 +151,12 @@ def validate_dataset(data):
         "expected_behavior_counts": dict(behaviors),
         "origin": data["origin"],
         "split": data["split"],
-        "annotation_status": "pending_human_review",
-        "human_reviewed_samples": 0,
+        "annotation_status": overall_status,
+        "human_reviewed_samples": reviewed_count,
         "double_annotated_samples": 0,
         "model_evaluation": "not_run",
-        "note": "Structure checked only; natural-language meaning and timezone interpretation need human review.",
+        "note": "Structure checked only. Single-annotator dev review is not double annotation; "
+                "natural-language meaning still requires independent second review.",
     }
 
 
