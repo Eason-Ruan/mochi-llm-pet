@@ -190,8 +190,13 @@ def validate_dataset(data):
         "human_reviewed_samples": reviewed_count,
         "double_annotated_samples": double_annotated_count,
         "model_evaluation": "not_run",
-        "note": "Structure checked only. Double annotation here means two recorded reviewer labels; "
-                "independence and natural-language meaning still require the declared annotation protocol.",
+        "note": (
+            "Structure checked only. Single-annotator dev review is not double annotation; "
+            "natural-language meaning still requires independent second review."
+            if overall_status == "single_annotator_dev"
+            else "Structure checked only. Double annotation here means two recorded reviewer labels; "
+                 "independence and natural-language meaning still require the declared annotation protocol."
+        ),
     }
 
 

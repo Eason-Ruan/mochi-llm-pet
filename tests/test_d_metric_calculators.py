@@ -153,7 +153,7 @@ class MetricCalculatorTests(unittest.TestCase):
     def test_semantics_eligible_count_matches_dataset(self):
         report, audit = calculate_semantics_report(DATASET)
         self.assertEqual(audit["eligible_request_count"], 6)
-        self.assertEqual(audit["double_annotated_samples"], 6)
+        self.assertEqual(audit["double_annotated_samples"], 0)
         for result in report["results"]:
             self.assertEqual(result["counts"]["eligible_requests"], 6)
             self.assertEqual(result["coverage"]["prediction_records"]["denominator"], 6)
