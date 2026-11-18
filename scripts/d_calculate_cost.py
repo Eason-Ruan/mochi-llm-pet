@@ -63,13 +63,9 @@ def calculate_case(case, events):
             applied[key] = result
 
     states, versions, used = {}, {}, set()
-    pending_command = None
     rows = {}
     for event in events:
         seq, kind = event["seq"], event["kind"]
-        if kind == "scenario.input":
-            payload = event["payload"]
-            pending_command = payload["payload"] if payload["kind"] == "command" else None
         if kind not in KINDS:
             continue
         command_id = event["payload"]["command_id"]
@@ -102,26 +98,22 @@ def calculate_case(case, events):
     for task, final in case["outcomes"]["tasks"].items():
         snapshots.append((len(events) + 1, final))
 
-    requests = {}
     for event in events:
-        if event["kind"] not in {"delivery.requested", "delivery.displayed"}:
+        if event["kind"] != "delivery.displayed":
             continue
         version = versions.get((event["task_id"], event["task_version"]))
         require(version is not None and version["view"]["status"] == "registered",
                 "Delivery uses an inactive task version")
         key = identity(version["view"])
-        if event["kind"] == "delivery.requested":
-            requests[event["delivery_id"]] = key
-        else:
-            require(event["source"] == "simulated", "Native/offscreen receipt is outside this profile")
-            if key in rows and not rows[key]["displayed"]:
-                receipt_seq = event["seq"]
-                candidates = [view for seq, view in snapshots if seq > receipt_seq
-                              and identity(view) == key and view.get("displayed_at") is not None]
-                render_values = {instant(v["displayed_at"]) for v in candidates}
-                if len(render_values) == 1:
-                    rows[key]["displayed"] = True
-                    rows[key]["displayed_at"] = render_values.pop().isoformat()
+        require(event["source"] == "simulated", "Native/offscreen receipt is outside this profile")
+        if key in rows and not rows[key]["displayed"]:
+            receipt_seq = event["seq"]
+            candidates = [view for seq, view in snapshots if seq > receipt_seq
+                          and identity(view) == key and view.get("displayed_at") is not None]
+            render_values = {instant(v["displayed_at"]) for v in candidates}
+            if len(render_values) == 1:
+                rows[key]["displayed"] = True
+                rows[key]["displayed_at"] = render_values.pop().isoformat()
     return list(rows.values())
 
 

@@ -58,16 +58,15 @@ class MetricCalculatorTests(unittest.TestCase):
         self.assertEqual(metric["metric_type"], "duration")
         self.assertEqual(metric["quantile"], 0.95)
         self.assertEqual(metric["quantile_method"], "nearest_rank")
-        self.assertIn(metric["status"], {"computed", "insufficient_evidence"})
+        self.assertIn(metric["status"], {"insufficient_evidence", "not_applicable"})
         self.assertIsNotNone(metric["counts"]["eligible_timing_targets"])
 
-    def test_latency_p95_is_nonnegative_when_computed(self):
+    def test_latency_status_is_insufficient_evidence_for_synthetic(self):
         report, _ = calculate_latency_report(self.full_suite())
         metric = report["results"][0]
-        if metric["status"] == "computed":
-            self.assertIsNotNone(metric["value"])
-            self.assertGreaterEqual(metric["value"], 0)
-            self.assertEqual(metric["sample_count"], metric["counts"]["measured"])
+        self.assertIn(metric["status"], {"insufficient_evidence", "not_applicable"})
+        self.assertIsNone(metric["value"])
+        self.assertEqual(metric["value_scope"], "not_available")
 
     def test_cost_report_is_not_measured_for_synthetic(self):
         report, audit = calculate_cost_report(self.full_suite())

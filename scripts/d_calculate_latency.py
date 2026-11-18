@@ -11,7 +11,6 @@ not establish real hardware latency; results carry evidence_type=synthetic_repla
 
 import argparse
 import json
-import math
 from collections import Counter
 from datetime import datetime
 from hashlib import sha256
@@ -77,13 +76,9 @@ def calculate_case(case, events):
             applied[key] = result
 
     states, versions, used = {}, {}, set()
-    pending_command = None
     rows = {}
     for event in events:
         seq, kind = event["seq"], event["kind"]
-        if kind == "scenario.input":
-            payload = event["payload"]
-            pending_command = payload["payload"] if payload["kind"] == "command" else None
         if kind not in KINDS:
             continue
         command_id = event["payload"]["command_id"]
@@ -116,34 +111,30 @@ def calculate_case(case, events):
     for task, final in case["outcomes"]["tasks"].items():
         snapshots.append((len(events) + 1, final))
 
-    requests = {}
     for event in events:
-        if event["kind"] not in {"delivery.requested", "delivery.displayed"}:
+        if event["kind"] != "delivery.displayed":
             continue
         version = versions.get((event["task_id"], event["task_version"]))
         require(version is not None and version["view"]["status"] == "registered",
                 "Delivery uses an inactive task version")
         key = identity(version["view"])
-        if event["kind"] == "delivery.requested":
-            requests[event["delivery_id"]] = key
-        else:
-            require(event["source"] == "simulated", "Native/offscreen receipt is outside this profile")
-            if key in rows and rows[key]["first_rendered_at"] is None:
-                receipt_seq = event["seq"]
-                candidates = [view for seq, view in snapshots if seq > receipt_seq
-                              and identity(view) == key and view.get("displayed_at") is not None]
-                render_values = {instant(v["displayed_at"]) for v in candidates}
-                if len(render_values) == 1:
-                    rendered = render_values.pop()
-                    due = instant(rows[key]["due_at"])
-                    latency_s = (rendered - due).total_seconds()
-                    rows[key]["first_rendered_at"] = rendered.isoformat()
-                    rows[key]["latency_ms"] = round(latency_s * 1000, 3)
-                    rows[key]["status"] = "measured" if latency_s >= 0 else "early_render_violation"
-                    rows[key]["reason"] = "nonnegative_due_latency" if latency_s >= 0 else "rendered_before_due"
-                else:
-                    rows[key]["status"] = "undetermined"
-                    rows[key]["reason"] = "missing_required_value"
+        require(event["source"] == "simulated", "Native/offscreen receipt is outside this profile")
+        if key in rows and rows[key]["first_rendered_at"] is None:
+            receipt_seq = event["seq"]
+            candidates = [view for seq, view in snapshots if seq > receipt_seq
+                          and identity(view) == key and view.get("displayed_at") is not None]
+            render_values = {instant(v["displayed_at"]) for v in candidates}
+            if len(render_values) == 1:
+                rendered = render_values.pop()
+                due = instant(rows[key]["due_at"])
+                latency_s = (rendered - due).total_seconds()
+                rows[key]["first_rendered_at"] = rendered.isoformat()
+                rows[key]["latency_ms"] = round(latency_s * 1000, 3)
+                rows[key]["status"] = "measured" if latency_s >= 0 else "early_render_violation"
+                rows[key]["reason"] = "nonnegative_due_latency" if latency_s >= 0 else "rendered_before_due"
+            else:
+                rows[key]["status"] = "undetermined"
+                rows[key]["reason"] = "missing_required_value"
 
     for key, row in rows.items():
         if row["status"] is None:
@@ -157,14 +148,6 @@ def calculate_case(case, events):
     return list(rows.values()), cutoff
 
 
-def nearest_rank_p95(values):
-    """P95 using nearest-rank method: ceil(0.95 * n) smallest value."""
-    require(values, "Cannot compute P95 of an empty sample")
-    ordered = sorted(values)
-    rank = math.ceil(0.95 * len(ordered))
-    return ordered[rank - 1]
-
-
 def metric_record(rows, cohort_id):
     measured = [r for r in rows if r["status"] == "measured"]
     early = [r for r in rows if r["status"] == "early_render_violation"]
@@ -172,23 +155,22 @@ def metric_record(rows, cohort_id):
     excluded = [r for r in rows if r["status"] == "excluded"]
     undetermined = [r for r in rows if r["status"] == "undetermined"]
     eligible = len(rows) - len(excluded)
-    latencies = [r["latency_ms"] for r in measured]
-    status = "not_applicable" if eligible == 0 else (
-        "computed" if measured and not undetermined and not missing else "insufficient_evidence")
-    p95 = nearest_rank_p95(latencies) if latencies else None
+    status = "not_applicable" if eligible == 0 else "insufficient_evidence"
     warnings = []
-    if status == "insufficient_evidence":
-        if missing:
-            warnings.append({"code": "LATENCY_MISSING_DISPLAY",
-                             "message": f"{len(missing)} hard occurrences have no valid display receipt."})
-        if undetermined:
-            warnings.append({"code": "LATENCY_RENDER_TIMESTAMP_GAP",
-                             "message": f"{len(undetermined)} occurrences lack a verifiable render timestamp."})
+    if measured:
+        warnings.append({"code": "SYNTHETIC_REPLAY_LATENCY",
+                         "message": "Latency samples are from simulated replay; they do not establish real hardware latency."})
+    if missing:
+        warnings.append({"code": "LATENCY_MISSING_DISPLAY",
+                         "message": f"{len(missing)} hard occurrences have no valid display receipt."})
+    if undetermined:
+        warnings.append({"code": "LATENCY_RENDER_TIMESTAMP_GAP",
+                         "message": f"{len(undetermined)} occurrences lack a verifiable render timestamp."})
     result = {
         "metric_id": "latency.hard_due_p95", "definition_version": "0.4",
         "cohort_id": cohort_id, "metric_type": "duration", "status": status, "assessment": "not_evaluated",
-        "value_scope": "eligible_cohort" if status == "computed" else "not_available",
-        "value": p95 if status == "computed" else None,
+        "value_scope": "not_available",
+        "value": None,
         "unit": "ms", "currency": None, "numerator": None, "denominator": None,
         "numerator_unit": None, "denominator_unit": None,
         "statistic": "percentile", "quantile": 0.95, "quantile_method": "nearest_rank",

@@ -75,7 +75,7 @@ def post_cancellation_result(cohort_id, violation_count, cancelled_count, violat
             "delivery_evidence": {"unit": "occurrence", "count": 0, "reason_counts": {}}},
         "not_invited_reason_counts": None,
         "coverage": {
-            "delivery_evidence": {"unit": "occurrence", "numerator": cancelled_count, "denominator": cancelled_count,
+            "cancelled_tasks": {"unit": "cancelled_task", "numerator": cancelled_count, "denominator": cancelled_count,
                 "value": 1.0 if cancelled_count > 0 else None,
                 "status": "computed" if cancelled_count > 0 else "not_applicable"}},
         "warnings": [

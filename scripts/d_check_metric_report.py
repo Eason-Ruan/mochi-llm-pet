@@ -160,7 +160,8 @@ def require_counts(result, names, path):
 
 def full_evidence(result):
     return (all(g["count"] == 0 for g in result["evidence_missing"].values())
-            and all(v["status"] == "computed" and v["numerator"] == v["denominator"]
+            and all((v["status"] == "computed" and v["numerator"] == v["denominator"])
+                    or (v["status"] == "not_applicable" and v["denominator"] == 0)
                     for v in result["coverage"].values()))
 
 
