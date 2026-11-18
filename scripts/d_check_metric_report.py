@@ -30,6 +30,10 @@ PROFILES = {
         "ratio", "fraction", "request", {"interpretation_evidence": "request"}),
     "semantics.clarification_behavior_accuracy": (
         "ratio", "fraction", "request", {"interpretation_evidence": "request"}),
+    "delivery.post_cancellation_display_violations": (
+        "count", "violation", None, {"delivery_evidence": "occurrence"}),
+    "delivery.duplicate_render_violations": (
+        "count", "violation", None, {"delivery_evidence": "occurrence"}),
 }
 GAP_REASONS = {"missing_record", "invalid_record", "missing_linkage", "missing_required_value"}
 INVITATION_REASONS = {
@@ -186,6 +190,8 @@ def check_metric(result, path):
         need(value >= 0, path, "negative value is invalid for this metric")
         if kind == "ratio":
             need(value <= 1, path, "ratio must be in 0..1")
+        if kind == "count":
+            count(value, path + ".value")
         expected_scope = "eligible_cohort" if status == "computed" else (
             "observed_respondents" if metric == "interruption.user_reported_rate" else "measured_subset")
         need(result["value_scope"] == expected_scope, path, "incorrect value_scope")
@@ -228,22 +234,33 @@ def check_metric(result, path):
     else:
         need(result["statistic"] == "scalar" and all(result[k] is None for k in (
             "quantile", "quantile_method", "sample_count")), path, "scalar statistical fields must be null")
-        number(result["numerator"], path + ".numerator", True)
-        count(result["denominator"], path + ".denominator", True)
-        if kind == "ratio":
-            count(result["numerator"], path + ".numerator", True)
-        need(result["numerator_unit"] == ("currency" if kind == "cost" else denominator_unit)
-             and result["denominator_unit"] == denominator_unit, path, "incorrect component units")
-        n, d = result["numerator"], result["denominator"]
-        if n is not None:
-            need(n >= 0, path, "numerator must be nonnegative")
-        if n is not None and d is not None and kind == "ratio":
-            need(n <= d, path, "ratio numerator exceeds denominator")
-        if value is not None:
-            need(n is not None and d is not None and d > 0, path, "numeric unit cost/rate needs a positive denominator")
-            close(value, n / d, path + ".value")
-        if status == "not_applicable":
-            need(d == 0, path, "this metric is not applicable only with an established zero denominator")
+        if kind == "count":
+            if status in UNAVAILABLE:
+                need(result["numerator"] is None and result["denominator"] is None, path,
+                     "unavailable count must keep numerator and denominator null")
+            else:
+                count(result["numerator"], path + ".numerator")
+                need(result["denominator"] is None, path, "count metrics have no denominator")
+                need(result["numerator_unit"] == unit and result["denominator_unit"] is None, path,
+                     "count numerator unit must match the metric unit")
+                need(result["value"] == result["numerator"], path, "count value must equal the numerator")
+        else:
+            number(result["numerator"], path + ".numerator", True)
+            count(result["denominator"], path + ".denominator", True)
+            if kind == "ratio":
+                count(result["numerator"], path + ".numerator", True)
+            need(result["numerator_unit"] == ("currency" if kind == "cost" else denominator_unit)
+                 and result["denominator_unit"] == denominator_unit, path, "incorrect component units")
+            n, d = result["numerator"], result["denominator"]
+            if n is not None:
+                need(n >= 0, path, "numerator must be nonnegative")
+            if n is not None and d is not None and kind == "ratio":
+                need(n <= d, path, "ratio numerator exceeds denominator")
+            if value is not None:
+                need(n is not None and d is not None and d > 0, path, "numeric unit cost/rate needs a positive denominator")
+                close(value, n / d, path + ".value")
+            if status == "not_applicable":
+                need(d == 0, path, "this metric is not applicable only with an established zero denominator")
 
     if "bounds" in result:
         bounds = result["bounds"]
@@ -364,6 +381,14 @@ def check_metric(result, path):
         if status == "computed":
             need(full_evidence(result), path, "semantics point estimate requires complete prediction evidence")
 
+    elif metric in {"delivery.post_cancellation_display_violations",
+                    "delivery.duplicate_render_violations"}:
+        require_counts(result, {"violations"}, path)
+        c = result["counts"]
+        need(result["value"] == c["violations"], path, "count value must equal violations count")
+        if status == "computed":
+            need(full_evidence(result), path, "violation count requires complete delivery evidence")
+
     else:
         require_counts(result, {"eligible_timing_targets", "measured", "missing_latency", "timed_out", "early_render_violations"}, path)
         c = result["counts"]
@@ -423,7 +448,9 @@ def validate_report(report):
         if report["example_only"]:
             need(result["assessment"] == "not_evaluated", f"results[{i}]",
                  "format examples cannot establish acceptance")
-        if report["evidence_type"] == "synthetic_replay" and key[0] != "delivery.soft_window_first_display_rate":
+        if report["evidence_type"] == "synthetic_replay" and key[0] not in {
+                "delivery.soft_window_first_display_rate",
+                "delivery.post_cancellation_display_violations"}:
             need(result["status"] in UNAVAILABLE, f"results[{i}]",
                  "synthetic replay cannot measure native cost, real latency, or user experience")
         need(key not in seen, f"results[{i}]", "duplicate metric/cohort/version")

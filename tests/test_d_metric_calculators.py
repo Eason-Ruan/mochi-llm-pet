@@ -15,6 +15,7 @@ from d_calculate_latency import calculate_latency_report, write_analysis as writ
 from d_calculate_cost import calculate_cost_report, write_analysis as write_cost
 from d_calculate_interruption import calculate_interruption_report, write_analysis as write_interruption
 from d_calculate_semantics import calculate_semantics_report, write_analysis as write_semantics
+from d_calculate_delivery_violations import calculate_violations_report, write_analysis as write_violations
 from d_replay import run_recorded_replay
 
 
@@ -165,6 +166,43 @@ class MetricCalculatorTests(unittest.TestCase):
         self.assertTrue((output / "metric-report.json").exists())
         report = load_report(output / "metric-report.json")
         self.assertEqual(validate_report(report)["status"], "passed")
+
+    def test_delivery_violations_report_validates(self):
+        report, audit = calculate_violations_report(self.full_suite())
+        self.assertEqual(validate_report(report)["status"], "passed")
+        ids = {r["metric_id"] for r in report["results"]}
+        self.assertEqual(ids, {
+            "delivery.post_cancellation_display_violations",
+            "delivery.duplicate_render_violations",
+        })
+
+    def test_post_cancellation_violations_is_computed(self):
+        report, _ = calculate_violations_report(self.full_suite())
+        metric = next(r for r in report["results"]
+                      if r["metric_id"] == "delivery.post_cancellation_display_violations")
+        self.assertEqual(metric["status"], "computed")
+        self.assertEqual(metric["metric_type"], "count")
+        self.assertEqual(metric["unit"], "violation")
+        self.assertEqual(metric["value"], metric["counts"]["violations"])
+        self.assertGreaterEqual(metric["counts"]["violations"], 0)
+
+    def test_duplicate_render_violations_not_measured(self):
+        report, _ = calculate_violations_report(self.full_suite())
+        metric = next(r for r in report["results"]
+                      if r["metric_id"] == "delivery.duplicate_render_violations")
+        self.assertEqual(metric["status"], "not_measured")
+        self.assertIsNone(metric["value"])
+        self.assertIsNone(metric["numerator"])
+
+    def test_delivery_violations_cli_produces_report(self):
+        suite = self.full_suite()
+        output = self.base / "viol-out"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "d_calculate_delivery_violations.py"),
+             str(suite), "--output", str(output)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((output / "metric-report.json").exists())
 
 
 if __name__ == "__main__":
