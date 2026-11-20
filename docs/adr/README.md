@@ -11,3 +11,4 @@
 | [0005](0005-replay-and-evidence.md) | 回放、离线模式及两平台证据 |
 | [0006](0006-observation-pipeline.md) | 采样与估计分离、证据时效及用户纠正 |
 | [0007](0007-embedded-ui-surface.md) | C 界面嵌入联调台、共享后端与单一展示路由 |
+| [0008](0008-c-implementation-plan.md) | C 界面与工作段实现计划（Proposed） |

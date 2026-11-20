@@ -1,0 +1,58 @@
+{
+  "surface_id": "c-state-example",
+  "surface_revision": 1,
+  "components": [
+    {
+      "component_id": "title",
+      "type": "text",
+      "label": "当前工作状态"
+    },
+    {
+      "component_id": "card",
+      "type": "card",
+      "label": "状态",
+      "data_key": "summary"
+    },
+    {
+      "component_id": "evidence",
+      "type": "list",
+      "data_key": "evidence"
+    },
+    {
+      "component_id": "state",
+      "type": "select",
+      "label": "状态",
+      "data_key": "state",
+      "options": [
+        "working",
+        "available",
+        "away",
+        "unknown"
+      ]
+    },
+    {
+      "component_id": "reason",
+      "type": "text_input",
+      "label": "原因",
+      "data_key": "reason"
+    },
+    {
+      "component_id": "apply",
+      "type": "button",
+      "label": "应用纠正",
+      "action_id": "state.override",
+      "data_key": "defaults"
+    }
+  ],
+  "data": {
+    "summary": "暂时无法判断",
+    "evidence": [
+      "样例输入，不代表真实用户标签"
+    ],
+    "state": "working",
+    "reason": "",
+    "defaults": {
+      "ttl_s": 30
+    }
+  }
+}
