@@ -1,0 +1,4 @@
+{
+  "ui_surface": "deskpet.c_ui.surface:create_surface",
+  "work_sessions": "deskpet.work_sessions.service:factory"
+}
