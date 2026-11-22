@@ -110,6 +110,7 @@ class ServiceWorker(QObject):
     def act(self, action):
         if self.env is None:
             return
+        ui = None
         try:
             if action.get("kind") == "ui":
                 ui = UiAction.model_validate(action["action"])
@@ -250,9 +251,19 @@ class ServiceWorker(QObject):
                 raise ValueError(f"未知动作 {kind}")
             if result is not None:
                 value = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+                if ui is not None and "command_id" not in value:
+                    value.setdefault("event_id", ui.event_id)
                 self.result_ready.emit(value)
             self.pump()
         except Exception as exc:
+            if ui is not None and ui.action_id.startswith("state.") and isinstance(exc, (ValueError, KeyError, TypeError, OverflowError)):
+                self.env.trace.emit("ui.rejected", source=self._qt_source,
+                    simulated=self._qt_source != "native",
+                    payload={"event_id": ui.event_id, "error_code": "INVALID_ARGUMENT"})
+                self.result_ready.emit({"event_id": ui.event_id, "status": "rejected",
+                    "error_code": "INVALID_ARGUMENT", "message": str(exc)})
+                self.pump()
+                return
             self.error.emit(f"操作失败：{type(exc).__name__}: {exc}")
 
     @pyqtSlot()

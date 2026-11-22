@@ -35,3 +35,5 @@ M0 的状态子集是 focusing/paused/break_due/ended；正式 candidate/自动�
 ## 观察诊断
 
 界面读取 ObservationFrame 中的 raw、estimated、observation.estimate 与 correction_status。以有效截止时间说明各层 TTL，保留原始能力缺口和失败原因。state.override 提交 state、reason、ttl_s，state.clear_override 提交空 payload。GUI 手工操作生成 origin=user，自动 smoke 生成 origin=automation。显示最近一次 read/pump 产生的帧，snapshot() 不会再次采样。用户纠正的原因与有效区间随输入保存，清除和到期都会重新暴露当前基础估计。回放时的原始信号注入只改变采样输入。[观察契约](observation.md) · [C 的联调步骤](../handoff/c-gui-work-sessions.md)
+
+C 的状态动作结果附带 UiAction 的 event_id；非法状态参数返回带 event_id 的 rejected / INVALID_ARGUMENT。具有 command_id 的任务和工作段结果继续使用原模型，不添加额外字段。C 的动态组件与状态入口见 [P3 实现说明](../c-p3.md)。
