@@ -744,6 +744,8 @@ class Workbench(QMainWindow):
         return self.views.get(task_id)
 
     def _create(self):
+        while f"gui-{self._next_task}" in self.views:
+            self._next_task += 1
         task_id = f"gui-{self._next_task}"
         self._next_task += 1
         self._select_task = task_id
@@ -875,7 +877,9 @@ class Workbench(QMainWindow):
             return
         receipt = DisplayReceipt(delivery_id=command.delivery_id, task_id=command.task_id,
                                  task_version=command.task_version,
-                                 rendered_at=(datetime.now(timezone.utc) if self.latest["clock"] == "wall" else self.latest["now"]), outcome=outcome,
+                                 # A queued display can precede the next clock snapshot.
+                                 rendered_at=(datetime.now(timezone.utc) if self.latest["clock"] == "wall" else
+                                              max(command.requested_at, datetime.fromisoformat(self.latest["now"]))), outcome=outcome,
                                  source=source, error_code=error)
         self.receipts[command.delivery_id] = receipt
         if outcome == "displayed":
