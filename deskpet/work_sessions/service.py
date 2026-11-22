@@ -32,6 +32,7 @@ class CWorkSessionService:
         self.emit = emit
         self._views: dict[str, WorkSession] = {}
         self._deadlines: dict[str, float] = {}
+        self._durations: dict[str, float] = {}
         self._commands: dict[str, tuple[str, SessionResult]] = {}
 
     def get(self, session_id: str) -> WorkSession | None:
@@ -41,6 +42,10 @@ class CWorkSessionService:
     def list_sessions(self) -> list[WorkSession]:
         self.pump()
         return list(self._views.values())
+
+    def duration_for(self, session_id: str) -> float | None:
+        """Original duration for UI summaries, independent of pauses and reviews."""
+        return self._durations.get(session_id)
 
     def apply(self, command: SessionCommand) -> SessionResult:
         # Resolve expiry before version/state validation, including at the boundary.
@@ -78,6 +83,7 @@ class CWorkSessionService:
                         goal=args.goal.strip(), task_id=args.task_id, remaining_s=args.duration_s,
                         phase_due_at=due_at)
                     self._deadlines[command.session_id] = deadline
+                    self._durations[command.session_id] = args.duration_s
                 except (ValidationError, ValueError, OverflowError):
                     error = ErrorCode.INVALID_ARGUMENT
         elif current is None:

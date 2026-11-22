@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QElapsedTimer, QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 
 from deskpet.contracts import (
     DecisionEnvelope, DisplayCommand, DisplayReceipt, ErrorCode, RawSignals, UserCorrection,
-    ProposedPlan, SessionCommand, TaskCommand, TaskDraft, ToolCall, UiAction,
+    ProposedPlan, SessionCommand, SessionResult, TaskCommand, TaskDraft, ToolCall, UiAction,
 )
 
 
@@ -55,6 +55,8 @@ class ServiceWorker(QObject):
         self.delivery = delivery
         self.env = None
         self.timer = None
+        self._realtime_scenario_timer = None
+        self._realtime_scenario_elapsed = 0
         self._saved_envelope = None
         self._observation = None
         self._qt_source = "offscreen" if QGuiApplication.platformName() in ("offscreen", "minimal") else "native"
@@ -63,12 +65,22 @@ class ServiceWorker(QObject):
     def start(self):
         try:
             from .composition import build_environment
+            scenario_clock = None
+            if self.args.profile == "scenario" and (
+                getattr(self.args, "realtime_scenario", False)
+                or getattr(self.args, "scenario_initial_time", None) is not None
+            ):
+                from deskpet.mocks.clock import FakeClock
+                scenario_clock = FakeClock(getattr(self.args, "scenario_initial_time", None))
             self.env = build_environment(
                 profile=self.args.profile, scenario_id=self.args.scenario,
                 output=self.args.output, delivery=self.delivery, adapters=getattr(self.args, "adapters", None),
-                external_sampling=self.args.profile == "live-smoke",
+                external_sampling=self.args.profile == "live-smoke", clock=scenario_clock,
             )
             self._observation = self.env.observations.snapshot().observation
+            if self.args.profile == "scenario" and getattr(self.args, "realtime_scenario", False):
+                self._realtime_scenario_timer = QElapsedTimer()
+                self._realtime_scenario_timer.start()
             self.timer = QTimer(self)
             self.timer.setInterval(100)
             self.timer.timeout.connect(self.pump)
@@ -81,14 +93,21 @@ class ServiceWorker(QObject):
     def snapshot(self):
         if self.env is None:
             return
-        sessions = self.env.sessions.list_sessions()
+        session_models = self.env.sessions.list_sessions()
+        sessions = [view.model_dump(mode="json") for view in session_models]
+        duration_for = getattr(self.env.sessions, "duration_for", None)
+        if callable(duration_for):
+            for view in sessions:
+                duration = duration_for(view["session_id"])
+                if duration is not None:
+                    view["duration_s"] = duration
         frame = self.env.observations.snapshot()
         self._observation = frame.observation
         self.snapshot_ready.emit({
             "now": self.env.clock.wall_now().isoformat(),
             "clock": getattr(self.env.clock, "kind", "wall"),
             "tasks": [v.model_dump(mode="json") for v in self.env.tasks.list_tasks()],
-            "sessions": [v.model_dump(mode="json") for v in sessions],
+            "sessions": sessions,
             "observation": frame.observation.model_dump(mode="json"),
             "observation_frame": frame.model_dump(mode="json"),
             "sampling_editable": self.args.profile == "scenario" and hasattr(self.env.sampling, "set_signals"),
@@ -101,10 +120,17 @@ class ServiceWorker(QObject):
         if self.env is None:
             return
         try:
+            self._sync_realtime_scenario()
             self.env.pump()
             self.snapshot()
         except Exception as exc:
             self.error.emit(f"pump: {type(exc).__name__}: {exc}")
+
+    def _sync_realtime_scenario(self):
+        if self._realtime_scenario_timer is not None:
+            elapsed = self._realtime_scenario_timer.nsecsElapsed()
+            self.env.clock.advance((elapsed - self._realtime_scenario_elapsed) / 1_000_000_000)
+            self._realtime_scenario_elapsed = elapsed
 
     @pyqtSlot(object)
     def act(self, action):
@@ -112,6 +138,7 @@ class ServiceWorker(QObject):
             return
         ui = None
         try:
+            self._sync_realtime_scenario()
             if action.get("kind") == "ui":
                 ui = UiAction.model_validate(action["action"])
                 self.env.trace.emit("ui.action", task_id=ui.task_id,
@@ -151,10 +178,17 @@ class ServiceWorker(QObject):
                 cmd_kind = action["command"]
                 payload = dict(action.get("payload", {}))
                 if cmd_kind in ("create", "edit"):
-                    delay = float(payload.pop("delay_s", 10))
                     window = float(payload.pop("window_s", 20))
                     mode = payload.pop("mode", "soft")
-                    start = self.env.clock.wall_now() + timedelta(seconds=delay)
+                    absolute_start = payload.pop("earliest_at", None)
+                    if absolute_start is None:
+                        delay = float(payload.pop("delay_s", 10))
+                        start = self.env.clock.wall_now() + timedelta(seconds=delay)
+                    else:
+                        start = datetime.fromisoformat(absolute_start)
+                        if start.utcoffset() is None:
+                            raise ValueError("earliest_at requires a UTC offset")
+                        start = start.astimezone(timezone.utc)
                     draft = TaskDraft(content=payload.pop("content"), mode=mode,
                                       earliest_at=start,
                                       latest_first_delivery_at=start + timedelta(
@@ -204,10 +238,24 @@ class ServiceWorker(QObject):
                 setter(action["state"], evidence=action.get("evidence"), ttl_s=action.get("ttl_s", 30))
                 result = {"status": "estimate_submitted"}
             elif kind == "session":
-                result = self.env.sessions.apply(SessionCommand(
+                payload = dict(action.get("payload", {}))
+                only_if_idle = action["command"] == "start" and payload.pop("only_if_idle", False)
+                command = SessionCommand(
                     command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
                     session_id=action["session_id"], expected_version=action.get("version", 0),
-                    payload=action.get("payload", {})))
+                    payload=payload)
+                if only_if_idle and any(
+                    view.state != "ended" and view.session_id != command.session_id
+                    for view in self.env.sessions.list_sessions()
+                ):
+                    result = SessionResult(command_id=command.command_id, status="rejected",
+                                           error_code=ErrorCode.INVALID_TRANSITION)
+                    self.env.trace.emit(
+                        "session.rejected", session_id=command.session_id,
+                        payload={"command_id": command.command_id, "kind": command.kind,
+                                 "error_code": ErrorCode.INVALID_TRANSITION.value})
+                else:
+                    result = self.env.sessions.apply(command)
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:
@@ -256,7 +304,7 @@ class ServiceWorker(QObject):
                 self.result_ready.emit(value)
             self.pump()
         except Exception as exc:
-            if ui is not None and ui.action_id.startswith("state.") and isinstance(exc, (ValueError, KeyError, TypeError, OverflowError)):
+            if ui is not None and isinstance(exc, (ValueError, KeyError, TypeError, OverflowError)):
                 self.env.trace.emit("ui.rejected", source=self._qt_source,
                     simulated=self._qt_source != "native",
                     payload={"event_id": ui.event_id, "error_code": "INVALID_ARGUMENT"})
@@ -317,10 +365,17 @@ class ReminderCard(QFrame):
 
 
 class Workbench(QMainWindow):
+    """Diagnostic UI, optionally observing delivery owned by a deskpet surface.
+
+    The external surface is mounted on the GUI thread and makes visible-paint
+    reports through its own context. The embedded C tab stays available for
+    manual commands and can inspect deliveries without acknowledging them.
+    """
+
     action = pyqtSignal(object)
     stop_requested = pyqtSignal()
 
-    def __init__(self, args):
+    def __init__(self, args, *, external_surface=None):
         super().__init__()
         self.args = args
         self.setWindowTitle("Mochi M0 · 协作联调台")
@@ -361,8 +416,13 @@ class Workbench(QMainWindow):
         self._surface_failed = False
         self._surface_commands = {}
         self._surface_setup_error = None
+        self._external_surface = external_surface
+        self._external_context = None
+        self._external_surface_failed = False
         self._build_ui()
         self._mount_surface()
+        if external_surface is not None:
+            self._mount_external_surface()
         self.delivery = QtDeliveryBridge(self)
         self.thread = QThread(self)
         self.worker = ServiceWorker(args, self.delivery)
@@ -419,8 +479,18 @@ class Workbench(QMainWindow):
             self._surface_setup_error = f"C 界面装配失败：{type(exc).__name__}: {exc}"
             self.tabs.addTab(QLabel(self._surface_setup_error), "C 界面 · 失败")
 
-    def _submit_surface_action(self, action):
-        if not self.ready_for_actions or self._closing or self._finishing or self._surface_failed:
+    def _mount_external_surface(self):
+        from .ui_surface import SurfaceContext
+        self._external_context = SurfaceContext(
+            submit=lambda action: self._submit_surface_action(action, external=True),
+            report=lambda delivery_id, outcome, error: self._surface_receipt(
+                delivery_id, outcome, error, external=True),
+            can_report=lambda: self._surface_can_report(external=True), parent=self)
+        self._external_surface.attach_context(self._external_context)
+
+    def _submit_surface_action(self, action, *, external=False):
+        failed = self._external_surface_failed if external else self._surface_failed
+        if not self.ready_for_actions or self._closing or self._finishing or failed:
             raise RuntimeError("UI surface is not accepting actions")
         self.action.emit({"kind": "ui", "action": action.model_dump(mode="json")})
 
@@ -431,21 +501,35 @@ class Workbench(QMainWindow):
         if not (self._closing or self._finishing or self._surface_failed):
             self._fail_surface(RuntimeError("C 界面组件已销毁"))
 
-    def _surface_can_report(self):
-        return bool(self.ui_surface is not None and self.ui_surface.isVisible()
-                    and not (self._capturing or self._finishing or self._closing or self._surface_failed))
+    def _surface_can_report(self, *, external=False):
+        if self._capturing or self._finishing or self._closing:
+            return False
+        if external:
+            return bool(
+                self._external_surface is not None and not self._external_surface_failed
+                and QGuiApplication.platformName() not in ("offscreen", "minimal")
+                and self._external_surface.can_report_display()
+            )
+        return bool(self._external_surface is None and self.ui_surface is not None
+                    and self.ui_surface.isVisible() and not self._surface_failed)
 
-    def _surface_receipt(self, delivery_id, outcome, error):
+    def _surface_receipt(self, delivery_id, outcome, error, *, external=False):
+        if external != (self._external_surface is not None):
+            return False
         command = self._surface_commands.get(delivery_id)
         if command is None or self._capturing or self._finishing or self._closing:
             return False
-        if outcome == "displayed" and not self._surface_can_report():
+        if outcome == "displayed" and not self._surface_can_report(external=external):
             return False
         cached = self.receipts.get(delivery_id)
         if cached and cached.outcome == "displayed":
             return False
         view = self.views.get(command.task_id)
         if view and (view["version"] != command.task_version or view["status"] != "registered"):
+            return False
+        if external and (view is None or (command.task_id, command.task_version) in self.pending_cancels
+                         or not self.latest
+                         or datetime.fromisoformat(self.latest["now"]) < command.requested_at):
             return False
         if self.latest and command.expires_at <= datetime.fromisoformat(self.latest["now"]):
             self._receipt(command, "rejected", ErrorCode.EXPIRED_REQUEST)
@@ -462,12 +546,22 @@ class Workbench(QMainWindow):
             self.ui_surface.setEnabled(False)
         if self.surface_context is not None:
             self.surface_context._close()
+        if self._external_surface is None:
+            self._fail_pending_deliveries()
+        self._error(f"C 界面运行失败：{type(exc).__name__}: {exc}")
+
+    def _fail_external_surface(self, exc):
+        self._external_surface_failed = True
+        self._external_context._close()
+        self._fail_pending_deliveries()
+        self._error(f"小猫界面运行失败：{type(exc).__name__}: {exc}")
+
+    def _fail_pending_deliveries(self):
         for command in list(self._surface_commands.values()):
             cached = self.receipts.get(command.delivery_id)
             if cached is None or cached.outcome != "displayed":
                 self._receipt(command, "failed", ErrorCode.FAILED)
         self._surface_commands.clear()
-        self._error(f"C 界面运行失败：{type(exc).__name__}: {exc}")
 
     def _build_ui(self):
         central = QWidget()
@@ -855,6 +949,12 @@ class Workbench(QMainWindow):
                 self.ui_surface.render_snapshot(self.surface_context.snapshot)
             except Exception as exc:
                 self._fail_surface(exc)
+        if self._external_context is not None and not self._external_surface_failed:
+            self._external_context._update_snapshot(value)
+            try:
+                self._external_surface.render_snapshot(self._external_context.snapshot)
+            except Exception as exc:
+                self._fail_external_surface(exc)
 
     @pyqtSlot(object)
     def _result(self, result):
@@ -865,6 +965,8 @@ class Workbench(QMainWindow):
         self.log.append(json.dumps(result, ensure_ascii=False))
         if self.surface_context is not None and not (self._closing or self._finishing):
             self.surface_context._publish_result(result)
+        if self._external_context is not None and not (self._closing or self._finishing):
+            self._external_context._publish_result(result)
 
     @pyqtSlot(str)
     def _error(self, message):
@@ -889,7 +991,7 @@ class Workbench(QMainWindow):
                                  rendered_at=(datetime.now(timezone.utc) if self.latest["clock"] == "wall" else self.latest["now"]), outcome=outcome,
                                  source=source, error_code=error)
         self.receipts[command.delivery_id] = receipt
-        if outcome == "displayed":
+        if outcome == "displayed" and self._external_surface is None:
             output = Path(self.args.output)
             output.mkdir(parents=True, exist_ok=True)
             self._grab_evidence(output / f"delivery-{len(self.receipts)}.png")
@@ -909,13 +1011,17 @@ class Workbench(QMainWindow):
             return
         cached = self.receipts.get(command.delivery_id)
         if cached and cached.outcome == "displayed":
-            self.action.emit({"kind": "receipt", "receipt": cached.model_dump(mode="json")})
+            if self._external_surface is None:
+                self.action.emit({"kind": "receipt", "receipt": cached.model_dump(mode="json")})
             return
         fault = self.delivery_fault.currentText()
         if fault == "渲染失败":
             self._receipt(command, "failed", ErrorCode.FAILED)
             return
         if fault == "缺失回执":
+            return
+        if self._external_surface is not None:
+            self._display_external(command)
             return
         if self._surface_configured:
             if self._surface_failed:
@@ -941,6 +1047,26 @@ class Workbench(QMainWindow):
         self.card_layout.insertWidget(self.card_layout.count()-1, card)
         card.show()
 
+    def _display_external(self, command):
+        if self._external_surface_failed:
+            self._receipt(command, "failed", ErrorCode.FAILED)
+            return
+        previous = self._surface_commands.get(command.delivery_id)
+        if previous == command:
+            return
+        self._surface_commands[command.delivery_id] = command
+        try:
+            self._external_surface.show_reminder(command.model_copy(deep=True))
+        except Exception as exc:
+            self._fail_external_surface(exc)
+        if self.ui_surface is not None and not self._surface_failed:
+            try:
+                if previous is not None:
+                    self.ui_surface.dismiss_reminder(command.task_id)
+                self.ui_surface.show_reminder(command.model_copy(deep=True))
+            except Exception as exc:
+                self._fail_surface(exc)
+
     @pyqtSlot(str)
     def _dismiss(self, task_id):
         routed = any(c.task_id == task_id for c in self._surface_commands.values())
@@ -950,6 +1076,11 @@ class Workbench(QMainWindow):
                 self.ui_surface.dismiss_reminder(task_id)
             except Exception as exc:
                 self._fail_surface(exc)
+        if routed and self._external_surface is not None and not self._external_surface_failed:
+            try:
+                self._external_surface.dismiss_reminder(task_id)
+            except Exception as exc:
+                self._fail_external_surface(exc)
         for key, card in list(self.cards.items()):
             if card.command.task_id == task_id:
                 self.card_layout.removeWidget(card)
@@ -1191,6 +1322,9 @@ class Workbench(QMainWindow):
             self._smoke_checks["live_observation_sampled"] = live_ok
             success = success and live_ok
         success = success and not self.errors
+        delivery_owner = "ui_surface" if self._surface_configured else "workbench"
+        if self._external_surface is not None:
+            delivery_owner = "external_surface"
         self.report = {**provenance(), "status": "passed" if success else "failed", "profile": self.args.profile,
                        "receipt_source": source, "native_gui_verified": success and source == "native",
                        "manual_review": "pending", "checks": self._smoke_checks,
@@ -1199,7 +1333,7 @@ class Workbench(QMainWindow):
                        "observation_frame": self.latest.get("observation_frame"),
                        "ui_surface": {"configured": self._surface_configured, "failed": self._surface_failed,
                                       "adapter": self._surface_spec,
-                                      "delivery_owner": "ui_surface" if self._surface_configured else "workbench"},
+                                      "delivery_owner": delivery_owner},
                        "observation_checkpoints": self._observation_checkpoints,
                        "activation_requested": self._activation_requested,
                        "native_active_at_start": self._native_active_at_start,
@@ -1237,6 +1371,8 @@ class Workbench(QMainWindow):
             return
         if self.surface_context is not None:
             self.surface_context._close()
+        if self._external_context is not None:
+            self._external_context._close()
         event.accept()
 
 
