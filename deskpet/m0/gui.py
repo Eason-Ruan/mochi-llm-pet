@@ -111,6 +111,7 @@ class ServiceWorker(QObject):
         if self.env is None:
             return
         ui = None
+        ui_action_seq = None
         try:
             if action.get("kind") == "ui":
                 ui = UiAction.model_validate(action["action"])
@@ -120,6 +121,7 @@ class ServiceWorker(QObject):
                                     payload={"event_id": ui.event_id, "action_id": ui.action_id,
                                              "surface_revision": ui.surface_revision,
                                              "automation": bool(getattr(self.args, "auto_smoke", False))})
+                ui_action_seq = self.env.trace.events[-1].seq
                 prefix, verb = ui.action_id.split(".", 1)
                 if prefix == "reminder":
                     task = self.env.tasks.get(ui.task_id) if ui.task_id else None
@@ -204,10 +206,25 @@ class ServiceWorker(QObject):
                 setter(action["state"], evidence=action.get("evidence"), ttl_s=action.get("ttl_s", 30))
                 result = {"status": "estimate_submitted"}
             elif kind == "session":
+                payload = dict(action.get("payload", {}))
+                review = payload.pop("_review", None) if ui is not None else None
+                submitted_at = self.env.clock.wall_now().isoformat()
                 result = self.env.sessions.apply(SessionCommand(
                     command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
                     session_id=action["session_id"], expected_version=action.get("version", 0),
-                    payload=action.get("payload", {})))
+                    payload=payload))
+                if ui is not None and action["command"] == "end" and result.status == "applied":
+                    from deskpet.c_ui.review_evidence import end_record
+                    applied = next((e.seq for e in reversed(self.env.trace.events)
+                        if e.kind == "session.applied" and e.session_id == action["session_id"]
+                        and e.payload.get("command_id") == result.command_id), None)
+                    origin = ("automation" if getattr(self.args, "auto_smoke", False)
+                              or self._qt_source != "native" else "user")
+                    self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
+                        source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
+                        payload=end_record(result=result.model_dump(mode="json"), review=review,
+                            submitted_at=submitted_at, origin=origin,
+                            action_seq=ui_action_seq, applied_seq=applied))
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:

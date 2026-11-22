@@ -1,0 +1,5 @@
+{
+  "gui": "deskpet.c_ui.desktop:run_gui",
+  "work_sessions": "deskpet.work_sessions.service:factory",
+  "metrics": "d_metrics:factory"
+}

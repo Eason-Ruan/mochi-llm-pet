@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="output/m0/c-p1/native")
     parser.add_argument("--offscreen", action="store_true")
+    parser.add_argument("--adapters", default="examples/m0/c-product.adapters.json")
     args = parser.parse_args()
     if args.offscreen:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -32,7 +33,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     app = QApplication.instance() or QApplication([])
     options = SimpleNamespace(profile="scenario", scenario="c-work-session", output=str(output),
-                              auto_smoke=False, adapters="examples/m0/c-product.adapters.json")
+        auto_smoke=False, adapters=args.adapters)
     w = Workbench(options)
     p = w.ui_surface
     if not isinstance(p, CWorkspace):
@@ -138,6 +139,7 @@ def main():
 
     def empty_review():
         assert not panel.outcomes.toPlainText() and not panel.next_steps.toPlainText()
+        panel.confirm_none.setChecked(True)
         panel.confirm_end.click()
 
     def empty_saved():
