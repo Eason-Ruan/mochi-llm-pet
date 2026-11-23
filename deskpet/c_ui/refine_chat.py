@@ -303,6 +303,9 @@ class RefineChat(QWidget):
         self._history.setAccessibleName("聊天记录")
         self._history.setMinimumHeight(0)
         self._history.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        scrollbar = self._history.verticalScrollBar()
+        self._history_maximum = scrollbar.maximum()
+        scrollbar.rangeChanged.connect(self._follow_history_range)
         self._history.hide()
         self._panel_layout.addWidget(self._history, 1)
 
@@ -342,14 +345,10 @@ class RefineChat(QWidget):
     def _resize_from_grip(self, delta):
         if self._resize_start is None:
             self._resize_start = self.height()
-        scrollbar = self._history.verticalScrollBar()
-        follow_tail = scrollbar.value() == scrollbar.maximum()
         offset = -delta if self._panel_above else delta
         self._preferred_height = min(self._resize_limit,
                                      max(self._minimum_panel_height(), round(self._resize_start + offset)))
         self.geometry_requested.emit()
-        if follow_tail:
-            self._to_latest()
 
     def _commit_height(self):
         if self._resize_start is not None:
@@ -363,6 +362,13 @@ class RefineChat(QWidget):
     def _to_latest(self):
         scrollbar = self._history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def _follow_history_range(self, _minimum, maximum):
+        scrollbar = self._history.verticalScrollBar()
+        previous_maximum = self._history_maximum
+        self._history_maximum = maximum
+        if scrollbar.value() >= previous_maximum:
+            scrollbar.setValue(maximum)
 
     def set_preference(self, mode: str):
         self._preferred = mode if self._voice_available else "typing"
@@ -683,8 +689,6 @@ class RefineChat(QWidget):
         self._rendered_messages = self._messages.copy()
 
     def _render(self):
-        scrollbar = self._history.verticalScrollBar()
-        follow_tail = scrollbar.value() == scrollbar.maximum()
         self._editor = self._elapsed = self._waveform = None
         self._clear_widgets(self._extras)
         self._clear_widgets(self._cards)
@@ -712,8 +716,6 @@ class RefineChat(QWidget):
             button.held.connect(lambda: self._compose(self._other(self._preferred)))
             self._cards.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         self.updateGeometry()
-        if follow_tail:
-            QTimer.singleShot(0, self._to_latest)
 
     def refresh_proposals(self):
         self._render()

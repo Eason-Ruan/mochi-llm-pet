@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 import re
 import unicodedata
 from typing import Any
@@ -22,6 +22,12 @@ _IDENTIFIED_ACTIONS = {
 _CANCEL_START = re.compile(
     r"^(?:算了[，,、\s]*)?(?:别|不要|先别|不用|取消)\s*(?:再)?(?:开始|启动|开启|开)(?:[了吧。.!！\s]|专注|番茄|钟|计时|$)"
     r"|^(?:never\s+mind[,.\s]*)?(?:don't|do not|cancel)\s+(?:the\s+)?start\b", re.I,
+)
+_RELATIVE_REMINDER = re.compile(
+    r"^(?:(?:请(?:你|帮我)?|帮我)\s*)?"
+    r"(?P<delay>(?:[0-9０-９]+(?:[.．][0-9０-９]+)?|[零一二两三四五六七八九十百]+)\s*(?:分钟|小时|秒|分))"
+    r"\s*(?:之后|以后|后)\s*(?:准点|准时)?\s*提醒我\s*"
+    r"(?P<title>[^\s，,；;。.!！?？\n][^，,；;。.!！?？\n]{0,499}?)\s*[。.!！]*$"
 )
 
 
@@ -128,6 +134,8 @@ def _explicit_action(text: str) -> str | None:
     text = re.sub(r"^(?:请(?:你|帮我)?|帮我)\s*", "", text)
     if (text.endswith(("?", "？")) and not request) or re.match(r"^(?:如果|假如|我刚才|怎么|如何|能否|what\b|how\b|why\b|if\b)", text):
         return None
+    if _RELATIVE_REMINDER.fullmatch(text):
+        return "item.create"
     rules = (
         ("phase.start", r"^(?:请(?:帮我)?\s*|帮我\s*|现在\s*)?(?:开始|启动|开启|开|来个?|start\b|begin\b).*(?:专注|番茄|休息|分钟|小时|计时|focus\b|minutes?\b|min\b|pomodoro\b|break\b)"),
         ("phase.pause", r"^(?:请|帮我\s*)?(?:暂停(?:专注|休息|计时|番茄|一下|[。！! ]*$)|pause\b)"),
@@ -209,20 +217,23 @@ def _settings_grant(text: str, selected_ref: str | None, context: dict) -> dict 
     return {"equal": {"scope": "default"}, "patch": patch} if patch else None
 
 
-def describe_grants(user: dict | None, context: dict) -> dict[str, dict]:
+def describe_grants(user: dict | None, context: dict, *, requested_at: datetime) -> dict[str, dict]:
     if user is None:
         eligible = [ref_id(item["occurrence_id"]) for item in context["eligible_items"] if item.get("occurrence_id")]
         rechecks = [ref_id(item["occurrence_id"]) for item in context.get("recheck_items", ()) if item.get("occurrence_id")]
         reviewable = list(dict.fromkeys(eligible + rechecks))
         focus = context["enabled_settings"].get("auto_adjust", False)
-        grants = {"pet.present": {}}
+        available = context["current_status"] == "fresh" and (context.get("current") or {}).get("state") == "available"
+        grants = {}
+        if available and context.get("opportunity_id"):
+            grants["pet.present"] = {}
         if focus or reviewable:
             grants["observation.wait_fresh"] = {"occurrences": reviewable, "focus": focus}
         if eligible:
             grants["reminder.present"] = {"occurrences": eligible}
         if reviewable:
             grants["reminder.recheck"] = {"occurrences": reviewable}
-        if focus and context["current_status"] == "fresh" and (context.get("current") or {}).get("state") == "available":
+        if focus and available:
             phase = ref_id((context.get("current_phase") or {}).get("id"))
             grants["proposal.offer"] = {"target": phase, "background": True}
         return grants
@@ -277,6 +288,17 @@ def describe_grants(user: dict | None, context: dict) -> dict[str, dict]:
         return {action: {"equal": equal, "issues": sorted(issues), "habits": sorted(habits),
                          "default_duration": context["enabled_settings"].get(default_duration), "input": text}}
     if action == "item.create":
+        literal = _RELATIVE_REMINDER.fullmatch(without_cancellation(user["utterance"]).strip())
+        if literal and (delay := _seconds(normalized(literal["delay"]))):
+            at = (requested_at.astimezone(UTC) + timedelta(seconds=delay)).isoformat()
+            return {action: {"equal": {"type": "reminder"}, "title": literal["title"].strip(),
+                             "input": text, "has_reminder": True, "deadline": False,
+                             "relative": True,
+                             "reminder_constraints": {
+                                 "exact": True, "earliest": True, "latest": True,
+                                 "fixed_times": {"remind_after": at, "remind_by": at},
+                                 "timezone": context["timezone"],
+                             }}}
         title = re.match(r"^(?:请(?:帮我)?|帮我\s*)?(?:记(?:一)?下|记录|note\s+|remember\s+)(?:我)?(?:要)?\s*(\S.*?)\s*[。！!]?\s*$", text)
         equal["type"] = "reminder" if re.search(r"提醒|\bremind(?:er)?\b", text) else "issue"
         return {action: {"equal": equal, "title": title[1].strip('“”"') if title and equal["type"] == "issue" else None,
@@ -440,13 +462,16 @@ def timer_query_language(utterance: str) -> str | None:
 
 
 def deterministic_command(user: dict | None, grants: dict[str, dict]) -> tuple[str, dict] | None:
-    """Recover a literal timer request when a completed model made no write call."""
+    """Build a command only when the grant binds every required parameter."""
     if not user or not user.get("utterance") or len(grants) != 1:
         return None
     text = normalized(without_cancellation(user["utterance"])).rstrip("。.!！?？")
     action, binding = next(iter(grants.items()))
     exact = binding.get("equal", {})
     duration = _DURATION_PHRASE
+    if action == "item.create" and binding.get("relative"):
+        return action, {**exact, "title": binding["title"],
+                        "reminder_rule": binding["reminder_constraints"]["fixed_times"]}
     if action == "phase.start" and "planned_duration_s" in exact:
         pattern = (_REQUEST_PREFIX + r"(?:开始|启动|开启|开|来|start|begin)\s*(?:一个|个|a\s+)?"
                    + duration + r"\s*(?:的|of\s+)?(?:专注|计时|番茄钟?|(?:长|短)?休息|focus|pomodoro|break|timer)?(?:吗|吧)?")
@@ -546,7 +571,7 @@ def allows(grants: dict[str, dict], function: str, args: dict) -> bool:
             if value and normalized(value) not in binding["input"] and not (field == "title" and value in {"专注", "休息"}):
                 return False
     if function == "item.create" and (title := binding.get("title")):
-        if not isinstance(args.get("title"), str) or normalized(args["title"]).rstrip("。！!") != title:
+        if not isinstance(args.get("title"), str) or normalized(args["title"]).rstrip("。！!") != normalized(title):
             return False
     if function == "item.create":
         description = args.get("description")

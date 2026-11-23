@@ -66,12 +66,13 @@ _REASONS = {
     "available": "当时符合提醒的空档条件。",
     "working": "当时正在工作。",
     "disabled": "相关设置已关闭。",
-    "model_unavailable": "这次未能连接 System 2 模型。",
+    "model_unavailable": "这次对话模型没能完成回复。",
     "superseded": "这条请求已经被后续操作替代。",
     "interrupted": "上一轮未完成，已核对保存的执行结果。",
     "expired_request": "这条请求已超过可执行时限。",
 }
 _STALE = {"STALE_TASK", "STALE_CONTEXT", "STALE_VERSION", "STALE_PROPOSAL"}
+_CAPABILITY_QUESTION = re.compile(r"(?:请问\s*)?(?:你)?(?:现在|当前)?有(?:操作)?权限吗[?。！!]*")
 _ITEM_LIST_QUERY = re.compile(
     r"^(?:请(?:帮我)?|帮我)?\s*(?:(?:查看|列出|显示|看看)(?:我(?:的)?)?\s*(?:所有|全部|现有|当前)?"
     r"\s*(?:待办事项|事项|待办|任务|提醒)(?:列表)?[？?。！! ]*$"
@@ -121,6 +122,8 @@ def _result_reply(function: str, result: dict) -> dict:
         text = result.get("message") or _ACTION_LABELS.get(function, "已处理。")
         phase = view.get("phase", view)
         seconds = phase.get("planned_duration_s") if isinstance(phase, dict) else None
+        if function == "item.create" and view.get("type") == "reminder" and (title := view.get("title")):
+            text = f"已设置提醒「{title}」。"
         if function in {"phase.start", "phase.adjust", "proposal.resolve"} and isinstance(seconds, (int, float)):
             length = f"{seconds / 60:g} 分钟" if seconds % 60 == 0 else f"{seconds:g} 秒"
             text = f"{'已调整' if function == 'phase.adjust' else '已开始'} · {length}"
@@ -697,7 +700,7 @@ class System2Host:
                     self._finish(admission, EngineReply(""), None, {}, context, as_of,
                                  local_reply={"text": text, "status": "answered"})
                     return
-        grants = describe_grants(intent, context)
+        grants = describe_grants(intent, context, requested_at=admission.created_at)
         bound = self._authority_context(context, schedule)
         if not self._store.bind(admission, grants, bound):
             return
@@ -719,7 +722,7 @@ class System2Host:
                 if (needs_refresh and not refreshed and canonical_tool_name(name) == "context.read"
                         and isinstance(args, dict) and not args.get("as_of")):
                     current, current_schedule = self._snapshot(admission, self.clock.wall_now())
-                    if describe_grants(intent, current) == grants:
+                    if describe_grants(intent, current, requested_at=admission.created_at) == grants:
                         updated = self._authority_context(current, current_schedule)
                         if self._store.bind(admission, grants, updated):
                             context, bound = current, updated
@@ -737,6 +740,23 @@ class System2Host:
             result = call_tool("phase.get", "local:time-remaining", {}, step_id=admission.step_id)
             self._finish(admission, EngineReply(""), None, grants, context, as_of,
                          local_reply=_timer_reply(result, language))
+            return
+        command = deterministic_command(intent, grants)
+        if command and command[0] == "item.create":
+            # A literal short delay can expire while the cloud model is thinking.
+            function, args = command
+            due = datetime.fromisoformat(args["reminder_rule"]["remind_by"])
+            if due <= self.clock.wall_now():
+                self._finish(admission, EngineReply(""), "expired_request", grants, context, as_of)
+            else:
+                call_tool(function, "explicit:" + function, args, step_id=admission.step_id)
+                self._finish(admission, EngineReply(""), None, grants, context, as_of)
+            return
+        if intent and not grants and _CAPABILITY_QUESTION.fullmatch(normalized(intent.get("utterance") or "")):
+            self._finish(admission, EngineReply(""), None, grants, context, as_of, local_reply={
+                "text": "可以直接叫我设提醒、记事项或开始专注。比如「一分钟后提醒我喝水」。我会告诉你这件事是否已办成。",
+                "status": "answered",
+            })
             return
         request = TurnRequest(
             admission.admission_id, admission.step_id, SYSTEM_PROMPT, json_text({
@@ -757,7 +777,7 @@ class System2Host:
         if not admission.created_at <= self.clock.wall_now() < admission.expires_at:
             reply, failure = EngineReply(""), "expired_request"
         if not self._stopping.is_set():
-            if failure is None and not attempted_write and (command := deterministic_command(intent, grants)):
+            if failure is None and not attempted_write and command:
                 function, args = command
                 call_tool(function, "explicit:" + function, args, step_id=admission.step_id)
             self._finish(admission, reply, failure, grants, context, as_of)

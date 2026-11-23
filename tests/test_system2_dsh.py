@@ -99,6 +99,7 @@ def endpoints():
             self.path = "/v1/chat/completions"
             self.reasoning_parts = ()
             self.failure = None
+            self.failure_body = None
             self.redirect_to = None
             self.verify = False
             self.respond = None
@@ -135,6 +136,8 @@ def endpoints():
                         if model.redirect_to:
                             self.send_header("Location", model.redirect_to)
                         self.end_headers()
+                        if model.failure_body is not None:
+                            self.wfile.write(json.dumps(model.failure_body).encode())
                         return
                     result = next((message["content"] for message in reversed(body["messages"])
                                    if message["role"] == "tool"), None)
@@ -408,6 +411,15 @@ def test_bailian_native_tool_continuation_and_credential_scope(tmp_path, endpoin
             engine.run(turn(), reply)
         assert len(endpoint.requests) == 6
         assert redirect.requests == []
+
+        endpoint.failure = 400
+        endpoint.redirect_to = None
+        endpoint.failure_body = {"error": {"code": "InvalidParameter", "message": SUMMARY}}
+        with pytest.raises(CloudRouteError, match=r"HTTP 400 \(InvalidParameter\)"):
+            engine.run(turn(), reply)
+        failure = settings.routes.snapshot(SYSTEM2).last_failure
+        assert failure == "System 2 endpoint returned HTTP 400 (InvalidParameter)"
+        assert len(endpoint.requests) == 7
     finally:
         engine.close()
 

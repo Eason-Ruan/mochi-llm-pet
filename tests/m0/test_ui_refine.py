@@ -174,6 +174,15 @@ try:
     assert editor is not None and editor.text() == '暂存的输入'
     bar.setValue(bar.maximum())
     assert bar.value() > 0
+    chat.append_message("**最新回复**\n\n" + "此处验证动态消息卡片的最终高度。" * 20 + "\n\n这一行在回复末尾。")
+    QTest.qWait(60)
+    assert bar.value() == bar.maximum()
+    last_card = chat._message_cards.itemAt(chat._message_cards.count() - 1).widget()
+    previous_maximum = bar.maximum()
+    last_card.setMinimumHeight(last_card.height() + 40)
+    wait_for(lambda: bar.maximum() > previous_maximum, 'late card resize did not update scroll range')
+    assert bar.value() == bar.maximum()
+    assert last_card.mapTo(history.viewport(), last_card.rect().bottomLeft()).y() < history.viewport().height()
     chat.reset_input()
 
     session.show_message('一条可以关闭的测试消息')

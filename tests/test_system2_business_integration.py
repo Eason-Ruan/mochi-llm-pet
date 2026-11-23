@@ -11,6 +11,7 @@ from deskpet.c_ui.desktop_system2 import DesktopSystem2
 from deskpet.c_ui.presentation import DesktopPresentation
 from deskpet.c_ui.refine_conversation_store import ConversationStore
 from deskpet.system2.host import System2Host
+from deskpet.system2.intent import describe_grants
 from deskpet.system2.protocol import EngineReply
 from deskpet.system2.tools import System2ToolExecutor
 from deskpet.work_sessions import PersistentWorkSessionService
@@ -322,6 +323,58 @@ def test_chat_binds_the_users_literal_reminder_times(business, message, fields):
         assert len(business.tasks.list_tasks()) == 1
     finally:
         host.close()
+
+
+def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(business):
+    def unexpected_model(*_):
+        pytest.fail("literal reminder and capability question should run locally")
+
+    host = host_for(business, unexpected_model)
+    try:
+        start = business.clock.wall_now()
+        host.submit_user("一分钟后提醒我喝水", event_id="water")
+        business.clock.advance(3)
+        assert host.pump()
+        task, = business.tasks.list_tasks()
+        due = start + timedelta(minutes=1)
+        assert task.draft.content == "喝水"
+        assert task.draft.mode == "hard"
+        assert task.draft.opens_at == task.draft.hard_deadline == due
+
+        host.submit_user("你现在有权限吗", event_id="capability-question")
+        assert host.pump()
+        assert len(business.tasks.list_tasks()) == 1
+        created, capability = host.ui_events()
+        assert created.payload["text"] == "已设置提醒「喝水」。"
+        assert "可以直接叫我设提醒" in capability.payload["text"]
+
+        host.submit_user("1秒后提醒我休息", event_id="elapsed-reminder")
+        business.clock.advance(2)
+        assert host.pump()
+        assert len(business.tasks.list_tasks()) == 1
+        assert host.ui_events()[-1].payload["status"] == "expired_request"
+
+        business.clock.advance((due - business.clock.wall_now()).total_seconds())
+        business.tasks.pump()
+        delivery, = business.tasks.delivery.commands
+        assert delivery.reason == "hard_due" and delivery.requested_at == due
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize(("status", "state", "opportunity", "allowed"), [
+    ("no_data", "unknown", None, False),
+    ("expired", "available", "break", False),
+    ("fresh", "working", "break", False),
+    ("fresh", "available", None, False),
+    ("fresh", "available", "break", True),
+])
+def test_background_pet_presentation_requires_a_current_opportunity(business, status, state, opportunity, allowed):
+    grants = describe_grants(None, {
+        "eligible_items": [], "enabled_settings": {}, "current_status": status,
+        "current": {"state": state}, "opportunity_id": opportunity,
+    }, requested_at=business.clock.wall_now())
+    assert ("pet.present" in grants) == allowed
 
 
 @pytest.mark.parametrize(("message", "mode"), [

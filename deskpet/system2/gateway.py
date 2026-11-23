@@ -21,6 +21,28 @@ from .bailian import BailianTurn
 
 _LOG = logging.getLogger(__name__)
 _MAX_BODY = 4 * 1024 * 1024
+_BAILIAN_BAD_REQUEST_CODES = frozenset({
+    "InvalidParameter", "InternalError.Algo.InvalidParameter", "DataInspectionFailed",
+    "InvalidParameter.DataInspection", "invalid_parameter_error", "context_length_exceeded",
+})
+
+
+def _bailian_bad_request_code(response: httpx.Response) -> str | None:
+    try:
+        with closing(response.iter_bytes(chunk_size=4097)) as chunks:
+            data = next(chunks, b"")
+        if len(data) > 4096:
+            return None
+        payload = json.loads(data)
+    except (httpx.HTTPError, ValueError, RecursionError):
+        return None
+    if isinstance(payload, dict):
+        error = payload.get("error", payload)
+        if isinstance(error, dict):
+            code = error.get("code")
+            if isinstance(code, str) and code in _BAILIAN_BAD_REQUEST_CODES:
+                return code
+    return None
 
 
 @dataclass(frozen=True)
@@ -245,6 +267,8 @@ class ModelGateway:
                             status = 502
                         else:
                             self.last_failure = f"System 2 endpoint returned HTTP {status}"
+                            if bailian and status == 400 and (code := _bailian_bad_request_code(response)):
+                                self.last_failure += f" ({code})"
                             if not 400 <= status <= 599:
                                 status = 502
                         handler._write(status, {"error": "System 2 provider rejected the request"})
