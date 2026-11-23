@@ -1,0 +1,6 @@
+{
+  "task_service": "deskpet.task_service:factory",
+  "work_sessions": "deskpet.work_sessions.service:factory",
+  "ui_surface": "deskpet.c_ui.surface:create_surface",
+  "metrics": "d_metrics:factory"
+}

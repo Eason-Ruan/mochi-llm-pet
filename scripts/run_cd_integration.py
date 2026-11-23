@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 import os
 import platform
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,25 @@ import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def check_sqlite_outputs(output):
+    """State-only UI checks intentionally create no reminder tasks."""
+    databases = {p.stem: p for p in (output / "databases").glob("*.sqlite3")}
+    expected = {"reminders", "work", "state", "experience", "realtime", "host"}
+    if set(databases) != expected:
+        raise RuntimeError("Missing or unexpected SQLite databases")
+    result = {}
+    for name, database in sorted(databases.items()):
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
+            integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
+            task_count = db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+            event_count = db.execute("SELECT count(*) FROM events").fetchone()[0]
+        if integrity != "ok" or (name != "state" and (not task_count or not event_count)):
+            raise RuntimeError(f"{name}: missing persisted tasks/events or bad integrity")
+        result[name] = {"integrity": integrity, "persisted_tasks": task_count,
+                        "persisted_events": event_count}
+    return result
 
 
 def source_hashes():
@@ -28,11 +48,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path, help="A new output directory")
     parser.add_argument("--offscreen", action="store_true", help="Diagnostics only, no native GUI acceptance")
+    parser.add_argument("--with-sqlite", action="store_true", help="Also integrate B's production SQLite adapter and recovery")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     baseline = source_hashes()
     env = dict(os.environ, PYTHONPATH=str(ROOT))
+    product = "examples/m0/abcd-product.adapters.json" if args.with_sqlite else "examples/m0/cd-product.adapters.json"
+    desktop = "examples/m0/abcd-desktop.adapters.json" if args.with_sqlite else "examples/m0/cd-desktop.adapters.json"
+    replay = "examples/m0/abcd-replay.adapters.json" if args.with_sqlite else product
     steps = [
         ("regression", ["-m", "pytest", "-q", "tests/m0", "tests/test_d_evaluation.py",
                         "tests/test_d_metric_calculators.py", "tests/test_d_metric_report.py",
@@ -40,21 +64,24 @@ def main():
         ("examples", ["-m", "deskpet.m0", "examples", "--check"]),
         ("d-baseline", ["scripts/d_replay.py", "--output", str(output / "d-baseline")]),
         ("combined-replay", ["-m", "deskpet.m0", "replay", "--suite", "m0", "--adapters",
-                            "examples/m0/cd-product.adapters.json", "--output", str(output / "replay")]),
+                            replay, "--output", str(output / "replay")]),
     ]
+    if args.with_sqlite:
+        steps[0] = ("regression", ["-m", "pytest", "-q", "tests", f"--junitxml={output / 'tests.xml'}"])
+        steps.append(("sqlite-recovery", ["-m", "deskpet.task_service.recovery", "--output", str(output / "sqlite-recovery")]))
     for name, script in (("reminders", "smoke_c_reminders.py"), ("work", "smoke_c_work_sessions.py"),
                          ("state", "smoke_c_state.py"), ("experience", "smoke_c_experience.py")):
-        adapters = "examples/m0/cd-desktop.adapters.json" if name == "experience" else "examples/m0/cd-product.adapters.json"
+        adapters = desktop if name == "experience" else product
         command = [f"scripts/{script}", "--adapters", adapters, "--output", str(output / name)]
         if args.offscreen:
             command.append("--offscreen")
         steps.append((name, command))
-    realtime = ["scripts/smoke_c_realtime.py", "--output", str(output / "realtime")]
+    realtime = ["scripts/smoke_c_realtime.py", "--adapters", desktop, "--output", str(output / "realtime")]
     if args.offscreen:
         realtime.append("--offscreen")
     steps += [("realtime", realtime),
               ("host", ["-m", "deskpet.m0", "gui", "--profile", "scenario", "--auto-smoke",
-                        "--adapters", "examples/m0/cd-product.adapters.json", "--output", str(output / "host")])]
+                        "--adapters", product, "--output", str(output / "host")])]
     steps += [
         ("delivery-evidence", ["scripts/d_count_deliveries.py", str(output / "reminders/trace.jsonl")]),
         ("review-evidence", ["scripts/check_cd_reviews.py", str(output / "work/trace.jsonl")]),
@@ -71,7 +98,7 @@ def main():
         "platform": platform.platform(), "started_at": datetime.now(timezone.utc).isoformat(),
         "step_details": {}, "formal_human_metrics": "not_measured",
         "pending_acceptance": ["human_experience", "Windows" if sys.platform != "win32" else "macOS",
-                               "A upstream UiSpec integration", "B persistent task service"]}
+                               "A upstream model-produced UiSpec push"] + ([] if args.with_sqlite else ["B persistent task service"])}
     def save():
         (output / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     save()
@@ -79,6 +106,12 @@ def main():
         for name, command in steps:
             print(f"Running {name}", flush=True)
             step_env = dict(env)
+            if name == "regression" and args.with_sqlite:
+                for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                    step_env.pop(key, None)
+            if args.with_sqlite and name in {"reminders", "work", "state", "experience", "realtime", "host"}:
+                (output / "databases").mkdir(exist_ok=True)
+                step_env["MOCHI_TASK_DB"] = str(output / "databases" / f"{name}.sqlite3")
             if name == "host" and args.offscreen:
                 step_env["QT_QPA_PLATFORM"] = "offscreen"
             started = time.monotonic()
@@ -110,6 +143,12 @@ def main():
         suites = ET.parse(output / "tests.xml").getroot().findall("testsuite")
         report["regression"] = {key: sum(int(s.get(key, 0)) for s in suites)
                                 for key in ("tests", "failures", "errors", "skipped")}
+        if args.with_sqlite:
+            report["sqlite"] = check_sqlite_outputs(output)
+            recovery = json.loads((output / "sqlite-recovery/report.json").read_text())
+            if recovery.get("status") != "passed":
+                raise RuntimeError("B cross-process recovery did not pass")
+            report["sqlite_recovery"] = {k: recovery[k] for k in ("status", "verification", "checks", "processes")}
         if source_hashes() != baseline:
             raise RuntimeError("Source changed during integration")
         report["artifact_sha256"] = {str(p.relative_to(output)): sha256(p.read_bytes()).hexdigest()

@@ -1,0 +1,6 @@
+{
+  "task_service": "deskpet.task_service:factory",
+  "work_sessions": "deskpet.work_sessions.service:factory",
+  "gui": "deskpet.c_ui.desktop:run_gui",
+  "metrics": "d_metrics:factory"
+}

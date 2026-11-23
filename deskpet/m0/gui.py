@@ -334,6 +334,14 @@ class ServiceWorker(QObject):
     def stop(self):
         if self.timer:
             self.timer.stop()
+        if self.env is not None:
+            for service in (self.env.sessions, self.env.tasks):
+                close = getattr(service, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        self.error.emit(f"关闭服务失败：{type(exc).__name__}: {exc}")
         self.stopped.emit()
         QThread.currentThread().quit()
 

@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--offscreen", action="store_true")
+    parser.add_argument("--adapters", default="examples/m0/cd-desktop.adapters.json")
     args = parser.parse_args()
     if args.offscreen:
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -29,12 +30,14 @@ def main():
     app = QApplication([])
     app.setQuitOnLastWindowClosed(False)
     desktop = DesktopSession(app, SimpleNamespace(profile="realtime", scenario="c-realtime",
-        output=str(output), auto_smoke=False, adapters="examples/m0/cd-desktop.adapters.json"))
+        output=str(output), auto_smoke=False, adapters=args.adapters))
     w = desktop.window
     p = w.ui_surface
     reminders, work = p.reminder_panel, p.work_panel
     source = "offscreen" if QGuiApplication.platformName() in {"offscreen", "minimal"} else "native"
     state = {"stage": 0, "since": time.monotonic()}
+    started_monotonic = time.monotonic()
+    started_wall = datetime.now(timezone.utc)
     checks, report = {}, {}
     timer = QTimer()
 
@@ -54,6 +57,10 @@ def main():
 
     def tick():
         try:
+            clock_gap = ((datetime.now(timezone.utc) - started_wall).total_seconds()
+                         - (time.monotonic() - started_monotonic))
+            if abs(clock_gap) > 2:
+                raise RuntimeError(f"Environment interrupted by suspend or clock adjustment ({clock_gap:.1f}s); rerun while awake")
             elapsed = time.monotonic() - state["since"]
             if elapsed > 25:
                 raise TimeoutError(f"stage {state['stage']}; visible={w.isVisible()}, active={w.isActiveWindow()}, errors={w.errors}")
