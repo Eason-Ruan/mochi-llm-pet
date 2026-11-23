@@ -112,7 +112,8 @@ def _model_view(model):
 
 
 def _settings_view(settings):
-    return {key: value for key, value in settings.to_dict().items() if not key.startswith("observation_")}
+    return {key: value for key, value in settings.to_dict().items()
+            if not key.startswith(("observation_", "document_"))}
 
 
 class System2ToolExecutor:
@@ -267,9 +268,10 @@ class System2ToolExecutor:
         # Project the route's currently authorized view outside the business write lock.
         if self.context_reader is None:
             return _rejected(call_id, "DISABLED")
-        return ToolResult(call_id, "applied", view=self._read_context(authority, _when(args.get("as_of"))))
+        return ToolResult(call_id, "applied", view=self._read_context(authority, args))
 
-    def _read_context(self, authority, as_of):
+    def _read_context(self, authority, args):
+        as_of = _when(args.get("as_of"))
         if callable(self.context_reader):
             return self.context_reader(authority, as_of)
         from deskpet.observation_v2.context import project_observation_context
@@ -277,8 +279,10 @@ class System2ToolExecutor:
         reader = self.context_reader
         if as_of is not None and hasattr(reader, "reader"):
             reader = reader.reader
-        context = reader.read_observation_context(as_of or self.now())
-        view = project_observation_context(context, share_summary=False)
+        options = {key: _when(args[key]) for key in ("history_start", "history_end") if args.get(key)}
+        context = reader.read_observation_context(as_of or self.now(), **options)
+        view = project_observation_context(context, share_summary=False, historical=as_of is not None,
+                                           include_capture_health=args.get("include_capture_health") is True)
         if as_of is not None:
             view.update(current=None, current_status="context_changed")
         return view

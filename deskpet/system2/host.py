@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import RealClock
-from deskpet.observation_v2.context import ObservationContext, project_observation_context
+from deskpet.observation_v2.context import OBSERVATION_CONTEXT_FIELDS, ObservationContext, project_observation_context
 from deskpet.settings import SettingsStore
 from deskpet.timezones import resolve_timezone
 
@@ -73,6 +73,16 @@ _REASONS = {
 }
 _STALE = {"STALE_TASK", "STALE_CONTEXT", "STALE_VERSION", "STALE_PROPOSAL"}
 _CAPABILITY_QUESTION = re.compile(r"(?:请问\s*)?(?:你)?(?:现在|当前)?有(?:操作)?权限吗[?。！!]*")
+_ACTIVITY_QUESTION = re.compile(
+    r"(?:刚才|刚刚|方才|之前|上一|过去|近一小时|这段时间|此前).{0,20}(?:做|干|改|看|打开|活动|那个|哪)"
+    r"|(?:哪|第[一二三四五六七八九十\d]+)(?:一)?(?:份|个|篇|段)(?:文档|文件|活动|[呢吗？?])?"
+    r"|(?:现在|正在).{0,15}(?:做什么|干嘛|看什么|改什么|开着什么)"
+    r"|(?:最近|之前|过去|刚才).{0,10}(?:活动|观测|观察)"
+    r"|^(?:那份|另一份|另一个|那另一个|另一个呢|那第二个).{0,8}[呢吗？?]?$"
+    r"|\b(?:what|which|second|third)\b.{0,55}\b(?:document|file|activity|doing|working on|looking at|editing|opened)\b"
+    r"|\b(?:last hour|just now|earlier|previous activity|last activity)\b"
+    r"|^(?:what about )?(?:the )?(?:other|next|second|third) one[?.]?$", re.IGNORECASE,
+)
 _ITEM_LIST_QUERY = re.compile(
     r"^(?:请(?:帮我)?|帮我)?\s*(?:(?:查看|列出|显示|看看)(?:我(?:的)?)?\s*(?:所有|全部|现有|当前)?"
     r"\s*(?:待办事项|事项|待办|任务|提醒)(?:列表)?[？?。！! ]*$"
@@ -182,7 +192,8 @@ class System2Host:
         if engine is None:
             from .dsh import DSHEngine
 
-            engine = DSHEngine(self.data_dir, settings=self.settings, tools=self.gateway.definitions)
+            engine = DSHEngine(self.data_dir, settings=self.settings, tools=self.gateway.definitions,
+                               observation_guard=self._observation_privacy_marker)
             self._trusted_projection = True
         else:
             self._trusted_projection = False
@@ -418,24 +429,43 @@ class System2Host:
                     habits = [habit for habit in habits if selected == habit["id"]
                               or normalized(habit["title"]) in original or habit["id"] in original]
         enabled = {key: value for key, value in settings.to_dict().items()
-                   if not key.startswith("observation_") and key != "input_mode"}
+                   if not key.startswith(("observation_", "document_")) and key != "input_mode"}
         return {"current_phase": phase, "items": items, "habits": habits, "enabled_settings": enabled, **selection}
 
-    def _observation(self, as_of, *, historical=False):
+    def _observation_privacy_marker(self):
+        reader = self.context_reader
+        if isinstance(reader, DesktopObservationInput):
+            reader = reader.reader
+        read = getattr(reader, "read_privacy_marker", None)
+        return read() if read is not None else (None, 0, None)
+
+    def _observation(self, as_of, *, historical=False, document_query=False, include_capture_health=False,
+                     history_start=None, history_end=None):
         try:
-            if historical and isinstance(self.context_reader, DesktopObservationInput):
-                observation = self.context_reader.reader.read_observation_context(as_of)
-            else:
-                observation = self.context_reader.read_observation_context(as_of)
+            reader = self.context_reader
+            if historical and isinstance(reader, DesktopObservationInput):
+                reader = reader.reader
+            expansion = {key: value for key, value in {"history_start": history_start, "history_end": history_end}.items()
+                         if value is not None}
+            observation = reader.read_observation_context(as_of, **expansion)
+            settings = self.settings.read()
+            locked = self._observation_privacy_marker()[2] is True
         except (sqlite3.Error, OSError, ValueError):
-            observation = ObservationContext.empty(as_of)
+            return project_observation_context(ObservationContext.empty(as_of))
         # The DSH engine reprojects before injection and rechecks each recipient
         # on the actual send. Keep injectable engines on the default projection.
-        return project_observation_context(observation, share_summary=self._trusted_projection)
+        return project_observation_context(
+            observation, share_summary=self._trusted_projection,
+            document_sources=settings.document_local_sources if self._trusted_projection and document_query else (),
+            include_document_source=self._trusted_projection,
+            excluded_apps=settings.observation_excluded_apps, excluded_domains=settings.observation_excluded_domains,
+            paused=settings.observation_paused, suppress_details=locked, historical=historical,
+            include_capture_health=include_capture_health, restrict_legacy_summaries=self._trusted_projection,
+        )
 
-    def _snapshot(self, admission, as_of):
+    def _snapshot(self, admission, as_of, **observation_options):
         schedule = self.scheduler.snapshot(as_of) if self.scheduler is not None else {}
-        observation = self._observation(as_of)
+        observation = self._observation(as_of, **observation_options)
         domain = self._business_context(admission, as_of)
         relevant_ids = {item["id"] for item in domain["items"]}
         eligible = [item for value in schedule.get("eligible_items", ()) if
@@ -469,7 +499,8 @@ class System2Host:
                 or observed.get("context_revision") != getattr(head, "context_revision", None)
                 or observed.get("observed_at") != head.observed_at.isoformat()):
             context["current"], context["current_status"] = None, "context_changed"
-        observed_fields = {key: context[key] for key in ("current", "current_status", "history")}
+            context["interruptibility"] = {"status": "context_changed", "current": None}
+        observed_fields = {key: context[key] for key in OBSERVATION_CONTEXT_FIELDS if key in context}
         return project_business_result(context) | observed_fields, schedule
 
     @staticmethod
@@ -562,11 +593,22 @@ class System2Host:
     def _execute(self, name, args, authority, context, admission):
         try:
             if name == "context.read":
+                query_now = self.clock.wall_now()
+                at = datetime.fromisoformat(args["as_of"]) if args.get("as_of") else query_now
+                history_start = datetime.fromisoformat(args["history_start"]) if args.get("history_start") else None
+                history_end = datetime.fromisoformat(args["history_end"]) if args.get("history_end") else None
+                if at > query_now or not at - timedelta(hours=1) <= (history_start or at - timedelta(hours=1)) < (
+                    history_end or at
+                ) <= at:
+                    return {"call_id": authority.call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
+                observation_options = {"document_query": admission.source == "user", "history_start": history_start,
+                                       "history_end": history_end,
+                                       "include_capture_health": args.get("include_capture_health") is True}
                 if args.get("as_of"):
-                    at = datetime.fromisoformat(args["as_of"])
-                    view = {**context, **self._observation(at, historical=True), "as_of": at.isoformat()}
+                    view = {**context, **self._observation(at, historical=True, **observation_options),
+                            "as_of": at.isoformat()}
                 else:
-                    view, _ = self._snapshot(admission, self.clock.wall_now())
+                    view, _ = self._snapshot(admission, at, **observation_options)
                 return {"call_id": authority.call_id, "status": "applied", "view": view}
             if name == "decision.list":
                 return {"call_id": authority.call_id, "status": "applied", "view": context["recent_decisions"]}
@@ -683,8 +725,11 @@ class System2Host:
         if not admission.created_at <= as_of < admission.expires_at:
             self._finish(admission, EngineReply(""), "expired_request", {}, {}, as_of)
             return
-        context, schedule = self._snapshot(admission, as_of)
         intent = admission.user_intent
+        document_query = bool(intent and _ACTIVITY_QUESTION.search(intent.get("utterance") or ""))
+        observation_generation = self.settings.read().observation_generation
+        observation_marker = self._observation_privacy_marker()
+        context, schedule = self._snapshot(admission, as_of, document_query=document_query)
         if intent and intent.get("utterance") and not intent.get("reply_to_proposal_id"):
             non_cancelled = without_cancellation(intent["utterance"])
             if non_cancelled != intent["utterance"]:
@@ -766,6 +811,8 @@ class System2Host:
                 "grants": grants,
             }), self.user_scope, PROMPT_VERSION, admission.source,
             allowed_tools=tuple(sorted(READ_TOOLS | grants.keys())), expires_at=admission.expires_at,
+            observation_generation=observation_generation, observation_privacy_marker=observation_marker,
+            observation_document_query=document_query,
         )
         failure = None
         try:

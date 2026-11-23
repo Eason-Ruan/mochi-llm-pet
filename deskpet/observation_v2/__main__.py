@@ -19,7 +19,9 @@ from .ollama import DEFAULT_ENDPOINT, OllamaClient
 from .openai_cloud import (
     RoutedObservationModel, delete_route_credential, store_route_credential, verify_cloud_route,
 )
-from .pipeline import LIVE_UPDATE_INTERVAL_S, LIVE_VISION_WAIT_S, run_live, run_replay
+from .pipeline import (
+    LIVE_UPDATE_INTERVAL_S, LIVE_VISION_WAIT_S, run_live, run_live_multimodal, run_replay, run_replay_multimodal,
+)
 from .routes import (
     OFFICIAL_BASE_URL, OLLAMA, STATE, VISION, CloudRoute, ObservationCloudSettings, _normalize_base_url,
 )
@@ -55,6 +57,8 @@ def _cloud_commands(commands) -> None:
     consent = changes.add_parser("consent", help="grant or revoke the selected role's extra data access")
     consent.add_argument("role", choices=(VISION, STATE))
     consent.add_argument("permission", choices=("allow", "revoke"))
+    consent.add_argument("--scope", choices=("default", "vision-signals"), default="default",
+                         help="select the role's default data or structured vision inputs")
     consent.add_argument("--recipient", help="exact service base URL being authorized (required for allow)")
     clear = changes.add_parser("clear", help="restore a role to local Ollama")
     clear.add_argument("role", choices=(VISION, STATE))
@@ -107,7 +111,12 @@ def _manage_cloud(arguments: argparse.Namespace) -> None:
             raise ValueError("Provide --recipient with the service's base URL before granting permission")
         if arguments.recipient and _normalize_base_url(arguments.recipient) != route.base_url:
             raise ValueError("The configured recipient changed")
-        snapshot = settings.set_permission(arguments.role, allow, expected=snapshot)
+        if arguments.scope == "vision-signals":
+            if arguments.role != VISION:
+                raise ValueError("The vision-signals permission is available only for vision")
+            snapshot = settings.set_vision_signals_permission(allow, expected=snapshot)
+        else:
+            snapshot = settings.set_permission(arguments.role, allow, expected=snapshot)
     _print_json(asdict(snapshot))
 
 
@@ -144,7 +153,12 @@ def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
             return None
         return settings.observation_generation
 
-    return request_policy, capture_policy
+    preferences_at_start = preferences()
+    if preferences_at_start is None:
+        raise ValueError("Could not confirm the desktop Observation policy")
+    if arguments.observation_generation is None:
+        arguments.observation_generation = preferences_at_start.observation_generation
+    return request_policy, capture_policy, preferences_at_start.document_local_sources
 
 
 def main(*, stop_event: Event | None = None) -> None:
@@ -167,7 +181,8 @@ def main(*, stop_event: Event | None = None) -> None:
     replay.add_argument("recording", type=Path)
     replay.add_argument("--interval-s", type=_positive, default=4.0)
     replay.add_argument("--max-frames", type=int, default=32)
-    replay.add_argument("--require-models", action="store_true", help="fail if any VLM or LLM result was unavailable")
+    replay.add_argument("--multimodal", action="store_true", help="use adaptive sampling and one visual model")
+    replay.add_argument("--require-models", action="store_true", help="require results for every model sample")
     live = commands.add_parser("live", parents=[common], help="observe native desktop activity")
     duration = live.add_mutually_exclusive_group()
     duration.add_argument("--duration-s", type=_positive, default=30.0)
@@ -175,16 +190,17 @@ def main(*, stop_event: Event | None = None) -> None:
                           help="collect until stopped by the desktop or interrupted")
     live.add_argument(
         "--model-interval-s", type=_positive, default=LIVE_UPDATE_INTERVAL_S,
-        help="minimum interval between Observation update rounds (default: %(default)s seconds)",
+        help="interval between periodic local updates (default: %(default)s seconds)",
     )
+    live.add_argument("--split-models", action="store_true", help="run the legacy two-model comparison")
     live.add_argument("--vision-wait-s", type=_positive, default=LIVE_VISION_WAIT_S,
-                      help="maximum time a live round waits for its window frame")
+                      help="maximum time a legacy split-model round waits for its window frame")
     live.add_argument("--observation-generation", type=int, help=argparse.SUPPRESS)
     live.add_argument("--browser-metadata", action="store_true", help="enable supported macOS browser page detection")
     live.add_argument("--exclude-app", action="append", default=[], help="exclude an application name substring")
     live.add_argument("--exclude-domain", action="append", default=[], help="exclude a detected domain and its subdomains")
     capture = live.add_mutually_exclusive_group()
-    capture.add_argument("--capture-screen", action="store_true", help="opt into local screen or approved cloud window capture")
+    capture.add_argument("--capture-screen", action="store_true", help="opt into verified foreground window capture")
     capture.add_argument("--capture-screen-from-settings", action="store_true",
                          help="use the live desktop's stored screenshot preference")
     context = commands.add_parser("context", help="read the System 2 Observation snapshot")
@@ -216,6 +232,8 @@ def main(*, stop_event: Event | None = None) -> None:
             parser.exit(2, f"Could not read Observation context ({exc}).\n")
         return
     request_policy = capture_policy = None
+    document_local_sources = ()
+    split_models = not arguments.multimodal if arguments.mode == "replay" else arguments.split_models
     if arguments.mode == "live":
         if arguments.observation_generation is not None and (
             arguments.observation_generation < 0 or not arguments.capture_screen_from_settings
@@ -224,53 +242,75 @@ def main(*, stop_event: Event | None = None) -> None:
         if arguments.capture_screen_from_settings:
             if arguments.cloud_settings is None:
                 parser.error("--capture-screen-from-settings requires --cloud-settings")
-            request_policy, capture_policy = _desktop_policies(arguments, stop_event)
+            if split_models:
+                parser.error("--capture-screen-from-settings uses the multimodal desktop collector")
+            try:
+                request_policy, capture_policy, document_local_sources = _desktop_policies(arguments, stop_event)
+            except ValueError as exc:
+                parser.exit(2, f"Observation could not start ({exc}).\n")
     if arguments.mode == "replay" and arguments.cloud_settings and arguments.database.resolve() == arguments.cloud_settings.resolve():
         parser.error("replay requires a database separate from model settings")
 
     vision_endpoint = arguments.vision_endpoint or arguments.endpoint
     state_endpoint = arguments.state_endpoint or arguments.endpoint
-    if not arguments.cloud_settings and arguments.vision_model == arguments.state_model and vision_endpoint == state_endpoint:
+    if (split_models and not arguments.cloud_settings and arguments.vision_model == arguments.state_model
+            and vision_endpoint == state_endpoint):
         parser.error("choose distinct vision and state models for the same Ollama endpoint")
     timeout = min(arguments.timeout_s, arguments.ttl_s) if arguments.mode == "live" else arguments.timeout_s
     try:
         with ExitStack() as stack:
             vision = stack.enter_context(OllamaClient(arguments.vision_model, endpoint=vision_endpoint, timeout=timeout))
-            text = stack.enter_context(OllamaClient(arguments.state_model, endpoint=state_endpoint, timeout=timeout))
+            text = (stack.enter_context(OllamaClient(arguments.state_model, endpoint=state_endpoint, timeout=timeout))
+                    if split_models else None)
             if arguments.cloud_settings is not None:
                 settings = ObservationCloudSettings(arguments.cloud_settings, user_scope=arguments.user_scope)
                 vision = RoutedObservationModel(
                     VISION, settings, vision, timeout_limit=timeout, local_vision_only=arguments.mode == "replay",
+                    request_policy=request_policy,
                 )
-                text = RoutedObservationModel(
-                    STATE, settings, text, timeout_limit=timeout, request_policy=request_policy,
-                )
+                if text is not None:
+                    text = RoutedObservationModel(STATE, settings, text, timeout_limit=timeout, request_policy=request_policy)
             observer = StateObserver(text, window_seconds=arguments.window_s, ttl_seconds=arguments.ttl_s)
             if arguments.mode == "replay":
-                report = run_replay(
-                    arguments.recording, arguments.database, vision, observer,
-                    interval_s=arguments.interval_s, max_frames=arguments.max_frames,
-                )
+                if split_models:
+                    report = run_replay(
+                        arguments.recording, arguments.database, vision, observer,
+                        interval_s=arguments.interval_s, max_frames=arguments.max_frames,
+                    )
+                else:
+                    report = run_replay_multimodal(
+                        arguments.recording, arguments.database, vision, observer=observer,
+                        interval_s=arguments.interval_s, max_frames=arguments.max_frames,
+                    )
             else:
-                report = run_live(
-                    arguments.database, vision, observer, duration_s=arguments.duration_s,
+                live_options = dict(
+                    duration_s=arguments.duration_s,
                     capture_screen=arguments.capture_screen or arguments.capture_screen_from_settings,
-                    browser_metadata=arguments.browser_metadata, vision_wait_s=arguments.vision_wait_s,
+                    browser_metadata=arguments.browser_metadata,
                     model_interval_s=arguments.model_interval_s, excluded_apps=tuple(arguments.exclude_app),
                     excluded_domains=tuple(arguments.exclude_domain),
                     capture_policy=capture_policy, stop_event=stop_event,
                     producer_policy=request_policy, policy_generation=arguments.observation_generation,
                 )
+                if split_models:
+                    report = run_live(
+                        arguments.database, vision, observer, vision_wait_s=arguments.vision_wait_s, **live_options,
+                    )
+                else:
+                    report = run_live_multimodal(
+                        arguments.database, vision, observer=observer, document_local_sources=document_local_sources,
+                        **live_options,
+                    )
     except FileExistsError:
         parser.exit(2, "Observation database already exists. Choose a new path.\n")
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         parser.exit(2, f"Observation could not complete ({exc}).\n")
     _print_json(report)
-    if arguments.mode == "replay" and arguments.require_models and (
-        report["screens"].get("ready", 0) != report["activities"]
-        or report["state_runs"].get("model", 0) != report["activities"]
-    ):
-        parser.exit(1, "Replay did not produce a valid result from both models for every frame.\n")
+    if arguments.mode == "replay" and arguments.require_models:
+        expected = report["activities"] if split_models else report["visual_attempts"]
+        if (expected == 0 or report["screens"].get("ready", 0) != expected
+                or report["state_runs"].get("model", 0) != expected):
+            parser.exit(1, "Replay did not produce a valid result for every model sample.\n")
 
 
 if __name__ == "__main__":

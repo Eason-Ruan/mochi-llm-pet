@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from io import BytesIO
@@ -24,7 +24,8 @@ from .routes import (
     BAILIAN_OBSERVATION_MODEL, STATE, VISION, CloudRoute, CloudRouteError, CloudRouteSnapshot,
     ObservationCloudSettings, Role, is_bailian_endpoint,
 )
-from .vision import ScreenModel, cloud_screen_text
+from .usage import ObservationUsage, report_usage
+from .vision import ScreenModel, VisionSignals, cloud_screen_text
 
 _LOG = logging.getLogger(__name__)
 LOCAL_CAPTURE = object()
@@ -142,10 +143,31 @@ class VisionImageGrant:
     snapshot: CloudRouteSnapshot
     expires_at: float
     permitted: Callable[[], bool]
+    allow_late_result: bool = False
+    send_permitted: Callable[[], bool] | None = None
+    _settings_scope: str | None = field(default=None, repr=False)
+
+    @property
+    def comparison_scope(self) -> str:
+        snapshot = self.snapshot
+        route = snapshot.route
+        assert route is not None
+        material = json.dumps((
+            self._settings_scope, snapshot.user_scope, route.recipient, snapshot.route_generation, snapshot.consent_generation,
+        ))
+        return sha256(material.encode()).hexdigest()
 
     def check(self) -> None:
         if time.monotonic() >= self.expires_at or not self.permitted():
             raise CloudRouteError("Window capture authorization expired")
+        if self.send_permitted is not None and not self.send_permitted():
+            raise CloudRouteError("The captured window is no longer eligible for upload")
+
+    def check_response(self) -> None:
+        if not self.allow_late_result:
+            self.check()
+        elif not self.permitted():
+            raise CloudRouteError("Window capture authorization changed")
 
 
 def prepare_vision_capture(
@@ -208,6 +230,9 @@ class _AuthorizedTransport(httpx.BaseTransport):
                     self._snapshot.role, self._snapshot.route_generation,
                     self._snapshot.consent_generation, route.base_url,
                 )
+            elif (event == "http11.send_request_body.started" and self._image_grant is not None
+                  and self._image_grant.send_permitted is not None):
+                self._image_grant.check()
             elif event == "http11.send_request_body.complete":
                 release()
 
@@ -224,7 +249,7 @@ class _AuthorizedTransport(httpx.BaseTransport):
             self._settings.check(self._snapshot, probe=self._probe)
             _require_request_permission(self._request_permitted)
             if self._image_grant is not None:
-                self._image_grant.check()
+                self._image_grant.check_response()
             return response
         except Exception:
             response.close()
@@ -240,6 +265,7 @@ def _request(
     credential: Callable[[CloudRoute], str], timeout_limit: float | None,
     probe: bool = False, image_grant: VisionImageGrant | None = None,
     request_permitted: Callable[[], bool] | None = None,
+    usage_observer: Callable[[ObservationUsage], None] | None = None,
 ) -> dict:
     _require_request_permission(request_permitted)
     settings.check(snapshot, probe=probe)
@@ -252,7 +278,8 @@ def _request(
         settings, snapshot, probe=probe, image_grant=image_grant, request_permitted=request_permitted,
     )
     if not route.is_cloud:
-        with OllamaClient(route.model, endpoint=route.base_url, timeout=timeout, transport=transport) as client:
+        with OllamaClient(route.model, endpoint=route.base_url, timeout=timeout, transport=transport,
+                          usage_observer=usage_observer) as client:
             return client.complete(system=system, prompt=prompt, schema=schema, image=image)
 
     from openai import OpenAI
@@ -286,6 +313,9 @@ def _request(
                 }},
                 **options,
             )
+            usage = result.usage
+            report_usage(usage_observer, model=route.model, prompt=getattr(usage, "prompt_tokens", None),
+                         completion=getattr(usage, "completion_tokens", None), total=getattr(usage, "total_tokens", None))
             choice = result.choices[0]
             if choice.finish_reason != "stop" or choice.message.refusal:
                 raise CloudRouteError("The provider did not return a complete structured response")
@@ -309,6 +339,7 @@ def verify_cloud_route(
     settings: ObservationCloudSettings, role: Role, *,
     credential: Callable[[CloudRoute], str] = _resolve_credential,
     expected: CloudRouteSnapshot | None = None,
+    usage_observer: Callable[[ObservationUsage], None] | None = None,
 ) -> CloudRouteSnapshot:
     """Verify structured output and, for vision, a synthetic image only."""
     snapshot = expected if expected is not None else settings.snapshot(role)
@@ -338,7 +369,7 @@ def verify_cloud_route(
                 "type": "object", "properties": {"answer": value_schema},
                 "required": ["answer"], "additionalProperties": False,
             },
-            image=image, credential=credential, timeout_limit=None, probe=True,
+            image=image, credential=credential, timeout_limit=None, probe=True, usage_observer=usage_observer,
         )
         if result != {"answer": answer}:
             raise CloudRouteError("The model failed the structured capability check")
@@ -359,6 +390,7 @@ class RoutedObservationModel:
         self, role: Role, settings: ObservationCloudSettings, local: ScreenModel, *,
         timeout_limit: float | None = None, credential: Callable[[CloudRoute], str] = _resolve_credential,
         local_vision_only: bool = False, request_policy: Callable[[], int | None] | None = None,
+        usage_observer: Callable[[ObservationUsage], None] | None = None,
     ) -> None:
         self._role = role
         self._settings = settings
@@ -367,6 +399,7 @@ class RoutedObservationModel:
         self._credential = credential
         self._local_vision_only = local_vision_only
         self._request_policy = request_policy
+        self._usage_observer = usage_observer
 
     @property
     def model(self) -> str:
@@ -388,10 +421,19 @@ class RoutedObservationModel:
             return LOCAL_CAPTURE if snapshot.verified else None
         if not (permitted() and snapshot.permission and snapshot.verified):
             return None
-        return VisionImageGrant(snapshot, time.monotonic() + min(self._timeout_limit or 15.0, 15.0), permitted)
+        return VisionImageGrant(
+            snapshot, time.monotonic() + min(self._timeout_limit or 15.0, 15.0), permitted,
+            _settings_scope=str(self._settings.path),
+        )
 
     def complete(
         self, *, system: str, prompt: str, schema: dict, image: bytes | None = None,
+    ) -> dict:
+        return self._complete(system=system, prompt=prompt, schema=schema, image=image)
+
+    def _complete(
+        self, *, system: str, prompt: str, schema: dict, image: bytes | None,
+        allow_partial_fields: bool = False,
     ) -> dict:
         request_permitted = None
         if self._request_policy is not None:
@@ -409,7 +451,7 @@ class RoutedObservationModel:
         if not route.is_cloud:
             return self._complete_route(
                 snapshot, system=system, prompt=prompt, schema=schema, image=image,
-                request_permitted=request_permitted,
+                request_permitted=request_permitted, allow_partial_fields=allow_partial_fields,
             )
         if self._role != STATE or image is not None:
             raise CloudRouteError("A scoped window capture grant is required")
@@ -424,32 +466,62 @@ class RoutedObservationModel:
             schema=_STATE_SCHEMA, image=None, request_permitted=request_permitted,
         )
 
-    def complete_image(self, image_grant: VisionImageGrant, *, image: bytes) -> dict:
+    def _image_snapshot(self, image_grant: VisionImageGrant) -> CloudRouteSnapshot:
         if (self._role != VISION or self._local_vision_only or image_grant.snapshot.role != VISION
+                or image_grant._settings_scope not in (None, str(self._settings.path))
                 or image_grant.snapshot.route is None or not image_grant.snapshot.route.is_cloud):
             raise CloudRouteError("A scoped window capture grant is required")
+        return image_grant.snapshot
+
+    def complete_image(self, image_grant: VisionImageGrant, *, image: bytes) -> dict:
         from .vision import _SCREEN_SCHEMA, _SYSTEM, _USER
 
         return self._complete_route(
-            image_grant.snapshot, system=_SYSTEM, prompt=_USER, schema=_SCREEN_SCHEMA, image=image,
+            self._image_snapshot(image_grant), system=_SYSTEM, prompt=_USER, schema=_SCREEN_SCHEMA, image=image,
             image_grant=image_grant,
+        )
+
+    def complete_multimodal_image(
+        self, image_grant: VisionImageGrant | None, *, image: bytes, signals: VisionSignals | None,
+        captured_at: datetime, activity_id: int, allow_document_title: bool,
+    ) -> dict:
+        from .vision import _multimodal_request, _project_signals
+
+        if self._role != VISION or not image or captured_at.utcoffset() is None:
+            raise CloudRouteError("A timed window capture is required")
+        projected = _project_signals(
+            signals, captured_at=captured_at, activity_id=activity_id,
+            comparison_scope=image_grant.comparison_scope if image_grant is not None else None,
+        )
+        if projected.get("screen_locked") is True:
+            raise CloudRouteError("Window capture is unavailable while locked")
+        request = _multimodal_request(
+            projected, captured_at=captured_at, allow_document_title=allow_document_title,
+            include_signals=image_grant is None or image_grant.snapshot.vision_signals_permission,
+        )
+        if image_grant is None:
+            return self._complete(image=image, allow_partial_fields=True, **request)
+        return self._complete_route(
+            self._image_snapshot(image_grant), image=image, image_grant=replace(image_grant, allow_late_result=True),
+            allow_partial_fields=True, **request,
         )
 
     def _complete_route(
         self, snapshot: CloudRouteSnapshot, *, system: str, prompt: str, schema: dict,
         image: bytes | None, image_grant: VisionImageGrant | None = None,
         request_permitted: Callable[[], bool] | None = None,
+        allow_partial_fields: bool = False,
     ) -> dict:
         try:
             result = _request(
                 self._settings, snapshot, system=system, prompt=prompt, schema=schema, image=image,
                 image_grant=image_grant, request_permitted=request_permitted,
-                credential=self._credential, timeout_limit=self._timeout_limit,
+                credential=self._credential, timeout_limit=self._timeout_limit, usage_observer=self._usage_observer,
             )
             _require_request_permission(request_permitted)
             if image_grant is not None:
-                image_grant.check()
-            if result.keys() != schema["properties"].keys():
+                image_grant.check_response()
+            if not allow_partial_fields and result.keys() != schema["properties"].keys():
                 raise CloudRouteError("The provider returned unexpected Observation response fields")
             self._settings.record_result(snapshot)
             return result

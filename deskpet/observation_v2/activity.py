@@ -4,8 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
-from hashlib import blake2b
-from ipaddress import ip_address
+import hmac
 import math
 import os
 from pathlib import Path
@@ -16,7 +15,11 @@ import subprocess
 import sys
 from threading import Lock
 import time
-from urllib.parse import urlsplit
+
+from .documents import (
+    browser_document_source, document_source_allowed, document_title, is_mochi_app,
+    native_document_identity, native_document_source, normalize_document_sources, page_domain as _page_domain,
+)
 
 
 POLL_INTERVAL_S = {"darwin": 1.5, "win32": 0.5, "linux": 1.0}
@@ -24,6 +27,8 @@ CAPTURE_INTERVAL_S = 30.0
 APP_COOLDOWN_S = 3.0
 BROWSER_COOLDOWN_S = 1.2
 _CAPTURE_STATUS = ("skipped", "failed", "captured")
+_DOCUMENT_COLUMNS = ("document_name", "document_source", "document_status", "document_change", "document_change_at")
+_DATA_TIMESTAMPS = ("started_at", "ended_at", "system_sampled_at", "document_change_at")
 _DEFAULT_EXCLUDED_APPS = ("1password", "bitwarden", "keychain")
 _SENSITIVE_TITLE_WORDS = ("bank", "login", "password", "密码", "银行", "支付")
 _BROWSERS = frozenset({
@@ -58,6 +63,8 @@ class ActivitySample:
     session_id: str | None = None
     system_sampled_at: datetime | None = None
     private_window: bool | None = None
+    app_id: str | None = field(default=None, repr=False)
+    active_tab_title: str | None = field(default=None, repr=False)
 
 
 def _utc(value: datetime) -> datetime:
@@ -83,12 +90,20 @@ class Activity:
     screen_locked: bool | None = None
     system_sampled_at: datetime | None = None
     capture_status: str = "skipped"
+    document_name: str | None = None
+    document_source: str | None = None
+    document_status: str | None = None
+    document_change: str | None = None
+    document_change_at: datetime | None = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
-        for name in ("started_at", "ended_at", "system_sampled_at"):
+        for name in _DATA_TIMESTAMPS:
             if data[name] is not None:
                 data[name] = _iso(data[name])
+        for name in _DOCUMENT_COLUMNS:
+            if data[name] is None:
+                del data[name]
         return data
 
 
@@ -108,6 +123,7 @@ class ActivityStore:
         try:
             self.connection.execute("PRAGMA foreign_keys = ON")
             with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS activities (
                         activity_id INTEGER PRIMARY KEY,
@@ -120,10 +136,19 @@ class ActivityStore:
                         idle_s REAL CHECK (idle_s >= 0),
                         screen_locked INTEGER CHECK (screen_locked IN (0, 1)),
                         system_sampled_at TEXT,
-                        capture_status TEXT NOT NULL CHECK (capture_status IN ('skipped', 'failed', 'captured'))
+                        capture_status TEXT NOT NULL CHECK (capture_status IN ('skipped', 'failed', 'captured')),
+                        document_name TEXT,
+                        document_source TEXT,
+                        document_status TEXT,
+                        document_change TEXT,
+                        document_change_at TEXT
                     )
                 """)
                 self.connection.execute("CREATE INDEX IF NOT EXISTS activities_ended_at ON activities (ended_at)")
+                columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(activities)")}
+                for name in _DOCUMENT_COLUMNS:
+                    if name not in columns:
+                        self.connection.execute(f"ALTER TABLE activities ADD COLUMN {name} TEXT")
         except sqlite3.Error:
             self.connection.close()
             raise
@@ -141,11 +166,13 @@ class ActivityStore:
         result = self.connection.execute("""
             INSERT INTO activities (started_at, ended_at, duration_s, app_name,
                                     window_title_redacted, domain, idle_s, screen_locked,
-                                    system_sampled_at, capture_status)
+                                    system_sampled_at, capture_status,
+                                    document_name, document_source, document_status, document_change, document_change_at)
             VALUES (:started_at, :ended_at, :duration_s, :app_name,
                     :window_title_redacted, :domain, :idle_s, :screen_locked,
-                    :system_sampled_at, :capture_status)
-        """, activity.to_dict())
+                    :system_sampled_at, :capture_status, :document_name, :document_source, :document_status,
+                    :document_change, :document_change_at)
+        """, dict.fromkeys(_DOCUMENT_COLUMNS) | activity.to_dict())
         return replace(activity, activity_id=result.lastrowid)
 
     def _extend(self, activity: Activity) -> None:
@@ -153,14 +180,15 @@ class ActivityStore:
         self.connection.execute("""
             UPDATE activities SET ended_at = :ended_at, duration_s = :duration_s,
                                   idle_s = :idle_s, screen_locked = :screen_locked,
-                                  system_sampled_at = :system_sampled_at
+                                  system_sampled_at = :system_sampled_at,
+                                  document_change = :document_change, document_change_at = :document_change_at
             WHERE activity_id = :activity_id
-        """, activity.to_dict())
+        """, dict.fromkeys(_DOCUMENT_COLUMNS) | activity.to_dict())
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> Activity:
         data = dict(row)
-        for name in ("started_at", "ended_at", "system_sampled_at"):
+        for name in _DATA_TIMESTAMPS:
             if data[name] is not None:
                 data[name] = datetime.fromisoformat(data[name])
         if data["screen_locked"] is not None:
@@ -212,33 +240,27 @@ def _private_title(title: str | None) -> bool:
     return bool(title and _PRIVATE_TITLE.search(title))
 
 
-def _page_domain(url: str | None) -> str | None:
-    if not url:
-        return None
-    try:
-        parsed = urlsplit(url)
-        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-            return None
-        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii")
-    except (UnicodeError, ValueError):
-        return None
-    try:
-        ip_address(host)
-    except ValueError:
-        pass
-    else:
-        return None
-    if len(host) > 253 or host.endswith((".local", ".internal", ".localhost", ".lan", ".home", ".arpa")):
-        return None
-    labels = host.split(".")
-    if len(labels) < 2 or not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
-                                  for label in labels):
-        return None
-    return host
-
-
 def _idle_value(value: float | None) -> float | None:
     return value if value is not None and math.isfinite(value) and value >= 0 else None
+
+
+def _excluded_app_rules(exclusions: tuple[str, ...]) -> tuple[str, ...]:
+    return (*_DEFAULT_EXCLUDED_APPS, *(app.strip().casefold() for app in exclusions if app.strip()))
+
+
+def _excluded_domain_rules(exclusions: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(domain.strip().casefold().strip(".") for domain in exclusions if domain.strip().strip("."))
+
+
+def _domain_excluded(domain: str, exclusions: tuple[str, ...]) -> bool:
+    return any(domain == rule or domain.endswith("." + rule) for rule in exclusions)
+
+
+def _mochi_process(pid: int) -> bool:
+    module = getattr(sys.modules.get("__main__"), "__spec__", None)
+    return pid == os.getpid() or (
+        pid == os.getppid() and getattr(module, "name", None) == "deskpet.observation_v2.desktop"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +270,7 @@ class _Identity:
     title: bytes | None
     page: bytes | None
     private: bool
+    document: tuple[str | None, str | None]
 
 
 class ActivityRecorder:
@@ -258,6 +281,7 @@ class ActivityRecorder:
                  capture_interval_s: float = CAPTURE_INTERVAL_S,
                  capture_enabled: bool = False, excluded_apps: tuple[str, ...] = (),
                  excluded_domains: tuple[str, ...] = (),
+                 document_local_sources: tuple[str, ...] = (),
                  on_sample_write: SampleWrite | None = None,
                  reset_wall_on_rollback: bool = False) -> None:
         self.store = store
@@ -270,15 +294,17 @@ class ActivityRecorder:
         self.capture_enabled = capture_enabled
         self._on_sample_write = on_sample_write
         self._reset_wall_on_rollback = reset_wall_on_rollback
-        self._excluded_apps = (*_DEFAULT_EXCLUDED_APPS, *(app.strip().casefold() for app in excluded_apps if app.strip()))
-        self._excluded_domains = tuple(domain.strip().casefold().lstrip(".").rstrip(".")
-                                       for domain in excluded_domains if domain.strip().strip("."))
+        self._excluded_apps = _excluded_app_rules(excluded_apps)
+        self._excluded_domains = _excluded_domain_rules(excluded_domains)
+        self._document_local_sources = normalize_document_sources(document_local_sources)
         self.last_capture_reason: str | None = None
+        self.capture_ineligibility: str | None = "foreground_unavailable"
         self.browser_url_status: str | None = None
         self._activity_id: int | None = None
         self._wall_floor: datetime | None = None
         self._identity: _Identity | None = None
         self._previous: ActivitySample | None = None
+        self._previous_document_marker: bool | None = None
         self._last_capture_at: float | None = None
         self._last_capture_identity: _Identity | None = None
         self._key = secrets.token_bytes(32)
@@ -287,9 +313,38 @@ class ActivityRecorder:
     def current_activity(self) -> Activity | None:
         return self.store.get_activity(self._activity_id) if self._activity_id else None
 
+    @property
+    def capture_eligible(self) -> bool:
+        return self.capture_ineligibility is None
+
+    def _document(self, sample: ActivitySample, app: str | None, *, browser: bool,
+                  own: bool, private: bool, excluded: bool) -> tuple[str | None, str | None, str]:
+        if sample.screen_locked is True:
+            return None, None, "screen_locked"
+        if own:
+            return None, None, "mochi_foreground"
+        if private or excluded:
+            return None, None, "private_window"
+        if not app or not sample.window_id or sample.screen_locked is not False:
+            return None, None, "foreground_unavailable"
+        if browser:
+            if sample.private_window is not False or not _page_domain(sample.url):
+                return None, None, "browser_metadata_unavailable"
+            source = browser_document_source(sample.url)
+            if source is None:
+                return None, None, "title_unavailable"
+            title = sample.active_tab_title or sample.window_title
+        else:
+            source = native_document_source(app, sample.app_id)
+            title = sample.window_title
+        if not document_source_allowed(source, self._document_local_sources):
+            return None, None, "source_not_allowed"
+        name, status = document_title(title, source)
+        return name, source, status
+
     def _fingerprint(self, value: str | None) -> bytes | None:
         if value:
-            return blake2b(value.encode("utf-8", errors="replace"), key=self._key, digest_size=16).digest()
+            return hmac.digest(self._key, value.encode("utf-8", errors="replace"), "sha256")[:16]
         return None
 
     def _elapsed(self, previous: ActivitySample, current: ActivitySample) -> float | None:
@@ -313,27 +368,41 @@ class ActivityRecorder:
             if system_at > observed_at:
                 raise ValueError("System sample is newer than its observation")
         app = None if sample.screen_locked else _app_name(sample.app_name)
+        own = app is not None and is_mochi_app(app, sample.app_id)
+        if own:
+            app = "Mochi"
         browser = _is_browser(app)
-        sensitive_title = any(word in (sample.window_title or "").casefold() for word in _SENSITIVE_TITLE_WORDS)
-        private = sample.private_window is True or (browser and _private_title(sample.window_title)) or sensitive_title
+        titles = (sample.window_title, sample.active_tab_title if browser else None)
+        sensitive_title = any(word in title.casefold() for title in titles if title for word in _SENSITIVE_TITLE_WORDS)
+        private = (sample.private_window is True or browser and any(_private_title(title) for title in titles)
+                   or sensitive_title)
         candidate_domain = _page_domain(sample.url) if browser else None
         domain = candidate_domain if not private else None
         normalized_app = app.casefold() if app else None
         excluded = bool(
             normalized_app and any(rule in normalized_app for rule in self._excluded_apps)
-            or candidate_domain and any(
-                candidate_domain == rule or candidate_domain.endswith("." + rule)
-                for rule in self._excluded_domains
-            )
+            or candidate_domain and _domain_excluded(candidate_domain, self._excluded_domains)
         )
         self.browser_url_status = None
         if browser:
             self.browser_url_status = "private_window" if private else ("available" if domain else "unavailable")
-        redacted_title = "[redacted]" if app and sample.window_title and not private else None
+        document_name, document_source, document_status = self._document(
+            sample, app, browser=browser, own=own, private=private, excluded=excluded,
+        )
+        native = native_document_identity(sample.window_title, document_source) if document_name else None
+        document_identity, document_marker = native if native is not None else (document_name, None)
+        redacted_title = "[redacted]" if app and sample.window_title and not (private or own) else None
+        capture_block = self._capture_blocked(sample, app=app, own=own, private=private, excluded=excluded)
+        capture_ineligibility = capture_block or (
+            "lock_state_unavailable" if sample.screen_locked is None else None
+        )
         identity = _Identity(normalized_app,
-                             sample.window_id if app and not private else None,
-                             self._fingerprint(sample.window_title) if redacted_title and not domain else None,
-                             self._fingerprint(sample.url) if domain else None, private)
+                             sample.window_id if app and not (private or own) else None,
+                             self._fingerprint(document_identity or (
+                                 sample.window_title if redacted_title and not domain and not document_source else None
+                             )),
+                             self._fingerprint(sample.url) if domain else None, private,
+                             (document_source, document_status))
         # Keep only filtered or hashed fields after this call. Session and window IDs
         # are used in memory and never written to the timeline.
         sanitized = ActivitySample(observed_at, sample.monotonic_s, idle_s=idle_s,
@@ -342,6 +411,7 @@ class ActivityRecorder:
         previous = self._previous
         current = self.current_activity
         if previous == sanitized and identity == self._identity:
+            self.capture_ineligibility = capture_ineligibility
             self.last_capture_reason = "duplicate_sample"
             return None
         elapsed = self._elapsed(previous, sanitized) if previous is not None else None
@@ -356,19 +426,29 @@ class ActivityRecorder:
             self.close()
             current, continuous = None, False
         same = not excluded and continuous and identity == self._identity and current is not None
-        boundary = not continuous or excluded or (self._identity is not None and self._identity.private != private)
+        boundary = (not continuous or excluded or self._identity is not None and (
+            self._identity.private != private or (self._identity.app == "mochi") != own
+        ))
         with self.store.connection:
             if continuous and current is not None:
+                # A missing poll can hide a clean, dirty, or different editing view.
+                appeared = (
+                    same and current.document_change is None and elapsed <= 1.5 * self.poll_interval_s
+                    and document_marker is True and self._previous_document_marker is False
+                )
                 current = replace(
                     current, ended_at=observed_at, duration_s=current.duration_s + elapsed,
                     idle_s=idle_s if same else current.idle_s,
                     system_sampled_at=system_at if same else current.system_sampled_at,
+                    document_change="unsaved_changes_appeared" if appeared else current.document_change,
+                    document_change_at=observed_at if appeared else current.document_change_at,
                 )
                 self.store._extend(current)
             if not same and not excluded:
                 current = self.store._insert(Activity(
                     0, observed_at, observed_at, 0.0, app, redacted_title,
                     domain, idle_s, sample.screen_locked, system_at,
+                    document_name=document_name, document_source=document_source, document_status=document_status,
                 ))
             if self._on_sample_write is not None:
                 # Readers see both the new Activity and any realtime invalidation
@@ -377,6 +457,7 @@ class ActivityRecorder:
 
         if excluded:
             self.close()
+            self.capture_ineligibility = "privacy_excluded"
             self._wall_floor = observed_at
             self.last_capture_reason = "privacy_excluded"
             return None
@@ -387,25 +468,37 @@ class ActivityRecorder:
         self._activity_id = current.activity_id
         self._identity = identity
         self._previous = sanitized
+        self._previous_document_marker = document_marker
         self._wall_floor = observed_at
-        self.last_capture_reason = self._capture_reason(sanitized, identity)
+        self.capture_ineligibility = capture_ineligibility
+        self.last_capture_reason = self._capture_reason(sanitized, identity, capture_block)
         if self.last_capture_reason in {"initial", "periodic", "app_change", "browser_page_change"}:
             self._last_capture_at = sample.monotonic_s
             self._last_capture_identity = identity
             return CaptureRequest(self.current_activity, self.last_capture_reason)
         return None
 
-    def _capture_reason(self, sample: ActivitySample, identity: _Identity) -> str:
-        if not self.capture_enabled:
-            return "capture_disabled"
+    def _capture_blocked(self, sample: ActivitySample, *, app: str | None, own: bool,
+                         private: bool, excluded: bool) -> str | None:
+        if excluded:
+            return "privacy_excluded"
         if sample.screen_locked:
             return "screen_locked"
-        if identity.private:
+        if own:
+            return "mochi_foreground"
+        if private:
             return "private_window"
-        if identity.app is None:
+        if app is None:
             return "foreground_unavailable"
         if self._excluded_domains and self.browser_url_status == "unavailable":
             return "browser_url_unavailable"
+        return None
+
+    def _capture_reason(self, sample: ActivitySample, identity: _Identity, capture_block: str | None) -> str:
+        if not self.capture_enabled:
+            return "capture_disabled"
+        if capture_block is not None:
+            return capture_block
         if self._last_capture_at is None:
             return "initial"
         since_capture = sample.monotonic_s - self._last_capture_at
@@ -439,7 +532,9 @@ class ActivityRecorder:
         self._activity_id = None
         self._identity = None
         self._previous = None
+        self._previous_document_marker = None
         self._last_capture_identity = None
+        self.capture_ineligibility = "foreground_unavailable"
 
 
 def _command(*args: str, timeout: float = 0.4) -> str:
@@ -450,9 +545,17 @@ def _command(*args: str, timeout: float = 0.4) -> str:
 class NativeActivitySampler:
     """Read desktop metadata without Qt, input hooks, or screenshots."""
 
-    def __init__(self, *, browser_metadata: bool = False) -> None:
+    def __init__(self, *, browser_metadata: bool = False,
+                 document_local_sources: tuple[str, ...] = (),
+                 excluded_apps: tuple[str, ...] = (), excluded_domains: tuple[str, ...] = ()) -> None:
         self.platform = sys.platform
         self.browser_metadata = browser_metadata
+        self._excluded_apps = _excluded_app_rules(excluded_apps)
+        self._excluded_domains = _excluded_domain_rules(excluded_domains)
+        self._document_domains = tuple(
+            domain for source in normalize_document_sources(document_local_sources) if source.startswith("domain:")
+            and not _domain_excluded(domain := source.removeprefix("domain:"), self._excluded_domains)
+        )
         self.errors: dict[str, str] = {}
         self._browser_retry_after: dict[str, float] = {}
 
@@ -476,19 +579,26 @@ class NativeActivitySampler:
         locked, session_id = self._probe("session", desktop, (None, None))
         if locked is None:
             self.errors.setdefault("session", "lock_state_unavailable")
-        app, window_id, title = (None, None, None)
+        app, window_id, title, app_id = None, None, None, None
         if locked is not True:
-            app, window_id, title = self._probe("foreground", foreground, (None, None, None))
+            app, window_id, title, *native_ids = self._probe("foreground", foreground, (None, None, None))
+            app_id = native_ids[0] if native_ids else None
             if app is None:
                 self.errors.setdefault("foreground", "no_foreground_window")
-        private, url = None, None
+        private, url, tab_title = None, None, None
         if _is_browser(app):
-            if _private_title(title):
+            if _private_title(title) or any(word in (title or "").casefold() for word in _SENSITIVE_TITLE_WORDS):
                 private = True
-            else:
-                private, url = self._browser_window(app)
+            elif not any(rule in app.casefold() for rule in self._excluded_apps):
+                private, url, tab_title = self._browser_window(app, app_id, locked is False)
+                if browser_document_source(url) and _page_domain(url) in self._document_domains:
+                    current = self._probe("foreground", foreground, (None, None, None))
+                    if current[:2] != (app, window_id) or current[2] != title:
+                        self.errors["browser_url"] = "foreground_changed"
+                        app, window_id, title = None, None, None
+                        private, url, tab_title = None, None, None
             if private:
-                title = None
+                title, tab_title = None, None
         idle = self._probe("idle", idle_reader)
         if idle is None:
             self.errors.setdefault("idle", "idle_unavailable")
@@ -496,27 +606,33 @@ class NativeActivitySampler:
         return ActivitySample(observed_at, time.monotonic(), app, window_id, title, url,
                               idle_s=idle, screen_locked=locked, session_id=session_id,
                               system_sampled_at=observed_at,
-                              private_window=private)
+                              private_window=private, app_id=app_id, active_tab_title=tab_title)
 
-    def _browser_window(self, app: str) -> tuple[bool | None, str | None]:
+    def _browser_window(self, app: str, app_id: str | None,
+                        document_titles: bool) -> tuple[bool | None, str | None, str | None]:
         bundle_id = _MAC_CHROMIUM_APPS.get(app.casefold()) if self.platform == "darwin" else None
-        if not self.browser_metadata:
+        document_domains = self._document_domains if document_titles else ()
+        if not self.browser_metadata and not document_domains:
             self.errors["browser_url"] = "native_url_disabled"
-        elif bundle_id is None:
+        elif bundle_id is None or app_id is not None and bundle_id.casefold() != app_id.casefold():
             self.errors["browser_url"] = "unsupported_browser"
         elif time.monotonic() < self._browser_retry_after.get(bundle_id, 0.0):
             self.errors["browser_url"] = "probe_backoff"
         else:
             try:
-                private, url = _mac_browser_window(bundle_id)
+                private, url, title = _mac_browser_window(bundle_id, document_domains)
             except (OSError, subprocess.SubprocessError) as error:
                 self.errors["browser_url"] = type(error).__name__
                 self._browser_retry_after[bundle_id] = time.monotonic() + 30.0
             else:
+                if _page_domain(url) not in document_domains or browser_document_source(url) is None:
+                    title = None
+                    if not self.browser_metadata and private is not True:
+                        private, url = None, None
                 if private is not True and url is None:
                     self.errors["browser_url"] = "native_url_unavailable"
-                return private, url
-        return None, None
+                return private, url, title
+        return None, None, None
 
 
 def _mac_active_bundle_path(bundle_id: str) -> str | None:
@@ -529,28 +645,40 @@ def _mac_active_bundle_path(bundle_id: str) -> str | None:
     return bundle.path() if bundle is not None else None
 
 
-def _mac_browser_window(bundle_id: str) -> tuple[bool | None, str | None]:
+def _mac_browser_window(bundle_id: str, document_domains: tuple[str, ...]) -> tuple[bool | None, str | None, str | None]:
     path = _mac_active_bundle_path(bundle_id)
     if not path or "\n" in path or "\r" in path:
-        return None, None
+        return None, None, None
     # Resolve only the allowed, frontmost bundle, and check mode before reading a URL.
     target = path.replace("\\", "\\\\").replace('"', '\\"')
+    permitted_hosts = " or ".join(
+        f'pageURL starts with "{scheme}://{host}/"' for host in document_domains for scheme in ("https", "http")
+    )
+    tab_title = ""
+    if permitted_hosts:
+        tab_title = f'''            if {permitted_hosts} then
+                return "normal:" & pageURL & linefeed & (title of active tab as text)
+            end if
+'''
     script = f'''if application "{target}" is not running then return ""
 tell application "{target}"
     if not frontmost then return ""
     if (count of windows) is 0 then return ""
     tell front window
         if mode is not "normal" then return "private"
-        return "normal:" & (URL of active tab as text)
+        set pageURL to (URL of active tab as text)
+{tab_title}        return "normal:" & pageURL
     end tell
 end tell'''
     response = _command("/usr/bin/osascript", "-e", script, timeout=1.2)
     if response == "private":
-        return True, None
+        return True, None, None
     if response.startswith("normal:"):
-        url = response.removeprefix("normal:")
-        return False, url if _page_domain(url) else None
-    return None, None
+        url, _, title = response.removeprefix("normal:").partition("\n")
+        if _page_domain(url):
+            return False, url, title or None
+        return False, None, None
+    return None, None, None
 
 
 def _mac_session() -> tuple[bool | None, str | None]:
@@ -577,22 +705,25 @@ def _mac_session() -> tuple[bool | None, str | None]:
     return locked, str(user_id) if user_id is not None else None
 
 
-def _mac_foreground() -> tuple[str | None, int | None, str | None]:
+def _mac_foreground() -> tuple[str | None, int | None, str | None, str | None]:
     import AppKit
     import Quartz
     from deskpet.perception.macos import window_infos
 
     app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
     if app is None:
-        return None, None, None
+        return None, None, None, None
     pid = app.processIdentifier()
+    app_name, app_id = app.localizedName(), app.bundleIdentifier() or "macos:unidentified"
+    if _mochi_process(pid) or is_mochi_app(app_name, app_id):
+        return "Mochi", None, None, app_id
     windows = Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
         Quartz.kCGNullWindowID,
     ) or []
     front_windows = (window for window in windows if window.get("kCGWindowOwnerPID") == pid)
     window = next(iter(window_infos(front_windows, pid, os.getpid())), None)
-    return app.localizedName(), (window.handle if window else None), (window.title if window else None)
+    return app_name, (window.handle if window else None), (window.title if window else None), app_id
 
 
 def _mac_idle() -> float | None:
@@ -635,16 +766,19 @@ def _win_session() -> tuple[bool | None, str | None]:
         user32.CloseDesktop(desktop)
 
 
-def _win_foreground() -> tuple[str | None, int | None, str | None]:
+def _win_foreground() -> tuple[str | None, int | None, str | None, str | None]:
     import psutil
     import win32gui
     import win32process
 
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
-        return None, None, None
+        return None, None, None, None
     _, pid = win32process.GetWindowThreadProcessId(hwnd)
-    return psutil.Process(pid).name(), hwnd, win32gui.GetWindowText(hwnd)
+    if _mochi_process(pid):
+        return "Mochi", None, None, None
+    app = psutil.Process(pid).name()
+    return app, hwnd, win32gui.GetWindowText(hwnd), app
 
 
 def _win_idle() -> float | None:
@@ -677,18 +811,23 @@ def _linux_is_x11() -> bool:
     return bool(os.environ.get("DISPLAY")) and os.environ.get("XDG_SESSION_TYPE") != "wayland"
 
 
-def _linux_foreground() -> tuple[str | None, str | None, str | None]:
+def _linux_foreground() -> tuple[str | None, str | None, str | None, str | None]:
     if not _linux_is_x11():
         raise RuntimeError("Desktop foreground metadata requires an X11 session")
     root = _command("xprop", "-root", "-notype", "_NET_ACTIVE_WINDOW")
     window = re.search(r"0x[\da-fA-F]+", root)
     if window is None or int(window[0], 16) == 0:
-        return None, None, None
-    props = _command("xprop", "-id", window[0], "-notype", "WM_CLASS", "_NET_WM_NAME", "WM_NAME")
+        return None, None, None, None
+    props = _command("xprop", "-id", window[0], "-notype", "WM_CLASS", "_NET_WM_NAME", "WM_NAME", "_NET_WM_PID")
     fields = dict(line.split(" = ", 1) for line in props.splitlines() if " = " in line)
+    pid = fields.get("_NET_WM_PID", "")
+    if pid.isdecimal() and _mochi_process(int(pid)):
+        return "Mochi", None, None, None
     classes = re.findall(r'"([^"\\]*)"', fields.get("WM_CLASS", ""))
     title = fields.get("_NET_WM_NAME", fields.get("WM_NAME", "")).strip('"')
-    return (classes[-1] if classes else None), window[0], title or None
+    app = classes[-1] if classes else None
+    # X11 client-supplied class names do not establish an authorized app identity.
+    return app, window[0], title or None, (f"x11:{app}" if app else None)
 
 
 def _linux_idle() -> float | None:

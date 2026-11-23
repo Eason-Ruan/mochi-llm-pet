@@ -135,6 +135,7 @@ class CloudRouteSnapshot:
     verified: bool = False
     last_success: str | None = None
     last_failure: str | None = None
+    vision_signals_permission: bool = False
 
 
 @contextmanager
@@ -171,9 +172,20 @@ class ObservationCloudSettings:
                     verified TEXT,
                     last_success TEXT,
                     last_failure TEXT,
+                    vision_signals_permission INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_scope, role)
                 )
             """)
+            signal_column = """
+                SELECT 1 FROM pragma_table_info('observation_cloud_routes') WHERE name = 'vision_signals_permission'
+            """
+            if connection.execute(signal_column).fetchone() is None:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(signal_column).fetchone() is None:
+                    connection.execute("""
+                        ALTER TABLE observation_cloud_routes
+                        ADD COLUMN vision_signals_permission INTEGER NOT NULL DEFAULT 0
+                    """)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=3.0)
@@ -183,16 +195,16 @@ class ObservationCloudSettings:
             raise ValueError("Unknown Observation role")
         row = connection.execute("""
             SELECT route, route_generation, consent_generation, permission, verified,
-                   last_success, last_failure
+                   last_success, last_failure, vision_signals_permission
             FROM observation_cloud_routes WHERE user_scope = ? AND role = ?
         """, (self.user_scope, role)).fetchone()
         if row is None:
             return CloudRouteSnapshot(role, self.user_scope)
-        route, generation, consent, permission, verified, success, failure = row
+        route, generation, consent, permission, verified, success, failure, vision_signals = row
         return CloudRouteSnapshot(
             role, self.user_scope, CloudRoute(**json.loads(route)) if route else None,
             generation, consent, bool(permission), verified == _capability_probe_version(role),
-            success, failure,
+            success, failure, vision_signals == 1,
         )
 
     @staticmethod
@@ -202,6 +214,7 @@ class ObservationCloudSettings:
             or current.route != expected.route or current.route_generation != expected.route_generation
             or current.consent_generation != expected.consent_generation
             or current.permission != expected.permission
+            or current.vision_signals_permission != expected.vision_signals_permission
         ):
             raise CloudRouteError("Observation service authorization changed")
 
@@ -229,6 +242,8 @@ class ObservationCloudSettings:
             # Even a change to a model or credential invalidates the queued authorization.
             connection.execute("""
                 INSERT OR REPLACE INTO observation_cloud_routes
+                (user_scope, role, route, route_generation, consent_generation, permission, verified,
+                 last_success, last_failure)
                 VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL)
             """, (
                 self.user_scope, role, json.dumps(asdict(route)) if route else None,
@@ -254,10 +269,27 @@ class ObservationCloudSettings:
             if current.permission != allow:
                 connection.execute("""
                     UPDATE observation_cloud_routes
-                    SET consent_generation = consent_generation + 1, permission = ?
+                    SET consent_generation = consent_generation + 1, permission = ?, vision_signals_permission = 0
                     WHERE user_scope = ? AND role = ?
                 """, (allow, self.user_scope, role))
             return self._get(connection, role)
+
+    def set_vision_signals_permission(self, allow: bool, *, expected: CloudRouteSnapshot) -> CloudRouteSnapshot:
+        """Allow this screenshot recipient to receive recent typed signals as well."""
+        if type(allow) is not bool or expected.role != VISION:
+            raise ValueError("Vision signal permission requires a vision recipient and a boolean choice")
+        with observation_privacy_gate(self.path), self._write() as connection:
+            current = self._get(connection, VISION)
+            self._require_current(current, expected)
+            if current.route is None or not current.route.is_cloud or (allow and not current.permission):
+                raise CloudRouteError("Allow cloud window images before sharing recent vision signals")
+            if current.vision_signals_permission != allow:
+                connection.execute("""
+                    UPDATE observation_cloud_routes
+                    SET consent_generation = consent_generation + 1, vision_signals_permission = ?
+                    WHERE user_scope = ? AND role = ?
+                """, (allow, self.user_scope, VISION))
+            return self._get(connection, VISION)
 
     @contextmanager
     def admit(self, expected: CloudRouteSnapshot, *, probe: bool = False):

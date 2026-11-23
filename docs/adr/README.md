@@ -14,3 +14,4 @@
 | [0008](0008-c-implementation-plan.md) | C 界面与工作段实现计划（Proposed） |
 | [0009](0009-observation-v2.md) | 独立 Observation v2 的数据流与复跑 |
 | [0010](0010-system2-runtime.md) | DSH 思考运行时、工具授权与验收 |
+| [0011](0011-multimodal-document-observation.md) | 单次多模态调用、文档记忆与 System 2 读取 |

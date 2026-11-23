@@ -1,4 +1,4 @@
-"""Aggregate observed intervals and validate the text model's state estimate."""
+"""Aggregate observed intervals and derive or validate a current state estimate."""
 
 from __future__ import annotations
 
@@ -332,9 +332,28 @@ def context_revision(
                    ttl_seconds=ttl_seconds, live=live).context
 
 
+def local_outcome(data: dict, activity_kind: str) -> tuple[str, str, str | None, tuple[str, ...]]:
+    if data["screen_locked"] is True:
+        state, reason = "away", "screen_locked"
+    elif data["screen_locked"] is False and data["recent_os_input"] and data["recently_switched"]:
+        state, reason = "available", "activity_transition"
+    elif data["screen_locked"] is False and data["recent_os_input"] and data["input_recovered"]:
+        state, reason = "available", "input_recovered"
+    elif data["screen_locked"] is False and data["sustained_activity"]:
+        state, reason = "working", "sustained_activity"
+    else:
+        state, reason = "unknown", "insufficient_signals"
+    screen = data["current_screen"]
+    kind = activity_kind if screen is not None and activity_kind in _KINDS else "unknown"
+    summary = screen["screen_summary"] if screen is not None else None
+    reasons = (reason, "screen_context") if screen is not None else (reason,)
+    return kind, state, summary, reasons
+
+
 class StateObserver:
     def __init__(
-        self, transport: ScreenModel, *, window_seconds: float = WINDOW_SECONDS, ttl_seconds: float = TTL_SECONDS,
+        self, transport: ScreenModel | None = None, *, window_seconds: float = WINDOW_SECONDS,
+        ttl_seconds: float = TTL_SECONDS,
     ):
         self.transport = transport
         self.window_seconds = window_seconds
@@ -350,8 +369,10 @@ class StateObserver:
         return _window(segments, screens, as_of=as_of, window_seconds=self.window_seconds,
                        ttl_seconds=self.ttl_seconds, live=live)
 
-    def features(self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime) -> dict:
-        return self._window(segments, screen_results, as_of).data
+    def features(
+        self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime, live: bool = False,
+    ) -> dict:
+        return self._window(segments, screen_results, as_of, live).data
 
     def _advance(self, signature: str, as_of: datetime) -> int | None:
         with self._guard:
@@ -382,6 +403,8 @@ class StateObserver:
     ) -> Observation | None:
         at = _time(as_of)
         started = time.monotonic()
+        if self.transport is None:
+            return None
         window = self._window(segments, screen_results, at, live)
         if current_context_revision is not None:
             current = current_context_revision()
@@ -416,6 +439,18 @@ class StateObserver:
         if not at <= current_time() < deadline:
             return None
         return self._publish(kind, state, summary, reasons, at, deadline, revision)
+
+    def observe_local(
+        self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
+        activity_kind: str = "unknown", live: bool = True,
+    ) -> Observation | None:
+        """Use native signals for interruptibility and optional current vision for the scene."""
+        at = _time(as_of)
+        window = self._window(segments, screen_results, at, live)
+        revision = self._advance(window.context, at)
+        if revision is None:
+            return None
+        return self._publish(*local_outcome(window.data, activity_kind), at, window.valid_until, revision)
 
     def fallback(
         self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime, live: bool = False,

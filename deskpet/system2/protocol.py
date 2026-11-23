@@ -18,6 +18,9 @@ class TurnRequest:
     source: str
     allowed_tools: tuple[str, ...] | None = None
     expires_at: datetime | None = None
+    observation_generation: int | None = None
+    observation_privacy_marker: tuple[str | None, int, bool | None] | None = None
+    observation_document_query: bool = False
 
 
 @dataclass(frozen=True, slots=True)

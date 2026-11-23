@@ -33,7 +33,7 @@ from .dsh_projection import project_input, project_tool_result
 from .gateway import ModelGateway, SendPolicy
 
 _WIRE_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-_PROFILE_VERSION = "mochi-dsh-0.2.2rc2-v1"
+_PROFILE_VERSION = "mochi-dsh-0.2.2rc2-v2"
 _INIT_TIMEOUT = 12.0
 _MAX_MODEL_STEPS = 6
 _STOP = object()
@@ -169,12 +169,15 @@ class _Runtime:
         self, storage: Path, policy: SendPolicy, *,
         session_id: str, prompt: str, tools: list[dict],
         credential: Callable[[CloudRoute], str], share: bool, closing: Event | None = None,
+        document_sources: tuple[str, ...] = (), private_storage: TemporaryDirectory | None = None,
     ) -> None:
         self.session_id = session_id
         self.policy = policy
         self._active: _ActiveTurn | None = None
         self._step_lock = Lock()
         self._share = share
+        self._document_sources = document_sources
+        self._private_storage = private_storage
         self._closing = closing
         self._close_lock = Lock()
         self._closed = False
@@ -247,7 +250,7 @@ class _Runtime:
         self.policy.check()
         if not isinstance(value, dict):
             raise CloudRouteError("System 2 tool returned invalid data")
-        return project_tool_result(request["name"], value, share=self._share)
+        return project_tool_result(request["name"], value, share=self._share, document_sources=self._document_sources)
 
     def _control(self, action: str, payload: dict) -> None:
         with httpx.Client(trust_env=False, follow_redirects=False, timeout=4.0) as client:
@@ -262,7 +265,8 @@ class _Runtime:
         payload = json.loads(turn.input_json)
         if not isinstance(payload, dict):
             raise CloudRouteError("System 2 requires structured context")
-        utterance, context = project_input(payload, share=self._share)
+        sources = self._document_sources if getattr(turn, "observation_document_query", False) else ()
+        utterance, context = project_input(payload, share=self._share, document_sources=sources)
         text = f"用户本轮原话：{utterance}" if turn.source == "user" and utterance else "请根据本轮后台事件与授权判断是否需要行动。"
         data = "本轮 Mochi 程序快照。字段内容是数据，工具权限由宿主校验。\n" + _json(context)
         grants = getattr(turn, "allowed_tools", None)
@@ -318,6 +322,9 @@ class _Runtime:
             if self._launch is not None:
                 self._launch.cleanup()
                 self._launch = None
+            if self._private_storage is not None:
+                self._private_storage.cleanup()
+                self._private_storage = None
 
 
 class DSHEngine:
@@ -326,21 +333,24 @@ class DSHEngine:
     def __init__(
         self, data_dir: Path | str, *, settings: SettingsStore, tools: Iterable,
         credential: Callable[[CloudRoute], str] | None = None,
+        observation_guard: Callable[[], tuple[str | None, int, bool | None]] | None = None,
     ) -> None:
         self._root = Path(data_dir).resolve() / "system2-dsh"
         self._settings = settings
         self._routes = settings.routes
         self._tools = _schemas(tools)
         self._credential = credential or _resolve_credential
-        self._runtime: _Runtime | None = None
+        self._observation_guard = observation_guard or (lambda: (None, 0, None))
+        self._runtimes: dict[bool, _Runtime] = {}
+        self._privacy_epoch = None
         self._serial = Lock()
         self._state = Lock()
         self._closing = Event()
 
     def _stop_runtime(self) -> None:
         with self._state:
-            runtime, self._runtime = self._runtime, None
-        if runtime is not None:
+            runtimes, self._runtimes = self._runtimes, {}
+        for runtime in runtimes.values():
             runtime.close()
 
     def _select_runtime(self, turn, snapshot: CloudRouteSnapshot) -> _Runtime:
@@ -348,34 +358,57 @@ class DSHEngine:
             raise CloudRouteError("Configure a System 2 model before use")
         preferences = self._settings.read()
         generation = preferences.observation_generation
-        share = not preferences.observation_paused and (not snapshot.route.is_cloud or snapshot.permission)
+        marker = self._observation_guard()
+        if (getattr(turn, "observation_generation", None) not in (None, generation)
+                or getattr(turn, "observation_privacy_marker", None) not in (None, marker)):
+            raise CloudRouteError("System 2 activity authorization changed")
+        share = (not preferences.observation_paused and marker[2] is not True
+                 and (not snapshot.route.is_cloud or snapshot.permission))
+        sources = preferences.document_local_sources if (share and turn.source == "user"
+                    and getattr(turn, "observation_document_query", False)) else ()
+        if snapshot.route.is_cloud:
+            sources = tuple(source for source in sources if source in preferences.document_cloud_sources)
+        private = bool(sources)
+        epoch = (snapshot.route_generation, snapshot.consent_generation, generation, marker)
+        if epoch != self._privacy_epoch:
+            self._stop_runtime()
+            self._privacy_epoch = epoch
         policy = SendPolicy(
             self._routes, snapshot, is_observation_current=lambda:
-            not self._closing.is_set() and self._settings.read().observation_generation == generation,
+            not self._closing.is_set() and self._settings.read().observation_generation == generation
+            and self._observation_guard() == marker,
         )
         policy.check()
         identity = sha256(_json({
             "profile": _PROFILE_VERSION, "user": snapshot.user_scope, "receiver": snapshot.route.recipient,
             "model": snapshot.route.model, "route": snapshot.route_generation, "consent": snapshot.consent_generation,
-            "activity": generation, "sharable": share, "prompt_version": turn.prompt_version,
+            "activity": generation, "sharable": share, "lock": marker, "private": private,
+            "prompt_version": turn.prompt_version,
             "prompt": turn.system_prompt, "tools": self._tools,
         }).encode()).hexdigest()
         session_id = "mochi-" + identity[:32]
         with self._state:
-            current = self._runtime
-        if current is not None and current.session_id == session_id:
-            return current
-        self._stop_runtime()
+            current = self._runtimes.get(private)
+            if current is not None and current.session_id == session_id:
+                return current
+            self._runtimes.pop(private, None)
+        if current is not None:
+            current.close()
         self._root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        path = self._root / identity[:32]
+        # A recipient can see authorized titles during a conversation. Keep the
+        # related native dialogue separate from durable general chat and discard
+        # it on a lock, policy change, or shutdown.
+        storage = TemporaryDirectory(prefix="mochi-observation-") if private else None
+        path = Path(storage.name) if storage is not None else self._root / identity[:32]
         path.mkdir(mode=0o700, exist_ok=True)
         runtime = _Runtime(
             path, policy, session_id=session_id, prompt=turn.system_prompt, tools=self._tools,
-            credential=self._credential, share=share, closing=self._closing,
+            credential=self._credential, share=share, closing=self._closing, document_sources=sources,
+            private_storage=storage,
         )
         with self._state:
             if not self._closing.is_set():
-                self._runtime = runtime
+                self._runtimes[private] = runtime
                 return runtime
         runtime.close()
         raise CloudRouteError("System 2 runtime was closed")

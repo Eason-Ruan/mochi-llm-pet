@@ -57,9 +57,21 @@ def test_full_desktop_context_waits_for_a_short_sqlite_commit(tmp_path, monkeypa
 
     # Even if a transient wait returns an older context, the consumer cannot
     # authorize an observation whose validity ended during the read.
-    timestamp = time.monotonic()
-    elapsed = iter((timestamp, timestamp + 11))
-    monkeypatch.setattr("deskpet.m0.observation_input.monotonic", lambda: next(elapsed))
+    at, timestamp = datetime.now(UTC), time.monotonic()
+    elapsed = 0
+    read_realtime_context = reader.reader.read_realtime_context
+
+    def delayed_read(*args, **kwargs):
+        nonlocal elapsed
+        context = read_realtime_context(*args, **kwargs)
+        if kwargs["include_current"]:
+            assert context.current is not None
+            elapsed = 11
+        return context
+
+    monkeypatch.setattr("deskpet.m0.observation_input.sample_realtime_clock", lambda *_: (at, timestamp))
+    monkeypatch.setattr("deskpet.m0.observation_input.monotonic", lambda: timestamp + elapsed)
+    monkeypatch.setattr(reader.reader, "read_realtime_context", delayed_read)
     assert reader.read_observation_context(datetime.now(UTC)).current is None
 
 

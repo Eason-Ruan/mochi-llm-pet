@@ -281,6 +281,46 @@ def test_revocation_between_tool_and_follow_up_rotates_all_history(tmp_path, end
         engine.close()
 
 
+def test_document_name_on_native_wire_before_and_after_source_revocation(tmp_path, endpoints):
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint, permission=True)
+    settings.update(expected_version=settings.read().version,
+                    document_local_sources=("Word", "VS Code"), document_cloud_sources=("Word",))
+    shared = "WireAcceptance.docx"
+    local_only = "PrivateWorkspace.py"
+    endpoint.respond = lambda _: ({"content": RECEIPT}, "stop")
+
+    def ask():
+        request = turn("刚才打开的是哪份文档？", tools=())
+        request.observation_document_query = True
+        request.observation_generation = settings.read().observation_generation
+        payload = json.loads(request.input_json)
+        at = payload["context"]["as_of"]
+        payload["context"].update(
+            current_context={"observed_at": at, "foreground_app": "Mochi", "screen_locked": False},
+            last_observed_activity={"observed_at": at, "activity_kind": "work", "relation": "previous",
+                                    "document_name": shared, "document_source": "app:microsoft-word"},
+            history_1h={"segments": [{"first_observed_at": at, "last_observed_at": at,
+                                      "document_name": local_only, "document_source": "app:vscode"}]},
+        )
+        request.input_json = json.dumps(payload, ensure_ascii=False)
+        return engine.run(request, reply)
+
+    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    try:
+        assert ask().text == RECEIPT
+        first = json.dumps(endpoint.requests[-1], ensure_ascii=False)
+        assert shared in first
+        assert local_only not in first and "app:microsoft-word" not in first
+        settings.update(expected_version=settings.read().version, document_cloud_sources=())
+        assert ask().text == RECEIPT
+        second = json.dumps(endpoint.requests[-1], ensure_ascii=False)
+        assert shared not in second and local_only not in second
+    finally:
+        engine.close()
+
+
 def test_endpoint_switch_during_send_prevents_first_packet(tmp_path, endpoints):
     first, second = endpoints(), endpoints()
     settings = SettingsStore(tmp_path / "business.sqlite")

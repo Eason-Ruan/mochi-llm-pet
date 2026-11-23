@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import ipaddress
 import json
 import math
 from urllib.parse import urlsplit
 
 import httpx
+
+from .usage import ObservationUsage, report_usage
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 
@@ -29,6 +32,7 @@ class OllamaClient:
     def __init__(
         self, model: str, *, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 90.0,
         transport: httpx.BaseTransport | None = None,
+        usage_observer: Callable[[ObservationUsage], None] | None = None,
     ):
         parts = urlsplit(endpoint)
         host = parts.hostname
@@ -52,6 +56,7 @@ class OllamaClient:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("A positive finite model timeout is required")
         self.model = model
+        self._usage_observer = usage_observer
         self._http = httpx.Client(
             base_url=endpoint, timeout=timeout, trust_env=False, follow_redirects=False, transport=transport,
         )
@@ -78,7 +83,11 @@ class OllamaClient:
                 "options": {"temperature": 0, "num_predict": 512},
             })
             response.raise_for_status()
-            content = json.loads(response.json()["message"]["content"])
+            data = response.json()
+            if isinstance(data, dict):
+                report_usage(self._usage_observer, model=self.model,
+                             prompt=data.get("prompt_eval_count"), completion=data.get("eval_count"))
+            content = json.loads(data["message"]["content"])
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             raise OllamaError(f"Local model request failed ({type(exc).__name__})") from None
         if not isinstance(content, dict):

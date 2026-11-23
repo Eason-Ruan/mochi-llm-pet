@@ -110,6 +110,23 @@ def test_window_open_recheck_and_idle_tick_merge(desktop):
     assert desktop.delivery.commands == []
 
 
+def test_delayed_settings_read_does_not_poison_a_fresh_observation(desktop, monkeypatch):
+    desktop.publish()
+    requested_at = desktop.now
+    read_settings = desktop.scheduler._settings
+
+    def delayed_settings(db):
+        if desktop.now == requested_at:
+            desktop.clock.advance(0.2)
+        return read_settings(db)
+
+    monkeypatch.setattr(desktop.scheduler, "_settings", delayed_settings)
+    first = desktop.scheduler.snapshot(requested_at)
+    assert first["current_status"] == "fresh"
+    assert first["current"].context_revision == 71
+    assert desktop.scheduler.snapshot(desktop.now)["current_status"] == "fresh"
+
+
 def test_snooze_invalidates_wait_and_old_deadline_while_exact_deadline_runs_offline(desktop):
     first_deadline = desktop.now + timedelta(seconds=20)
     reminder = desktop.reminder('hydration', remind_by=first_deadline)

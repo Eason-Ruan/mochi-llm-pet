@@ -6,11 +6,25 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 import sys
+from threading import Lock
 
 
 # Samples take both readings in succession. Allow scheduling jitter and
 # normal clock slew when comparing the two elapsed times.
 CLOCK_TOLERANCE_S = 0.05
+_CLOCK_SAMPLE_LOCK = Lock()
+
+
+def sample_realtime_clock(wall_now, monotonic_now) -> tuple[datetime, float] | None:
+    """Pair the wall sample with its monotonic instant despite thread scheduling."""
+    with _CLOCK_SAMPLE_LOCK:
+        for _ in range(3):
+            before = monotonic_now()
+            wall = wall_now()
+            after = monotonic_now()
+            if 0 <= after - before <= CLOCK_TOLERANCE_S / 2:
+                return wall, (before + after) / 2
+    return None
 
 
 def clocks_agree(wall: datetime, monotonic_s: float, then: datetime, then_s: float) -> bool:

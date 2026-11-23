@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
+from threading import Event
 
 import pytest
 
@@ -39,6 +41,71 @@ def test_default_privacy_and_settings_compare_and_swap(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sum(pool.map(save, [1200, 2400])) == 1
     assert SettingsStore(path).read().version == 2
+
+
+def test_document_permissions_migrate_and_apply_only_to_the_exact_allowed_source(tmp_path):
+    path = tmp_path / "business.sqlite3"
+    store = SettingsStore(path)
+    legacy = Settings(version=4, default_focus_s=2100, observation_screenshots=True).to_dict()
+    del legacy["document_local_sources"], legacy["document_cloud_sources"]
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE pet_settings SET settings = ?", (json.dumps(legacy),))
+
+    migrated = store.read()
+    assert migrated.version == 4 and migrated.default_focus_s == 2100 and migrated.observation_screenshots
+    assert migrated.document_local_sources == migrated.document_cloud_sources == ()
+    assert SettingsStore.read_at(path) == migrated
+
+    granted = store.update(
+        expected_version=migrated.version,
+        document_local_sources=(" VS Code ", "app:vscode", "Word", "Excel", "docs.google.com"),
+        document_cloud_sources=("APP:VSCODE", "Docs.Google.COM", "google.com", "mail.google.com"),
+    )
+    assert granted.document_local_sources == (
+        "app:vscode", "app:microsoft-word", "app:microsoft-excel", "domain:docs.google.com",
+    )
+    assert granted.document_cloud_sources == ("app:vscode", "domain:docs.google.com")
+    assert granted.observation_generation == migrated.observation_generation + 1
+    assert SettingsStore.read_at(path) == granted
+
+    revoked = store.update(expected_version=granted.version, document_local_sources=("Word", "docs.google.com"))
+    assert revoked.document_cloud_sources == ("domain:docs.google.com",)
+    assert revoked.observation_generation == granted.observation_generation + 1
+    restored_locally = store.update(expected_version=revoked.version,
+                                    document_local_sources=granted.document_local_sources)
+    assert restored_locally.document_cloud_sources == revoked.document_cloud_sources
+
+    revoked_cloud = store.update(expected_version=restored_locally.version, document_cloud_sources=())
+    assert revoked_cloud.document_local_sources == granted.document_local_sources
+    assert revoked_cloud.document_cloud_sources == ()
+    assert revoked_cloud.observation_generation == restored_locally.observation_generation + 1
+    assert SettingsStore.read_at(path) == revoked_cloud
+
+    with pytest.raises(ValueError):
+        store.update(expected_version=revoked_cloud.version,
+                     document_local_sources=("https://docs.google.com/document/secret",))
+    assert store.read() == revoked_cloud
+
+
+def test_document_permissions_use_the_observation_privacy_gate(tmp_path):
+    from deskpet.observation_v2.routes import observation_privacy_gate
+
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    granted = store.update(expected_version=0, document_local_sources=("Word",),
+                           document_cloud_sources=("Word",))
+    revoking = Event()
+
+    def revoke():
+        revoking.set()
+        return store.update(expected_version=granted.version, document_cloud_sources=())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with observation_privacy_gate(store.path):
+            future = pool.submit(revoke)
+            assert revoking.wait(1)
+            assert store.read() == granted
+            assert not future.done()
+        assert future.result(timeout=2).document_cloud_sources == ()
 
 
 def test_habit_archive_remains_readable_to_phase_transaction(tmp_path):
@@ -146,6 +213,55 @@ def test_settings_widget_sends_edits_and_routes_each_sound_preview(tmp_path, mon
         panel.close()
 
 
+def test_settings_widget_edits_document_permissions_together(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QPushButton
+
+    from deskpet.c_ui.settings import SettingsPanel
+
+    app = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    commands = []
+    panel = SettingsPanel(store, save_preferences=lambda version, changes: commands.append((version, changes)))
+
+    def edit_permissions(local_value, cloud_value):
+        dialog = app.activeModalWidget()
+        local = dialog.findChild(QLineEdit, "settings-document_local_sources")
+        cloud = dialog.findChild(QLineEdit, "settings-document_cloud_sources")
+        local.setText(local_value)
+        cloud.setText(cloud_value)
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save).click()
+        if dialog.isVisible():
+            dialog.reject()
+
+    try:
+        assert "本机记录 0 个来源 · 云端共享 0 个来源" == panel._document_permissions_label.text()
+        permissions = panel.findChild(QPushButton, "settings-document-permissions")
+        QTimer.singleShot(0, lambda: edit_permissions("VS Code，Excel，docs.google.com", "Excel，mail.google.com"))
+        permissions.click()
+        assert commands == [(0, {
+            "document_local_sources": ("app:vscode", "app:microsoft-excel", "domain:docs.google.com"),
+            "document_cloud_sources": ("app:microsoft-excel",),
+        })]
+        version, changes = commands[0]
+        store.update(expected_version=version, **changes)
+        panel.finish_preference_save(True)
+        assert "本机记录 3 个来源 · 云端共享 1 个来源" == panel._document_permissions_label.text()
+        assert "仅用于旧版双模型采集与对照回放" in panel._route_labels["observation_state"].text()
+
+        QTimer.singleShot(0, lambda: edit_permissions("", "Excel"))
+        permissions.click()
+        assert commands[-1] == (1, {"document_local_sources": (), "document_cloud_sources": ()})
+        version, changes = commands[-1]
+        store.update(expected_version=version, **changes)
+        panel.finish_preference_save(True)
+        assert "本机记录 0 个来源 · 云端共享 0 个来源" == panel._document_permissions_label.text()
+    finally:
+        panel.close()
+
+
 def test_route_editor_never_reuses_a_credential_or_permission_for_another_recipient(tmp_path, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PyQt6")
@@ -198,3 +314,50 @@ def test_route_editor_never_reuses_a_credential_or_permission_for_another_recipi
     assert local_snapshot.route.credential_ref is None and not local_snapshot.permission
     assert not _RouteEditor(routes, STATE, None).permission.isEnabled()
     app.processEvents()
+
+
+def test_vision_editor_upgrades_existing_image_authorization_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
+
+    from deskpet.c_ui.settings import _RouteEditor
+    from deskpet.observation_v2.routes import VISION, CloudRoute
+
+    app = QApplication.instance() or QApplication([])
+    routes = SettingsStore(tmp_path / "business.sqlite3").routes
+    configured = routes.configure(VISION, CloudRoute(
+        "openai_compatible", "https://first.example/v1", "test-vision", "Service A",
+    ))
+    permitted = routes.set_permission(VISION, True, expected=configured)
+    legacy = routes.record_result(permitted, probe=True)
+    editor = _RouteEditor(routes, VISION, None)
+    signal_permission = editor.findChild(QPushButton, "settings-route-vision-signals")
+    prompts = []
+
+    def confirm(message):
+        prompts.append(message.text())
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "exec", confirm)
+    try:
+        assert legacy.permission and legacy.verified and not legacy.vision_signals_permission
+        assert signal_permission.isEnabled() and "升级授权" in signal_permission.text()
+        editor.endpoint.setText("https://another.example/v1")
+        assert not signal_permission.isEnabled()
+        editor.endpoint.setText(legacy.route.base_url)
+        signal_permission.click()
+        upgraded = routes.snapshot(VISION)
+        assert upgraded.permission and upgraded.verified and upgraded.vision_signals_permission
+        assert upgraded.route == legacy.route
+        assert upgraded.consent_generation == legacy.consent_generation + 1
+        assert len(prompts) == 1 and "https://first.example/v1" in prompts[0]
+
+        signal_permission.click()
+        downgraded = routes.snapshot(VISION)
+        assert downgraded.permission and downgraded.verified and not downgraded.vision_signals_permission
+        assert downgraded.consent_generation == upgraded.consent_generation + 1
+        assert len(prompts) == 1
+    finally:
+        editor.close()
+        app.processEvents()

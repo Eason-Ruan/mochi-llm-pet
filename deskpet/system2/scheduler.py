@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from deskpet.contracts import DisplayCommand, TaskView
 from deskpet.observation_v2.context import RealtimeBridge, RealtimeHead
+from deskpet.observation_v2.realtime import sample_realtime_clock
 from deskpet.settings import SettingsStore
 
 
@@ -217,15 +218,22 @@ class Scheduler:
             return RealtimeBridge(RealtimeHead(None, "no_data"))
         if settings.observation_paused:
             return RealtimeBridge(RealtimeHead(None, "context_changed"))
-        arguments = {"monotonic_s": self.clock.monotonic_now(),
+        clock = sample_realtime_clock(self.clock.wall_now, self.clock.monotonic_now)
+        if clock is None:
+            return RealtimeBridge(RealtimeHead(None, "no_data"))
+        sampled_at, sampled_monotonic = clock
+        arguments = {"monotonic_s": sampled_monotonic,
                      "policy_generation": settings.observation_generation if self.observation_policy else None}
         try:
             reader = getattr(self.observation, "read_realtime_bridge", None)
-            if reader is not None:
-                return reader(now, **arguments)
-            return RealtimeBridge(self.observation.read_realtime_head(now, **arguments))
+            bridge = (reader(sampled_at, **arguments) if reader is not None else
+                      RealtimeBridge(self.observation.read_realtime_head(sampled_at, **arguments)))
         except (sqlite3.Error, OSError, ValueError):
             return RealtimeBridge(RealtimeHead(None, "no_data"))
+        head = bridge.head
+        if head.current is not None and not head.current.observed_at <= now < head.current.valid_until:
+            return replace(bridge, head=replace(head, current=None, current_status="context_changed"))
+        return bridge
 
     def _lock_state(self) -> bool | None:
         return False if self.lock_probe is None else self.lock_probe()

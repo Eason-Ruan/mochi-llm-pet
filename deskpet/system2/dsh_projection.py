@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 import math
 
+from deskpet.observation_v2.context import CAPTURE_HEALTH_REASONS, CAPTURE_HEALTH_STATUSES, CAPTURE_HEALTH_TIMES
+from deskpet.observation_v2.documents import document_source_allowed, sanitize_document_name
 from deskpet.observation_v2.state import _KINDS, _REASONS
+from deskpet.observation_v2.vision import validated_scene_elements, validated_visible_changes
 
 _CONTEXT_FIELDS = {
     "as_of", "timezone", "trigger_reasons", "items", "habits", "eligible_items", "current_phase",
@@ -24,6 +27,8 @@ _PRIVATE_FIELDS = {
     "window_title_redacted", "app_name", "domain", "foreground", "current_foreground",
     "previous_foreground", "credential_ref", "api_key", "authorization", "notes", "note",
     "description", "review", "confirmed_outcomes", "next_steps", "password", "access_token",
+    "document_name", "document_source", "document_local_sources", "document_cloud_sources", "document_change",
+    "scene_elements", "visible_changes", "current_context", "last_observed_activity", "history_1h", "capture_health",
 }
 
 
@@ -101,7 +106,60 @@ def _segment(value: dict, *, share: bool) -> dict:
     return result
 
 
-def project_context(value: dict, *, share: bool) -> dict:
+def _document_detail(value: dict, *, share: bool, document_sources: tuple[str, ...]) -> dict:
+    result = {"activity_kind": _enum(value.get("activity_kind"), _KINDS, "unknown")}
+    if share:
+        result.update(summary=_summary(value.get("summary")),
+                      scene_elements=list(validated_scene_elements(value.get("scene_elements"))),
+                      visible_changes=list(validated_visible_changes(value.get("visible_changes"))))
+    source = value.get("document_source")
+    if share and isinstance(source, str) and document_source_allowed(source, document_sources):
+        if name := sanitize_document_name(value.get("document_name"), source):
+            result["document_name"] = name
+            change = value.get("document_change")
+            if (isinstance(change, dict) and change.get("type") == "unsaved_changes_appeared"
+                    and (observed_at := _stamp(change.get("observed_at")))):
+                result["document_change"] = {"type": "unsaved_changes_appeared", "observed_at": observed_at}
+    return result
+
+
+def _gap_projection(history: dict) -> list[dict]:
+    return [
+        {"last_observed_at": _stamp(item.get("last_observed_at")),
+         "next_observed_at": _stamp(item.get("next_observed_at"))}
+        for item in _items(history.get("gaps"), 8)
+    ]
+
+
+def _contains_name(value, names: set[str]):
+    return any(name in value.casefold() for name in names) if isinstance(value, str) else False
+
+
+def _remove_document_text(value, names: set[str]):
+    # Document names only travel in their structured field, regardless of recipient.
+    if not isinstance(value, dict) or not names:
+        return
+    for key, data in value.items():
+        if key in {"summary", "foreground_app"} and _contains_name(data, names):
+            value[key] = None
+        elif isinstance(data, list):
+            for entry in data:
+                _remove_document_text(entry, names)
+        elif isinstance(data, dict):
+            _remove_document_text(data, names)
+
+
+def _document_names(value) -> set[str]:
+    if isinstance(value, dict):
+        return {item.casefold() for key, item in value.items() if key == "document_name" and isinstance(item, str) and item} | {
+            name for item in value.values() for name in _document_names(item)
+        }
+    if isinstance(value, (tuple, list)):
+        return {name for item in value for name in _document_names(item)}
+    return set()
+
+
+def project_context(value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
     result = {key: _clean(data) for key, data in value.items() if key in _CONTEXT_FIELDS}
     current = value.get("current")
     history = value.get("history")
@@ -111,11 +169,7 @@ def project_context(value: dict, *, share: bool) -> dict:
         result["history"] = {
             "recent": [_sample(item, current=False, share=share) for item in _items(history.get("recent"), 3)],
             "segments": [_segment(item, share=share) for item in _items(history.get("segments"), 8)],
-            "gaps": [
-                {"last_observed_at": _stamp(item.get("last_observed_at")),
-                 "next_observed_at": _stamp(item.get("next_observed_at"))}
-                for item in _items(history.get("gaps"), 128)
-            ],
+            "gaps": _gap_projection(history),
         }
         stats = history.get("stats")
         if isinstance(stats, dict):
@@ -127,13 +181,66 @@ def project_context(value: dict, *, share: bool) -> dict:
                 result["history"]["stats"]["state_counts"] = {
                     state: _count(count) for state, count in counts.items() if state in _STATES
                 }
+    if isinstance(signals := value.get("current_context"), dict):
+        idle = signals.get("idle_s")
+        locked = signals.get("screen_locked")
+        foreground = signals.get("foreground_app")
+        result["current_context"] = {
+            "observed_at": _stamp(signals.get("observed_at")),
+            "screen_locked": locked if type(locked) is bool else None,
+            "idle_s": idle if type(idle) in (float, int) and 0 <= idle and math.isfinite(idle) else None,
+            "foreground_app": _summary(foreground) if share or foreground == "Mochi" else None,
+        }
+    if isinstance(last := value.get("last_observed_activity"), dict):
+        result["last_observed_activity"] = {
+            **_document_detail(last, share=share, document_sources=document_sources),
+            "observed_at": _stamp(last.get("observed_at")),
+            "relation": _enum(last.get("relation"), {"current", "previous"}, "previous"),
+        }
+    elif "last_observed_activity" in value:
+        result["last_observed_activity"] = None
+    if isinstance(interrupt := value.get("interruptibility"), dict):
+        status = _enum(interrupt.get("status"), _CURRENT_STATUSES, "no_data")
+        sample = interrupt.get("current")
+        result["interruptibility"] = {"status": status, "current": _sample(sample, current=True, share=False)
+                                      if status == "fresh" and isinstance(sample, dict) else None}
+    if isinstance(hour := value.get("history_1h"), dict):
+        hour_segments = _items(hour.get("segments"), 8)
+        if any("state" not in segment for segment in hour_segments) and "history" in result:
+            # Fresh desktop segments supersede the old estimator-only timeline.
+            for key in ("recent", "segments", "gaps"):
+                result["history"].pop(key, None)
+        result["history_1h"] = {
+            "from_at": _stamp(hour.get("from_at")), "to_at": _stamp(hour.get("to_at")),
+            "segments": [{**_segment(item, share=False),
+                          **{key: _stamp(item[key]) for key in ("scene_observed_at", "change_observed_at")
+                             if share and item.get(key)},
+                          **_document_detail(item, share=share, document_sources=document_sources)}
+                         for item in hour_segments],
+            "gaps": _gap_projection(hour),
+        }
+        if isinstance(stats := hour.get("stats"), dict):
+            result["history_1h"]["stats"] = {key: _count(stats.get(key)) for key in (
+                "total_samples", "gap_count", "omitted_segment_count",
+            )}
+    if "capture_health" in value:
+        status = value["capture_health"]
+        result["capture_health"] = None
+        if share and isinstance(status, dict):
+            result["capture_health"] = {
+                "status": _enum(status.get("status"), CAPTURE_HEALTH_STATUSES, None),
+                "observed_at": _stamp(status.get("observed_at")),
+                "reason": _enum(status.get("reason"), CAPTURE_HEALTH_REASONS, None),
+                **{key: _stamp(status.get(key)) for key in CAPTURE_HEALTH_TIMES},
+            }
+    _remove_document_text(result, _document_names(value))
     return result
 
 
-def project_input(payload: dict, *, share: bool) -> tuple[str | None, dict]:
+def project_input(payload: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> tuple[str | None, dict]:
     context = payload.get("context")
     data = {key: _clean(payload[key]) for key in ("event", "grants") if key in payload}
-    data["context"] = project_context(context, share=share) if isinstance(context, dict) else {}
+    data["context"] = project_context(context, share=share, document_sources=document_sources) if isinstance(context, dict) else {}
     intent = payload.get("user_intent")
     if not isinstance(intent, dict):
         return None, data
@@ -148,10 +255,10 @@ def project_business_result(value: dict) -> dict:
     return _clean(value)
 
 
-def project_tool_result(name: str, value: dict, *, share: bool) -> dict:
+def project_tool_result(name: str, value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
     result = project_business_result(value)
     if name == "context_read":
         for key in ("view", "data"):
             if isinstance(view := value.get(key), dict):
-                result[key] = project_context(view, share=share)
+                result[key] = project_context(view, share=share, document_sources=document_sources)
     return result

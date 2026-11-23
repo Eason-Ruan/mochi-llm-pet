@@ -13,8 +13,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL
-from deskpet.settings import Habit, HabitBehavior, SettingsConflict
+from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL, VISION
+from deskpet.settings import Habit, HabitBehavior, Settings, SettingsConflict
 
 from .work_panel import MinutesSpinBox
 
@@ -25,8 +25,8 @@ from .refine_style import (
 
 _ROLES = {
     "system2": ("对话与动作", "分享已发布的活动摘要"),
-    "observation_vision": ("屏幕图像理解", "发送获准窗口的截图"),
-    "observation_state": ("活动状态判断", "发送脱敏屏幕文字"),
+    VISION: ("屏幕图像理解", "发送获准窗口的截图"),
+    "observation_state": ("活动状态判断（旧版／对照）", "发送脱敏屏幕文字"),
 }
 
 _ROUTE_NAMES = {BAILIAN: "阿里云百炼", "openai": "OpenAI", "local_ollama": "Ollama"}
@@ -224,6 +224,12 @@ class SettingsPanel(_Panel):
         exclusions = QPushButton("编辑排除应用与域名")
         exclusions.clicked.connect(self._edit_exclusions)
         section.addWidget(exclusions)
+        documents = QPushButton("编辑文档名权限")
+        documents.setObjectName("settings-document-permissions")
+        documents.clicked.connect(self._edit_document_sources)
+        section.addWidget(documents)
+        self._document_permissions_label = _text(size=11, color=MUTED, wrap=True)
+        section.addWidget(self._document_permissions_label)
         self._route_labels = {}
         self._route_buttons = {}
         self._verify_buttons = {}
@@ -261,6 +267,7 @@ class SettingsPanel(_Panel):
                 widget.setValue(getattr(self._settings, key) / 60)
         self._load_habits()
         self._render_routes()
+        self._render_document_permissions()
         self._render_notification_status()
 
     def showEvent(self, event):
@@ -313,6 +320,7 @@ class SettingsPanel(_Panel):
             self._report("保存设置失败。")
             return
         self._report("")
+        self._render_document_permissions()
         self._render_notification_status()
         self.settings_changed.emit(self._settings)
 
@@ -362,6 +370,63 @@ class SettingsPanel(_Panel):
                 observation_excluded_apps=tuple(re.split(r"[,，]", apps.text())),
                 observation_excluded_domains=tuple(re.split(r"[,，]", domains.text())),
             )
+
+    def _render_document_permissions(self):
+        local = len(self._settings.document_local_sources)
+        cloud = len(self._settings.document_cloud_sources)
+        self._document_permissions_label.setText(f"本机记录 {local} 个来源 · 云端共享 {cloud} 个来源")
+
+    def _edit_document_sources(self):
+        preferences = self._settings
+        dialog = QDialog(self)
+        dialog.setWindowTitle("文档名权限")
+        dialog.setStyleSheet(_CONTROL_STYLE)
+        dialog.setMinimumWidth(395)
+        body = QVBoxLayout(dialog)
+        form = QFormLayout()
+        fields = {}
+        for key, label, example in (
+            ("document_local_sources", "本机记录", "例如 VS Code，Word，Excel，docs.google.com"),
+            ("document_cloud_sources", "云端对话共享", "例如 Excel，docs.google.com"),
+        ):
+            field = QLineEdit(", ".join(getattr(preferences, key)))
+            field.setObjectName(f"settings-{key}")
+            field.setAccessibleName(label)
+            field.setPlaceholderText(example)
+            form.addRow(label, field)
+            fields[key] = field
+        body.addLayout(form)
+        body.addWidget(_text(
+            "输入支持的应用名称或文档网站的完整域名，用逗号分开。留空即关闭。"
+            "云端共享仅保留本机已允许的来源，并需要为当前对话接收方开启活动摘要分享。",
+            size=11, color=MUTED, wrap=True,
+        ))
+        error = _text(size=11, color=MUTED, wrap=True)
+        body.addWidget(error)
+        changes = {}
+
+        def accept():
+            values = {
+                key: tuple(source for source in re.split(r"[,，]", field.text()) if source.strip())
+                for key, field in fields.items()
+            }
+            try:
+                updated = Settings.model_validate({**preferences.model_dump(), **values})
+            except ValueError:
+                error.setText("请输入支持的应用名称或完整域名，每栏最多 100 项。")
+                return
+            changes.update({key: getattr(updated, key) for key in fields})
+            dialog.accept()
+
+        buttons = _dialog_buttons(dialog)
+        buttons.accepted.connect(accept)
+        body.addWidget(buttons)
+        if dialog.exec() and changes:
+            if preferences.version == self._settings.version:
+                self._save(**changes)
+            else:
+                self._report("设置已更新，请重新操作。")
+        dialog.deleteLater()
 
     def _load_habits(self):
         selected = self._habit_selector.currentData()
@@ -425,7 +490,7 @@ class SettingsPanel(_Panel):
                 status = ("配置阿里云百炼 API Key 后，点击验证能力。"
                           if role == "system2" else "本地默认路由")
             else:
-                if role == "observation_vision" and not (local or snapshot.permission):
+                if role == VISION and not (local or snapshot.permission):
                     capability = "请先授权该接收方，再验证识图能力"
                 elif role in self._checking:
                     capability = "正在验证"
@@ -434,16 +499,21 @@ class SettingsPanel(_Panel):
                 status = f"{route.display_name} · {route.model}\n{capability}"
                 if role == "system2" and not local:
                     status += "\n活动摘要分享已开启" if snapshot.permission else "\n活动摘要分享已关闭"
+                elif role == VISION and snapshot.permission:
+                    status += ("\n已授权截图与近期系统信号" if snapshot.vision_signals_permission
+                               else "\n已授权截图")
                 elif snapshot.permission:
                     status += "\n已授权该接收方"
                 if snapshot.last_success:
                     status += f"\n最近成功 {snapshot.last_success}"
                 if snapshot.last_failure:
                     status += f"\n验证失败 · {snapshot.last_failure}"
+            if role == "observation_state":
+                status += "\n仅用于旧版双模型采集与对照回放。"
             label.setText(status)
             self._verify_buttons[role].setEnabled(
                 (route is not None and role not in self._checking)
-                and (role != "observation_vision" or local or snapshot.permission)
+                and (role != VISION or local or snapshot.permission)
             )
 
     def _configure_route(self, role):
@@ -629,6 +699,13 @@ class _RouteEditor(QDialog):
         self.permission.clicked.connect(self._change_permission)
         body.addWidget(self.permission)
         self.permission.setVisible(preset_provider is None)
+        self._signals_permission = None
+        if role == VISION:
+            self._signals_permission = QPushButton()
+            self._signals_permission.setObjectName("settings-route-vision-signals")
+            self._signals_permission.clicked.connect(self._change_vision_signals_permission)
+            self._signals_permission.setVisible(preset_provider is None)
+            body.addWidget(self._signals_permission)
         self.help = _text(size=11, color=MUTED, wrap=True)
         body.addWidget(self.help)
         self.error = _text(size=11, color=MUTED, wrap=True)
@@ -682,7 +759,7 @@ class _RouteEditor(QDialog):
     def _endpoint_changed(self):
         if self.provider.currentData() == BAILIAN:
             self.key.clear()
-        if self.role == "system2":
+        if self.role in {"system2", VISION}:
             self._render_permission()
 
     def _selected_endpoint(self, provider):
@@ -702,7 +779,7 @@ class _RouteEditor(QDialog):
         _, permission = _ROLES[self.role]
         route = self.snapshot.route
         provider = self.provider.currentData()
-        if self.role == "system2" and not self._same_recipient(route, provider):
+        if self.role in {"system2", VISION} and not self._same_recipient(route, provider):
             route = None
         is_local = route is not None and route.provider_kind == "local_ollama"
         self.permission.setEnabled(route is not None and not is_local and self._preset_provider is None)
@@ -710,6 +787,12 @@ class _RouteEditor(QDialog):
             self.permission.setText(f"撤回授权 · {permission}")
         else:
             self.permission.setText(f"授权 · {permission}")
+        if self._signals_permission is not None:
+            self._signals_permission.setEnabled(self.permission.isEnabled() and self.snapshot.permission)
+            self._signals_permission.setText(
+                "撤回近期系统信号授权" if route and self.snapshot.vision_signals_permission
+                else "升级授权 · 同时发送近期系统信号"
+            )
         status = (
             f"当前接收方：{route.display_name}\n{route.base_url}\n"
             "更改授权适用于以后发送。已发送的信息无法撤回。"
@@ -720,9 +803,11 @@ class _RouteEditor(QDialog):
         elif self.role == "system2" and route:
             status = (f"接收方：{route.display_name}\n{route.base_url}\n"
                       "模型接收与你的请求相关的聊天、事项和结构化活动状态。"
-                      "活动摘要需单独授权。撤回只影响后续发送。")
+                      "活动摘要需单独授权。文档名共享还需要开启相应来源的权限。撤回只影响后续发送。")
         elif self.role == "system2":
             status = "保存服务和模型后验证文本与工具调用能力。活动摘要分享默认关闭。"
+        elif self.role == VISION and route:
+            status += "\n截图获准后，可为同一接收方追加近期系统信号授权。"
         if provider == BAILIAN:
             if route is not None:
                 self.key.setPlaceholderText("留空保留此地址的 Key")
@@ -734,6 +819,17 @@ class _RouteEditor(QDialog):
             self.key.setPlaceholderText("输入新密钥")
         self.help.setText(status)
 
+    def _confirm_permission(self, title, message):
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle(title)
+        prompt.setTextFormat(self.help.textFormat())
+        prompt.setText(message)
+        prompt.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        prompt.setDefaultButton(QMessageBox.StandardButton.No)
+        prompt.button(QMessageBox.StandardButton.Yes).setText("授权")
+        prompt.button(QMessageBox.StandardButton.No).setText("取消")
+        return prompt.exec() == QMessageBox.StandardButton.Yes
+
     def _change_permission(self):
         route = self.snapshot.route
         if not self.permission.isEnabled() or route is None:
@@ -741,15 +837,10 @@ class _RouteEditor(QDialog):
         allowed = not self.snapshot.permission
         if allowed:
             name, data = _ROLES[self.role]
-            prompt = QMessageBox(self)
-            prompt.setWindowTitle(f"{name}授权")
-            prompt.setTextFormat(self.help.textFormat())
-            prompt.setText(f"允许向 {route.display_name} ({route.base_url}) {data}？")
-            prompt.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            prompt.setDefaultButton(QMessageBox.StandardButton.No)
-            prompt.button(QMessageBox.StandardButton.Yes).setText("授权")
-            prompt.button(QMessageBox.StandardButton.No).setText("取消")
-            if prompt.exec() != QMessageBox.StandardButton.Yes:
+            message = f"允许向 {route.display_name} ({route.base_url}) {data}？"
+            if self.role == "system2":
+                message += "\n文档名按「文档名权限」中的云端来源设置共享。"
+            if not self._confirm_permission(f"{name}授权", message):
                 return
         try:
             self.snapshot = self.routes.set_permission(self.role, allowed, expected=self.snapshot)
@@ -759,6 +850,26 @@ class _RouteEditor(QDialog):
             else:
                 self.snapshot = self.routes.snapshot(self.role)
                 self.error.setText("授权状态已变化，请核对接收方后再操作。")
+        else:
+            self.error.clear()
+        self._render_permission()
+
+    def _change_vision_signals_permission(self):
+        route = self.snapshot.route
+        if self._signals_permission is None or not self._signals_permission.isEnabled() or route is None:
+            return
+        allowed = not self.snapshot.vision_signals_permission
+        if allowed and not self._confirm_permission(
+            "近期系统信号授权",
+            f"允许向 {route.display_name} ({route.base_url}) 随截图发送近期系统信号？\n"
+            "可发送采样时间、前台停留和切换、锁屏与近期输入状态，以及上一帧的场景类别和界面类型。",
+        ):
+            return
+        try:
+            self.snapshot = self.routes.set_vision_signals_permission(allowed, expected=self.snapshot)
+        except (ValueError, RuntimeError, sqlite3.Error):
+            self.snapshot = self.routes.snapshot(VISION)
+            self.error.setText("授权状态已变化，请核对接收方后再操作。")
         else:
             self.error.clear()
         self._render_permission()

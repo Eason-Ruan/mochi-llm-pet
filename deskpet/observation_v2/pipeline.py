@@ -21,7 +21,8 @@ from .activity import Activity, ActivityRecorder, ActivitySample, ActivityStore,
 from .context import _timestamp
 from .media import capture_desktop, recording_frames
 from .realtime import boot_id as system_boot_id, clocks_agree
-from .state import Observation, StateObserver, context_revision
+from .sampling import ACTIVITY_POLL_S, CaptureSchedule, frame_thumbnail, known_video_source
+from .state import Observation, StateObserver, context_revision, local_outcome
 from .vision import ScreenModel, ScreenObservation, analyze_screen
 
 REPLAY_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
@@ -105,6 +106,12 @@ class ObservationStore(ActivityStore):
                 PRAGMA application_id = {application_id};
                 COMMIT;
             """)
+            self._add_columns("screen_observations", {
+                "processed_at": "TEXT", "activity_kind": "TEXT", "scene_elements": "TEXT",
+                "visible_changes": "TEXT", "next_check": "TEXT", "document_name": "TEXT",
+                "document_source": "TEXT", "filtered_fields": "TEXT",
+                "realtime_eligible": "INTEGER NOT NULL DEFAULT 1",
+            })
             if live:
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS realtime_observation_head (
@@ -127,12 +134,35 @@ class ObservationStore(ActivityStore):
                         reason TEXT NOT NULL, boot_id TEXT, policy_generation INTEGER
                     )
                 """)
-                if not any(row["name"] == "policy_generation" for row in
-                           self.connection.execute("PRAGMA table_info(realtime_observation_head)")):
-                    self.connection.execute("ALTER TABLE realtime_observation_head ADD COLUMN policy_generation INTEGER")
+                self._add_columns("realtime_observation_head", {
+                    "policy_generation": "INTEGER", "activity_id": "INTEGER", "app_name": "TEXT",
+                    "screen_locked": "INTEGER", "idle_s": "REAL", "system_sampled_at": "TEXT",
+                    "lock_epoch": "INTEGER NOT NULL DEFAULT 0",
+                })
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS observation_capture_health (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        status TEXT NOT NULL, sampled_at TEXT NOT NULL
+                    )
+                """)
+                self._add_columns("observation_capture_health", {
+                    "reason": "TEXT", "last_ready_at": "TEXT", "last_failure_at": "TEXT", "last_skipped_at": "TEXT",
+                })
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS observation_upload_budget (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        boot_id TEXT, attempted_at TEXT NOT NULL, attempted_monotonic_s REAL NOT NULL
+                    )
+                """)
         except Exception:
             self.close()
             raise
+
+    def _add_columns(self, table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def begin_live_run(
         self, as_of: datetime, *, monotonic_s: float | None = None, poll_interval_s: float = 1.5,
@@ -190,22 +220,87 @@ class ObservationStore(ActivityStore):
                 boot_id = excluded.boot_id, policy_generation = excluded.policy_generation
         """, (reason,))
 
-    def _record_live_sample(self, as_of: datetime, monotonic_s: float) -> None:
+    def _record_live_sample(
+        self, as_of: datetime, monotonic_s: float, *, sample: ActivitySample | None = None,
+        activity: Activity | None = None,
+    ) -> None:
         """Refresh the source clock evidence inside the Activity transaction."""
         self.connection.execute("""
             UPDATE realtime_observation_head
-            SET sampled_at = ?, sampled_monotonic_s = ?, sample_deadline_s = ?
+            SET sampled_at = ?, sampled_monotonic_s = ?, sample_deadline_s = ?,
+                lock_epoch = lock_epoch + CASE WHEN ? = 1 AND screen_locked IS NOT 1 THEN 1 ELSE 0 END,
+                activity_id = ?, app_name = ?, screen_locked = ?, idle_s = ?, system_sampled_at = ?
             WHERE singleton = 1
-        """, (_timestamp(as_of), monotonic_s, monotonic_s + 3 * self._poll_interval_s))
+        """, (
+            _timestamp(as_of), monotonic_s, monotonic_s + 3 * self._poll_interval_s,
+            sample.screen_locked if sample else None,
+            activity.activity_id if activity else None, activity.app_name if activity else None,
+            sample.screen_locked if sample else None, sample.idle_s if sample else None,
+            _timestamp(sample.system_sampled_at) if sample and sample.system_sampled_at else None,
+        ))
 
-    def save_screen(self, screen: ScreenObservation) -> None:
+    def save_capture_health(
+        self, status: str, at: datetime, *, reason: str | None = None, preserve_status: bool = False,
+    ) -> None:
+        timestamp = _timestamp(at)
+        ready = timestamp if status == "ready" else None
+        failure = timestamp if status in {"capture_failed", "model_failed"} else None
+        skipped = timestamp if status in {"skipped", "source_restricted"} else None
+        with self.connection:
+            self.connection.execute("""
+                INSERT INTO observation_capture_health
+                    (singleton, status, sampled_at, reason, last_ready_at, last_failure_at, last_skipped_at)
+                VALUES (1, :status, :at, :reason, :ready, :failure, :skipped)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    status = CASE WHEN :preserve THEN status ELSE excluded.status END,
+                    sampled_at = CASE WHEN :preserve THEN sampled_at ELSE excluded.sampled_at END,
+                    reason = CASE WHEN :preserve THEN reason ELSE excluded.reason END,
+                    last_ready_at = coalesce(excluded.last_ready_at, last_ready_at),
+                    last_failure_at = coalesce(excluded.last_failure_at, last_failure_at),
+                    last_skipped_at = coalesce(excluded.last_skipped_at, last_skipped_at)
+            """, dict(status=status, at=timestamp, reason=reason, ready=ready, failure=failure,
+                      skipped=skipped, preserve=preserve_status))
+
+    def last_upload(self, at: datetime, mono: float) -> float:
+        previous = self.connection.execute("SELECT * FROM observation_upload_budget WHERE singleton = 1").fetchone()
+        if previous is None:
+            return float("-inf")
+        identity = self._boot_id or system_boot_id()
+        if identity is not None and previous["boot_id"] == identity and previous["attempted_monotonic_s"] <= mono:
+            return previous["attempted_monotonic_s"]
+        elapsed = (at - datetime.fromisoformat(previous["attempted_at"])).total_seconds()
+        return mono - max(0.0, elapsed)
+
+    def record_upload(self, at: datetime, mono: float) -> None:
+        with self.connection:
+            self.connection.execute("""
+                INSERT OR REPLACE INTO observation_upload_budget VALUES (1, ?, ?, ?)
+            """, (self._boot_id or system_boot_id(), _timestamp(at), mono))
+
+    def save_screen(
+        self, screen: ScreenObservation, *, processed_at: datetime | None = None,
+        realtime_eligible: bool = True, document_source: str | None = None,
+    ) -> None:
         data = asdict(screen)
         data["captured_at"] = _timestamp(screen.captured_at)
+        data["processed_at"] = _timestamp(processed_at) if processed_at else None
+        data["realtime_eligible"] = int(realtime_eligible)
+        data["document_source"] = document_source if data.get("document_name") else None
+        for field in ("scene_elements", "visible_changes", "filtered_fields"):
+            data[field] = json.dumps(data[field], ensure_ascii=False) if field in data else None
+        for field in ("activity_kind", "next_check", "document_name"):
+            data.setdefault(field, None)
         with self.connection:
             self.connection.execute("""
                 INSERT INTO screen_observations
+                    (capture_id, activity_id, captured_at, status, model_id,
+                     screen_kind, visible_text_redacted, screen_summary, processed_at,
+                     activity_kind, scene_elements, visible_changes, next_check,
+                     document_name, document_source, filtered_fields, realtime_eligible)
                 VALUES (:capture_id, :activity_id, :captured_at, :status, :model_id,
-                        :screen_kind, :visible_text_redacted, :screen_summary)
+                        :screen_kind, :visible_text_redacted, :screen_summary, :processed_at,
+                        :activity_kind, :scene_elements, :visible_changes, :next_check,
+                        :document_name, :document_source, :filtered_fields, :realtime_eligible)
             """, data)
 
     def recent_screens(self, since: datetime) -> list[dict]:
@@ -285,10 +380,61 @@ def run_replay(
         return {**store.counts(), "state_runs": dict(outcomes), "last_observation": latest}
 
 
+def run_replay_multimodal(
+    recording: Path, database: Path, vision: ScreenModel, *, interval_s: float, max_frames: int,
+    observer: StateObserver | None = None,
+) -> dict:
+    """Replay visual candidates on the media clock using the live sampling budget."""
+    from .vision import VisionSignals, analyze_multimodal
+
+    frames = recording_frames(recording, interval_s=interval_s, max_frames=max_frames)
+    observer = observer or StateObserver()
+    schedule = CaptureSchedule()
+    schedule.observe("recording", frames[0].seconds)
+    latest = previous = None
+    attempts = 0
+    next_update = frames[0].seconds
+    outcomes: Counter[str] = Counter()
+    with ObservationStore(database) as store:
+        recorder = ActivityRecorder(store)
+        activity = recorder.add_recording_interval(
+            REPLAY_EPOCH, REPLAY_EPOCH + timedelta(seconds=frames[-1].seconds),
+        )
+        for frame in frames:
+            at = REPLAY_EPOCH + timedelta(seconds=frame.seconds)
+            update = frame.seconds >= next_update
+            if update:
+                next_update = frame.seconds + LIVE_UPDATE_INTERVAL_S
+            outcome = "local"
+            if schedule.due(frame.seconds, interactive=True) and schedule.inspect(frame_thumbnail(frame.jpeg), frame.seconds):
+                schedule.sent(frame.seconds)
+                attempts += 1
+                store.set_capture_status(activity.activity_id, "captured")
+                screen = analyze_multimodal(
+                    vision, image=frame.jpeg, activity_id=activity.activity_id,
+                    capture_id=uuid4().hex, captured_at=at, signals=VisionSignals(previous=previous),
+                )
+                store.save_screen(screen, processed_at=at)
+                if screen.status == "ready":
+                    previous, update, outcome = screen, True, "model"
+                    schedule.recommend(screen.next_check, frame.seconds, video=screen.screen_kind == "video")
+            if update:
+                result = observer.observe_local(
+                    [], [previous] if previous is not None else [], as_of=at, live=False,
+                    activity_kind=previous.activity_kind if previous is not None else "unknown",
+                )
+                if result is not None:
+                    store.save_observation(result, published_at=at)
+                    latest = result.to_dict()
+                    outcomes[outcome] += 1
+        return {**store.counts(), "visual_attempts": attempts, "state_runs": dict(outcomes), "last_observation": latest}
+
+
 def _desktop_identity(sample: ActivitySample) -> tuple:
     return (
         sample.session_id, sample.screen_locked, sample.private_window,
         sample.app_name, sample.window_id, sample.window_title, sample.url,
+        sample.app_id, sample.active_tab_title,
     )
 
 
@@ -381,7 +527,7 @@ def run_live(
                 current_signature = None
                 if active_round is not None:
                     active_round.changed = True
-            store._record_live_sample(sample.observed_at, sample.monotonic_s)
+            store._record_live_sample(sample.observed_at, sample.monotonic_s, sample=sample, activity=activity)
             if sample.screen_locked is True and (last_sample is None or last_sample.screen_locked is not True):
                 store._record_live_departure("locked")
             last_sample = sample
@@ -621,4 +767,321 @@ def run_live(
                 latest.to_dict() if latest is not None and latest.valid_until > as_of
                 and coverage_is_current(as_of, time.monotonic()) else None
             ), "native_probe_errors": sampler.errors,
+        }
+
+
+@dataclass(frozen=True)
+class _MultimodalJob:
+    activity_id: int
+    document_source: str | None
+    deadline_s: float
+    video_hint: bool
+    permitted: Callable[[], bool]
+    future: Future[ScreenObservation]
+
+
+def run_live_multimodal(
+    database: Path, vision: ScreenModel, *, duration_s: float | None,
+    observer: StateObserver | None = None, capture_screen: bool | Callable[[], bool] = False,
+    browser_metadata: bool = False, model_interval_s: float = LIVE_UPDATE_INTERVAL_S,
+    excluded_apps: tuple[str, ...] = (), excluded_domains: tuple[str, ...] = (),
+    document_local_sources: tuple[str, ...] = (), stop_event: Event | None = None,
+    capture_policy: Callable[[], int | None] | None = None,
+    producer_policy: Callable[[], int | None] | None = None, policy_generation: int | None = None,
+) -> dict:
+    """Publish a local desk state and sample only stable, materially changed windows."""
+    from .media import capture_window, cloud_window_eligible
+    from .openai_cloud import LOCAL_CAPTURE, prepare_vision_capture
+    from .vision import VisionSignals, analyze_multimodal
+
+    if (not math.isfinite(model_interval_s) or model_interval_s <= 0
+            or duration_s is not None and (not math.isfinite(duration_s) or duration_s <= 0)):
+        raise ValueError("Live duration and update interval must be positive and finite")
+
+    def capture_stamp() -> int | None:
+        try:
+            enabled = capture_screen() if callable(capture_screen) else capture_screen
+            if enabled:
+                return capture_policy() if capture_policy is not None else 0
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            pass
+        return None
+
+    if producer_policy is not None and policy_generation is None:
+        policy_generation = producer_policy()
+
+    def stopped() -> bool:
+        return (stop_event is not None and stop_event.is_set()
+                or producer_policy is not None
+                and (policy_generation is None or producer_policy() != policy_generation))
+
+    observer = observer or StateObserver()
+    sampler = NativeActivitySampler(
+        browser_metadata=browser_metadata, document_local_sources=document_local_sources,
+        excluded_apps=excluded_apps, excluded_domains=excluded_domains,
+    )
+    outcomes: Counter[str] = Counter()
+    metrics: deque[dict] = deque()
+    activity_floor = None
+    activity_id = None
+    last_sample = None
+    latest = None
+    visual = None
+    previous_visual = None
+    job = None
+    uploads = 0
+    immediate_update = False
+
+    database = Path(database).resolve()
+    with (
+        ThreadPoolExecutor(max_workers=1) as workers,
+        _live_writer(database), ObservationStore(database, live=True) as store,
+    ):
+        revision_base = store.begin_live_run(
+            datetime.now(UTC), poll_interval_s=ACTIVITY_POLL_S, policy_generation=policy_generation,
+        )
+        next_poll = next_update = time.monotonic()
+        end_at = next_poll + duration_s if duration_s is not None else math.inf
+        schedule = CaptureSchedule(last_upload_s=store.last_upload(datetime.now(UTC), next_poll))
+
+        def record_sample(sample: ActivitySample, activity: Activity | None, boundary: bool, _switched: bool) -> None:
+            nonlocal activity_floor, activity_id, last_sample, latest, visual, previous_visual, immediate_update
+            prior_activity = activity_id
+            activity_id = activity.activity_id if activity is not None else None
+            changed = (
+                prior_activity != activity_id or last_sample is None
+                or sample.screen_locked is not last_sample.screen_locked or sample.session_id != last_sample.session_id
+                or sample.monotonic_s - last_sample.monotonic_s > 3 * ACTIVITY_POLL_S
+                or not clocks_agree(sample.observed_at, sample.monotonic_s, last_sample.observed_at, last_sample.monotonic_s)
+            )
+            if boundary:
+                activity_floor = activity_id
+                metrics.clear()
+                if last_sample is not None and sample.observed_at < last_sample.observed_at:
+                    observer.reset_live_context()
+            if changed:
+                store._invalidate_current(sample.observed_at)
+                latest = visual = previous_visual = None
+                immediate_update = True
+            if sample.screen_locked is True and (last_sample is None or last_sample.screen_locked is not True):
+                store._record_live_departure("locked")
+            store._record_live_sample(sample.observed_at, sample.monotonic_s, sample=sample, activity=activity)
+            last_sample = sample
+            metrics.append({
+                "started_at": sample.observed_at, "ended_at": sample.observed_at,
+                "system_sampled_at": sample.system_sampled_at, "idle_s": sample.idle_s,
+                "screen_locked": sample.screen_locked,
+            })
+
+        recorder = ActivityRecorder(
+            store, platform=sampler.platform, poll_interval_s=ACTIVITY_POLL_S,
+            excluded_apps=excluded_apps, excluded_domains=excluded_domains, document_local_sources=document_local_sources,
+            on_sample_write=record_sample, reset_wall_on_rollback=True,
+        )
+
+        def activities_at(at: datetime) -> list:
+            since = at - timedelta(seconds=observer.window_seconds)
+            while metrics and metrics[0]["started_at"] < since:
+                metrics.popleft()
+            activities = (
+                [row for row in store.list_activities(since=since) if row.activity_id >= activity_floor]
+                if activity_floor is not None else []
+            )
+            return [*activities, *metrics]
+
+        def coverage_current(at: datetime, mono: float) -> bool:
+            return (last_sample is not None and mono - last_sample.monotonic_s <= 3 * ACTIVITY_POLL_S
+                    and clocks_agree(at, mono, last_sample.observed_at, last_sample.monotonic_s))
+
+        def refresh(*, publish: bool, outcome: str = "local") -> None:
+            nonlocal latest
+            at, mono = datetime.now(UTC), time.monotonic()
+            if stopped() or not coverage_current(at, mono):
+                if latest is not None:
+                    store.invalidate_current(at)
+                    latest = None
+                return
+            activities = activities_at(at)
+            screens = [visual] if visual is not None else []
+            activity_kind = visual.activity_kind if visual is not None else "unknown"
+            estimate = local_outcome(observer.features(activities, screens, as_of=at, live=True), activity_kind)
+            if latest is not None:
+                published = (latest.activity_kind, latest.state, latest.summary, latest.reason_codes)
+                if latest.valid_until <= at or estimate != published:
+                    store.invalidate_current(at)
+                    latest = None
+            if not publish:
+                # A short availability opportunity can fall between periodic publications.
+                publish = latest is None and estimate[1] == "available"
+            if not publish:
+                return
+            result = observer.observe_local(activities, screens, as_of=at, activity_kind=activity_kind)
+            if result is not None:
+                latest = replace(result, context_revision=result.context_revision + revision_base)
+                store.save_observation(latest, published_at=at, monotonic_s=mono)
+                outcomes[outcome] += 1
+
+        def acquire(sample: ActivitySample) -> None:
+            nonlocal immediate_update, job, uploads
+            activity = recorder.current_activity
+            stamp = capture_stamp()
+            if stamp is None or not recorder.capture_eligible or not cloud_window_eligible(
+                sample, browser_url_required=bool(excluded_domains), platform=sampler.platform,
+            ) or activity is None:
+                schedule.observe(None, sample.monotonic_s)
+                store.save_capture_health(
+                    "skipped" if stamp is None else "source_restricted", sample.observed_at,
+                    reason="capture_disabled" if stamp is None else recorder.capture_ineligibility or "window_unavailable",
+                )
+                return
+            video_hint = known_video_source(sample.app_name, sample.window_title, activity.domain)
+            window = (sample.session_id, sample.app_id or sample.app_name, sample.window_id)
+            schedule.observe(activity.activity_id, sample.monotonic_s, window=window)
+            if job is not None or not schedule.due(sample.monotonic_s, interactive=sample.idle_s is not None and sample.idle_s < 5):
+                return
+
+            def permitted() -> bool:
+                return not stopped() and capture_stamp() == stamp
+
+            grant = prepare_vision_capture(vision, permitted=permitted)
+            if grant is None or not permitted():
+                store.save_capture_health("source_restricted", sample.observed_at, reason="recipient_unavailable")
+                return
+            try:
+                acquired_at, image = capture_window(sample, platform=sampler.platform)
+                thumbnail = frame_thumbnail(image)
+            except (OSError, RuntimeError, ValueError):
+                schedule.probe_failed(sample.monotonic_s)
+                store.set_capture_status(activity.activity_id, "failed")
+                store.save_capture_health("capture_failed", sample.observed_at)
+                return
+
+            after = sampler.sample()
+            if (_desktop_identity(sample) != _desktop_identity(after)
+                    or not clocks_agree(after.observed_at, after.monotonic_s, sample.observed_at, sample.monotonic_s)
+                    or after.monotonic_s - sample.monotonic_s > 3 * ACTIVITY_POLL_S):
+                recorder.observe(after)
+                schedule.observe(None, after.monotonic_s)
+                store.save_capture_health("source_restricted", after.observed_at,
+                                          reason="foreground_changed_during_capture")
+                if immediate_update:
+                    refresh(publish=True)
+                    immediate_update = False
+                return
+            if not permitted() or not sample.observed_at <= acquired_at <= after.observed_at:
+                return
+            now = time.monotonic()
+            if not schedule.inspect(thumbnail, now):
+                store.save_capture_health("skipped", acquired_at, reason="waiting_for_visual_change",
+                                          preserve_status=previous_visual is not None)
+                return
+            store.set_capture_status(activity.activity_id, "captured")
+            signals = observer.features(activities_at(acquired_at), [], as_of=acquired_at, live=True)
+            document_source = activity.document_source if activity.document_status == "title_unavailable" else None
+            evidence = VisionSignals(
+                sampled_at=sample.system_sampled_at or sample.observed_at,
+                foreground_run_s=signals["current_foreground_run_s"],
+                foreground_switches=signals["foreground_switches"], screen_locked=signals["screen_locked"],
+                recent_os_input=signals["recent_os_input"] if signals["idle_s"] is not None else None,
+                previous=previous_visual,
+            )
+            capture_id = uuid4().hex
+            deadline_s = after.monotonic_s + observer.ttl_seconds - (after.observed_at - acquired_at).total_seconds()
+
+            def still_owns_scene() -> bool:
+                at, mono = datetime.now(UTC), time.monotonic()
+                return (activity_id == activity.activity_id and mono < deadline_s and coverage_current(at, mono)
+                        and last_sample is not None and last_sample.screen_locked is False)
+
+            if grant is not LOCAL_CAPTURE:
+                grant = replace(grant, send_permitted=still_owns_scene)
+
+            def request() -> ScreenObservation:
+                if not permitted() or not still_owns_scene():
+                    return ScreenObservation(capture_id, activity.activity_id, acquired_at, "failed", vision.model)
+                return analyze_multimodal(
+                    vision, image=image, activity_id=activity.activity_id, capture_id=capture_id,
+                    captured_at=acquired_at, image_grant=None if grant is LOCAL_CAPTURE else grant,
+                    signals=evidence, document_source=document_source,
+                )
+
+            store.record_upload(datetime.now(UTC), now)
+            schedule.sent(now)
+            if video_hint:
+                schedule.recommend(None, now, video=True)
+            uploads += 1
+            job = _MultimodalJob(
+                activity.activity_id, document_source, deadline_s, video_hint, permitted, workers.submit(request),
+            )
+
+        def collect(*, finishing: bool = False) -> None:
+            nonlocal job, visual, previous_visual
+            if job is None or not (job.future.done() or finishing):
+                return
+            finished, job = job, None
+            result = finished.future.result()
+            at, mono = datetime.now(UTC), time.monotonic()
+            permission = finished.permitted()
+            same_activity = finished.activity_id == activity_id
+            realtime = (not finishing and permission and same_activity and coverage_current(at, mono)
+                        and mono < finished.deadline_s and at < result.captured_at + timedelta(seconds=observer.ttl_seconds))
+            if not permission:
+                result = ScreenObservation(result.capture_id, result.activity_id, result.captured_at, "redacted_out", result.model_id)
+            store.save_screen(result, processed_at=max(at, result.captured_at), realtime_eligible=realtime,
+                              document_source=finished.document_source)
+            if same_activity and not finishing:
+                health = {"ready": "ready", "failed": "model_failed", "redacted_out": "filtered"}[result.status]
+                if getattr(result, "filtered_fields", ()):
+                    health = "filtered"
+                store.save_capture_health(health, at)
+            if result.status == "ready" and same_activity:
+                previous_visual = result
+                if realtime:
+                    visual = result
+                    video = result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
+                    schedule.recommend(result.next_check, mono, video=video)
+                    refresh(publish=True, outcome="model")
+            if not realtime:
+                outcomes["discarded"] += 1
+
+        try:
+            while not stopped() and (mono := time.monotonic()) < end_at:
+                if mono >= next_poll:
+                    sample = sampler.sample()
+                    if stopped():
+                        break
+                    if last_sample is not None and not clocks_agree(
+                        sample.observed_at, sample.monotonic_s, last_sample.observed_at, last_sample.monotonic_s,
+                    ):
+                        recorder.close()
+                    recorder.observe(sample)
+                    periodic = mono >= next_update
+                    refresh(publish=periodic or immediate_update)
+                    immediate_update = False
+                    if periodic:
+                        next_update = mono + model_interval_s
+                    acquire(sample)
+                    next_poll = max(next_poll + ACTIVITY_POLL_S, time.monotonic())
+                collect()
+                wake = min(end_at, next_poll)
+                if job is not None:
+                    wake = min(wake, time.monotonic() + _JOB_CHECK_INTERVAL_S)
+                wait_s = max(0.0, wake - time.monotonic())
+                if stop_event is None:
+                    time.sleep(wait_s)
+                else:
+                    stop_event.wait(wait_s)
+        finally:
+            recorder.close()
+        halted = stopped()
+        if halted:
+            store.invalidate_current(datetime.now(UTC))
+            latest = None
+        if not halted or (job is not None and job.future.done()):
+            collect(finishing=True)
+        as_of = datetime.now(UTC)
+        return {
+            **store.counts(), "visual_attempts": uploads, "state_runs": dict(outcomes),
+            "last_observation": latest.to_dict() if latest is not None and latest.valid_until > as_of
+            and coverage_current(as_of, time.monotonic()) else None, "native_probe_errors": sampler.errors,
         }

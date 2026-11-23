@@ -18,6 +18,7 @@ from PIL import Image
 from .activity import (
     _DEFAULT_EXCLUDED_APPS, _SENSITIVE_TITLE_WORDS, ActivitySample, _is_browser, _page_domain, _private_title,
 )
+from .documents import is_mochi_app
 
 _WIDTH, _HEIGHT = 960, 540
 _FRAME_BYTES = _WIDTH * _HEIGHT * 3
@@ -56,11 +57,12 @@ def cloud_window_eligible(
         platform not in {"darwin", "win32"} or sample.screen_locked is not False
         or not sample.session_id or not sample.app_name or not sample.window_title
         or type(sample.window_id) is not int or sample.window_id <= 0
-        or sample.private_window is True or _private_title(sample.window_title)
+        or sample.private_window is True or is_mochi_app(sample.app_name, sample.app_id)
+        or _private_title(sample.window_title) or _private_title(sample.active_tab_title)
     ):
         return False
-    title = sample.window_title.casefold()
-    if any(word in title for word in _SENSITIVE_TITLE_WORDS):
+    titles = (sample.window_title, sample.active_tab_title)
+    if any(word in title.casefold() for title in titles if title for word in _SENSITIVE_TITLE_WORDS):
         return False
     if any(app in sample.app_name.casefold() for app in _DEFAULT_EXCLUDED_APPS):
         return False

@@ -4,13 +4,14 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
 import logging
 import sqlite3
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import h11
 import httpcore
@@ -23,7 +24,8 @@ from deskpet.observation_v2.openai_cloud import (
     LOCAL_CAPTURE, RoutedObservationModel, prepare_vision_capture, verify_cloud_route,
 )
 from deskpet.observation_v2.routes import STATE, VISION, CloudRoute, CloudRouteError, ObservationCloudSettings
-from deskpet.observation_v2.vision import analyze_screen
+from deskpet.observation_v2.usage import ObservationUsage
+from deskpet.observation_v2.vision import VisionSignals, analyze_multimodal, analyze_screen
 
 
 class LocalModel:
@@ -50,11 +52,12 @@ def _server(monkeypatch, *, wire_only=False):
         seen.append((path, authorization, payload))
         local_ollama = path == "/api/chat"
         schema = payload["format"] if local_ollama else payload["response_format"]["json_schema"]["schema"]
-        user = payload["messages"][-1]["content"]
+        message = payload["messages"][-1]
+        user = message["content"]
         if "answer" in schema["properties"]:
-            if isinstance(user, list):
-                data_url = user[-1]["image_url"]["url"]
-                with Image.open(BytesIO(base64.b64decode(data_url.split(",")[1]))) as image:
+            if isinstance(user, list) or "images" in message:
+                encoded = message["images"][0] if local_ollama else user[-1]["image_url"]["url"].split(",")[1]
+                with Image.open(BytesIO(base64.b64decode(encoded))) as image:
                     red, green, blue = image.getpixel((0, 0))
                 answer = "yellow" if red > 125 and green > 125 else (
                     "red" if red > 125 else "green" if green > 125 else "blue"
@@ -79,6 +82,8 @@ def _server(monkeypatch, *, wire_only=False):
         else:
             response.update(id="synthetic-completion", object="chat.completion", created=1,
                             choices=[{"index": 0, "finish_reason": "stop", "message": message}])
+            if "usage" in behavior:
+                response["usage"] = behavior["usage"]
         body = json.dumps(response).encode()
         headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
         if status == 307:
@@ -119,6 +124,8 @@ def _server(monkeypatch, *, wire_only=False):
                 if before_upload is not None and not upload_started.is_set():
                     upload_started.set()
                     before_upload()
+                if (writes := behavior.get("writes")) is not None:
+                    writes.append(bytes(buffer))
                 self.connection.receive_data(buffer)
 
             def read(self, max_bytes, timeout=None):
@@ -142,6 +149,8 @@ def _server(monkeypatch, *, wire_only=False):
 
         class SyntheticNetwork(httpcore.NetworkBackend):
             def connect_tcp(self, **_kwargs):
+                if (before_connect := behavior.get("before_connect")) is not None:
+                    before_connect()
                 return Wire()
 
         with monkeypatch.context() as patch:
@@ -286,6 +295,157 @@ def test_vision_consent_scope_recipient_switch_and_recording_isolation(tmp_path,
         assert result.status == "ready" and local.images == [jpeg] and len(seen) == 2
 
 
+@pytest.mark.parametrize("permission_revoked", [False, True])
+def test_cloud_multimodal_grant_admits_one_combined_call_and_checks_late_permission(
+    tmp_path, monkeypatch, permission_revoked,
+):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr("deskpet.observation_v2.openai_cloud.time", SimpleNamespace(monotonic=lambda: clock.now))
+    with _server(monkeypatch) as (base, seen, behavior, responded, release_response):
+        settings = ObservationCloudSettings(tmp_path / "settings.db")
+        configured = settings.configure(VISION, _route(base + "/vision/v1", model="qwen3.7-flash"))
+        image_permission = settings.set_permission(VISION, True, expected=configured)
+        settings.set_vision_signals_permission(True, expected=image_permission)
+        probe_usage, usage = [], []
+        verify_cloud_route(settings, VISION, usage_observer=probe_usage.append)
+        local = LocalModel()
+        model = RoutedObservationModel(VISION, settings, local, usage_observer=usage.append)
+        scene_eligible = True
+        grant = replace(prepare_vision_capture(model), send_permitted=lambda: scene_eligible)
+        captured_at = datetime.now(UTC)
+        behavior.update(hold=True, usage={"prompt_tokens": 20, "completion_tokens": 0}, vision_result={
+            "screen_kind": "document", "activity_kind": "work", "scene_elements": ["document table"],
+            "next_check": "check_soon", "unapproved_output": "PRIVATE TEXT",
+        })
+        jpeg = b"synthetic-frame"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                analyze_multimodal, model, image=jpeg, image_grant=grant, capture_id="a", activity_id=1,
+                captured_at=captured_at, signals=VisionSignals(
+                    sampled_at=captured_at - timedelta(seconds=1), foreground_run_s=3.0, screen_locked=False,
+                ),
+            )
+            assert responded.wait(timeout=5)
+            clock.now = grant.expires_at + 1
+            scene_eligible = False
+            if permission_revoked:
+                settings.set_permission(VISION, False, expected=settings.snapshot(VISION))
+            release_response.set()
+            result = future.result(timeout=5)
+
+        assert local.images == []
+        assert probe_usage == [ObservationUsage("qwen3.7-flash", None, None, None)]
+        assert len(seen) == 2  # Capability check plus the single combined request.
+        _, _, wire = seen[-1]
+        content = wire["messages"][-1]["content"]
+        assert base64.b64decode(content[1]["image_url"]["url"].split(",")[-1]) == jpeg
+        assert json.loads(content[0]["text"])["system_signals"]["foreground_run_s"] == 3.0
+        assert "document_title" not in wire["response_format"]["json_schema"]["schema"]["properties"]
+        assert not settings.snapshot(STATE).permission
+        if permission_revoked:
+            assert result.status == "failed" and usage == []
+        else:
+            assert result.status == "ready" and result.scene_elements == ("document table",)
+            assert set(result.filtered_fields) == {"unexpected_fields", "visible_changes"}
+            assert usage == [ObservationUsage("qwen3.7-flash", 20, 0, None)]
+        assert "PRIVATE TEXT" not in repr(result)
+
+
+@pytest.mark.parametrize("move_when", ["before_connect", "before_upload"])
+def test_cloud_multimodal_window_change_during_transport_admission_blocks_image_body(tmp_path, monkeypatch, move_when):
+    with _server(monkeypatch, wire_only=True) as (base, seen, behavior, _, _):
+        settings = ObservationCloudSettings(tmp_path / "settings.db")
+        configured = settings.configure(VISION, _route(base + "/vision/v1"))
+        settings.set_permission(VISION, True, expected=configured)
+        verify_cloud_route(settings, VISION)
+        model = RoutedObservationModel(VISION, settings, LocalModel())
+        scene_eligible = True
+        grant = replace(prepare_vision_capture(model), send_permitted=lambda: scene_eligible)
+
+        def change_window():
+            nonlocal scene_eligible
+            scene_eligible = False
+
+        writes = []
+        behavior.update({move_when: change_window, "writes": writes})
+        image = b"synthetic-frame"
+        result = analyze_multimodal(
+            model, image=image, image_grant=grant, capture_id="a", activity_id=1,
+            captured_at=datetime.now(UTC),
+        )
+
+        assert not scene_eligible
+        assert result.status == "failed"
+        assert base64.b64encode(image) not in b"".join(writes)
+        assert bool(writes) is (move_when == "before_upload")
+        assert len(seen) == 1  # Only the synthetic verification request reached the recipient.
+
+
+def test_old_image_grant_migrates_without_expanding_payload_and_new_consent_scopes_comparisons(tmp_path, monkeypatch):
+    with _server(monkeypatch) as (base, seen, behavior, _, _):
+        database = tmp_path / "settings.db"
+        settings = ObservationCloudSettings(database)
+        configured = settings.configure(VISION, _route(base + "/vision/v1"))
+        settings.set_permission(VISION, True, expected=configured)
+        verify_cloud_route(settings, VISION)
+        with sqlite3.connect(database) as connection:
+            connection.execute("ALTER TABLE observation_cloud_routes DROP COLUMN vision_signals_permission")
+
+        settings = ObservationCloudSettings(database)
+        migrated = settings.snapshot(VISION)
+        assert migrated.permission and migrated.verified and not migrated.vision_signals_permission
+        model = RoutedObservationModel(VISION, settings, LocalModel())
+        now = datetime.now(UTC)
+        behavior["vision_result"] = {
+            "screen_kind": "document", "activity_kind": "work", "scene_elements": ["page canvas"],
+            "visible_changes": [], "next_check": None,
+        }
+
+        def observe(seconds, *, previous=None, grant=None):
+            at = now + timedelta(seconds=seconds)
+            return analyze_multimodal(
+                model, image=b"synthetic-frame", image_grant=grant, capture_id=str(seconds), activity_id=1,
+                captured_at=at, signals=VisionSignals(sampled_at=at, recent_os_input=True, previous=previous),
+            )
+
+        def wire_text():
+            return seen[-1][-1]["messages"][-1]["content"][0]["text"]
+
+        old_grant = prepare_vision_capture(model)
+        image_only = observe(0, grant=old_grant)
+        assert image_only.status == "ready"
+        assert wire_text() == "Observe this frame and return the requested structured fields."
+
+        upgraded = settings.set_vision_signals_permission(True, expected=migrated)
+        assert upgraded.permission and upgraded.verified and upgraded.vision_signals_permission
+        sent = len(seen)
+        assert observe(1, grant=old_grant).status == "failed" and len(seen) == sent
+        first = observe(2, previous=image_only, grant=prepare_vision_capture(model))
+        assert first.status == "ready"
+        assert json.loads(wire_text())["system_signals"]["recent_os_input"] is True
+        assert "previous_scene" not in json.loads(wire_text())
+
+        behavior["vision_result"].update(scene_elements=["page canvas", "comments panel"],
+                                         visible_changes=["visible panel changed"])
+        same_recipient = observe(3, previous=first, grant=prepare_vision_capture(model))
+        assert same_recipient.visible_changes == ("visible panel changed",)
+        assert json.loads(wire_text())["previous_scene"]["scene_elements"] == ["page canvas"]
+
+        config = settings.configure(VISION, _route(base + "/replacement/v1"), expected=settings.snapshot(VISION))
+        assert not config.permission and not config.vision_signals_permission
+        with pytest.raises(CloudRouteError, match="Allow cloud window images"):
+            settings.set_vision_signals_permission(True, expected=config)
+        enabled = settings.set_permission(VISION, True, expected=config)
+        settings.set_vision_signals_permission(True, expected=enabled)
+        verify_cloud_route(settings, VISION)
+        changed_recipient = observe(4, previous=first, grant=prepare_vision_capture(model))
+        assert changed_recipient.status == "ready" and changed_recipient.visible_changes == ()
+        assert "previous_scene" not in json.loads(wire_text())
+        disabled = settings.set_permission(VISION, False, expected=settings.snapshot(VISION))
+        assert not disabled.permission and not disabled.vision_signals_permission
+
+
 def test_revoking_during_serialization_cleans_next_send_and_disables_retries_and_redirects(tmp_path, monkeypatch):
     with _server(monkeypatch) as (base, seen, behavior, _, _):
         settings = ObservationCloudSettings(tmp_path / "settings.db")
@@ -351,6 +511,27 @@ def test_independent_loopback_ollama_state_route(tmp_path, monkeypatch):
         assert settings.snapshot(VISION).route is None
         with pytest.raises(ValueError, match="loopback"):
             CloudRoute("local_ollama", "https://fake.example", "model", "Remote")
+
+
+def test_explicit_loopback_vision_route_validates_multimodal_fields_independently(tmp_path, monkeypatch):
+    with _server(monkeypatch) as (base, seen, behavior, _, _):
+        settings = ObservationCloudSettings(tmp_path / "settings.db")
+        settings.configure(VISION, CloudRoute("local_ollama", base, "local-vision", "Ollama fixture", timeout_s=2))
+        assert verify_cloud_route(settings, VISION).verified
+        fallback = LocalModel()
+        model = RoutedObservationModel(VISION, settings, fallback)
+        assert prepare_vision_capture(model) is LOCAL_CAPTURE
+        behavior["vision_result"] = {
+            "screen_kind": "document", "activity_kind": "work", "scene_elements": ["pivot table"],
+        }
+        result = analyze_multimodal(
+            model, image=b"synthetic-frame", capture_id="local", activity_id=1, captured_at=datetime.now(UTC),
+        )
+
+        assert fallback.images == []
+        assert len(seen) == 2 and all(path == "/api/chat" and authorization is None for path, authorization, _ in seen)
+        assert result.status == "ready" and result.scene_elements == ("pivot table",)
+        assert set(result.filtered_fields) == {"visible_changes", "next_check"}
 
 
 def test_upload_guard_does_not_lock_business_writes(tmp_path, monkeypatch):

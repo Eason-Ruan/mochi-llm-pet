@@ -12,12 +12,15 @@ import sqlite3
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+from deskpet.observation_v2.documents import normalize_document_sources
 
 
 _OBSERVATION_PRIVACY_FIELDS = {
     "observation_screenshots", "observation_browser_metadata", "observation_paused",
     "observation_excluded_apps", "observation_excluded_domains",
+    "document_local_sources", "document_cloud_sources",
 }
 
 
@@ -44,6 +47,8 @@ class Settings(BaseModel):
     observation_browser_metadata: bool = False
     observation_excluded_apps: tuple[str, ...] = Field(default=(), max_length=100)
     observation_excluded_domains: tuple[str, ...] = Field(default=(), max_length=100)
+    document_local_sources: tuple[str, ...] = Field(default=(), max_length=100)
+    document_cloud_sources: tuple[str, ...] = Field(default=(), max_length=100)
     observation_paused: bool = False
     observation_generation: int = Field(ge=0, default=0)
     input_mode: Literal["voice", "typing"] = "typing"
@@ -69,6 +74,17 @@ class Settings(BaseModel):
                 raise ValueError("Use a domain without a URL or path")
             domains.append(normalized)
         return tuple(dict.fromkeys(domains))
+
+    @field_validator("document_local_sources")
+    @classmethod
+    def _clean_document_local_sources(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return normalize_document_sources(value)
+
+    @field_validator("document_cloud_sources")
+    @classmethod
+    def _clean_document_cloud_sources(cls, value: tuple[str, ...], info: ValidationInfo) -> tuple[str, ...]:
+        local_sources = set(info.data.get("document_local_sources", ()))
+        return tuple(source for source in normalize_document_sources(value) if source in local_sources)
 
     def to_dict(self) -> dict:
         return self.model_dump(mode="json")

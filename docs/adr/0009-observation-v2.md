@@ -1,5 +1,7 @@
 # 0009 · 独立 Observation v2
 
+桌面实时采样与文档记忆的后续决策见 [0011](0011-multimodal-document-observation.md)。
+
 状态为独立实现，设计来自 [Notion ADR](https://app.notion.com/p/420eb246ea0681169f3af32e46ee9ce5)。
 
 ```mermaid
