@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
 )
 
@@ -43,6 +43,8 @@ class WorkPanel(QGroupBox):
         self._select_when_available = None
         self._review_session = None
         self._drafts = {}
+        self._none_drafts = {}
+        self._review_offers = {}
         self._session_rows = None
         self._task_rows = None
 
@@ -98,6 +100,8 @@ class WorkPanel(QGroupBox):
         self.next_steps.setMaximumHeight(65)
         review_layout.addWidget(self.outcomes)
         review_layout.addWidget(self.next_steps)
+        self.confirm_none = QCheckBox("我确认本轮没有完成项（可填写下一步）")
+        review_layout.addWidget(self.confirm_none)
         self.review_notice = label("")
         review_layout.addWidget(self.review_notice)
         review_buttons = QHBoxLayout()
@@ -140,6 +144,7 @@ class WorkPanel(QGroupBox):
         self.sessions.setEnabled(self.pending is None)
         self.outcomes.setReadOnly(self.pending is not None)
         self.next_steps.setReadOnly(self.pending is not None)
+        self.confirm_none.setEnabled(self.pending is None)
 
     def _command(self, kind):
         button = self.confirm_end if kind == "end" else self.buttons[kind]
@@ -154,7 +159,13 @@ class WorkPanel(QGroupBox):
             payload = {"session_id": view["session_id"], "expected_session_version": view["version"]}
             if kind == "end":
                 self._save_draft()
-                payload.update(confirmed_outcomes=self._lines(self.outcomes), next_steps=self._lines(self.next_steps))
+                outcomes = self._lines(self.outcomes)
+                if outcomes and self.confirm_none.isChecked():
+                    self.result.setText("已填写成果时不能同时确认没有完成项，请检查后提交。")
+                    return
+                payload.update(confirmed_outcomes=outcomes, next_steps=self._lines(self.next_steps),
+                    _review={**self._review_offers[view["session_id"]],
+                             "explicit_no_completed_items": self.confirm_none.isChecked()})
         try:
             event_id = self.submit(f"session.{kind}", payload=payload)
         except (RuntimeError, ValueError) as exc:
@@ -178,9 +189,11 @@ class WorkPanel(QGroupBox):
                 self.result.setText("工作段已创建。")
             elif pending["kind"] == "end":
                 self._drafts.pop(pending["session_id"], None)
+                self._none_drafts.pop(pending["session_id"], None)
+                self._review_offers.pop(pending["session_id"], None)
                 self._review_session = None
                 self.review_editor.hide()
-                self.result.setText("已结束，用户确认的回顾已保存。")
+                self.result.setText("已结束，回顾已保存。")
             else:
                 self.result.setText("已暂停。" if pending["kind"] == "pause" else "已继续。")
         else:
@@ -192,14 +205,20 @@ class WorkPanel(QGroupBox):
     def _save_draft(self):
         if self._review_session is not None:
             self._drafts[self._review_session] = (self.outcomes.toPlainText(), self.next_steps.toPlainText())
+            self._none_drafts[self._review_session] = self.confirm_none.isChecked()
 
     def _open_review(self):
         if not self.buttons["end"].isEnabled():
             return
         self._review_session = self.current_session()["session_id"]
+        self._review_offers.setdefault(self._review_session, {
+            "review_id": f"c-review-{uuid4().hex}", "session_id": self._review_session,
+            "offered_at": self.snapshot.get("now"),
+        })
         outcomes, next_steps = self._drafts.get(self._review_session, ("", ""))
         self.outcomes.setPlainText(outcomes)
         self.next_steps.setPlainText(next_steps)
+        self.confirm_none.setChecked(self._none_drafts.get(self._review_session, False))
         self.review_notice.setText("确认前工作段保持当前状态；返回后可以继续操作。")
         self.review_editor.show()
         self._refresh_controls()
@@ -258,7 +277,12 @@ class WorkPanel(QGroupBox):
             if view["state"] == "break_due":
                 self.summary.setText(self.summary.text() + "\n本轮时间已到，请结束并确认成果；尚未自动开始休息。")
             if view["state"] == "ended":
-                outcomes = "\n".join(f"• {s}" for s in view["confirmed_outcomes"]) or "未填写"
+                evidence = self.snapshot.get("session_reviews", {}).get(view["session_id"], {})
+                confirmed_none = (evidence.get("version") == view["version"]
+                                  and evidence.get("status") == "confirmed_none")
+                outcomes = "\n".join(f"• {s}" for s in view["confirmed_outcomes"])
+                if not outcomes:
+                    outcomes = "已确认：本轮没有完成项" if confirmed_none else "未填写（未确认没有完成项）"
                 next_steps = "\n".join(f"• {s}" for s in view["next_steps"]) or "未填写"
                 self.review.setText(f"工作回顾 · {view['goal']}\n确认成果：\n{outcomes}\n下一步：\n{next_steps}")
                 if self._review_session == view["session_id"]:

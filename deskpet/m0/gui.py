@@ -59,6 +59,7 @@ class ServiceWorker(QObject):
         self._realtime_scenario_elapsed = 0
         self._saved_envelope = None
         self._observation = None
+        self._session_reviews = {}
         self._qt_source = "offscreen" if QGuiApplication.platformName() in ("offscreen", "minimal") else "native"
 
     @pyqtSlot()
@@ -108,6 +109,7 @@ class ServiceWorker(QObject):
             "clock": getattr(self.env.clock, "kind", "wall"),
             "tasks": [v.model_dump(mode="json") for v in self.env.tasks.list_tasks()],
             "sessions": sessions,
+            "session_reviews": {key: dict(value) for key, value in self._session_reviews.items()},
             "observation": frame.observation.model_dump(mode="json"),
             "observation_frame": frame.model_dump(mode="json"),
             "sampling_editable": self.args.profile == "scenario" and hasattr(self.env.sampling, "set_signals"),
@@ -137,6 +139,7 @@ class ServiceWorker(QObject):
         if self.env is None:
             return
         ui = None
+        ui_action_seq = None
         try:
             self._sync_realtime_scenario()
             if action.get("kind") == "ui":
@@ -147,6 +150,7 @@ class ServiceWorker(QObject):
                                     payload={"event_id": ui.event_id, "action_id": ui.action_id,
                                              "surface_revision": ui.surface_revision,
                                              "automation": bool(getattr(self.args, "auto_smoke", False))})
+                ui_action_seq = self.env.trace.events[-1].seq
                 prefix, verb = ui.action_id.split(".", 1)
                 if prefix == "reminder":
                     task = self.env.tasks.get(ui.task_id) if ui.task_id else None
@@ -239,6 +243,8 @@ class ServiceWorker(QObject):
                 result = {"status": "estimate_submitted"}
             elif kind == "session":
                 payload = dict(action.get("payload", {}))
+                review = payload.pop("_review", None) if ui is not None else None
+                submitted_at = self.env.clock.wall_now().isoformat()
                 only_if_idle = action["command"] == "start" and payload.pop("only_if_idle", False)
                 command = SessionCommand(
                     command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
@@ -256,6 +262,21 @@ class ServiceWorker(QObject):
                                  "error_code": ErrorCode.INVALID_TRANSITION.value})
                 else:
                     result = self.env.sessions.apply(command)
+                if ui is not None and action["command"] == "end" and result.status == "applied":
+                    from deskpet.c_ui.review_evidence import end_record
+                    applied = next((e.seq for e in reversed(self.env.trace.events)
+                        if e.kind == "session.applied" and e.session_id == action["session_id"]
+                        and e.payload.get("command_id") == result.command_id), None)
+                    origin = ("automation" if getattr(self.args, "auto_smoke", False)
+                              or self._qt_source != "native" else "user")
+                    record = end_record(result=result.model_dump(mode="json"), review=review,
+                        submitted_at=submitted_at, origin=origin,
+                        action_seq=ui_action_seq, applied_seq=applied)
+                    self._session_reviews[action["session_id"]] = {
+                        "version": result.view.version, "status": record["review_status"]}
+                    self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
+                        source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
+                        payload=record)
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:
@@ -318,6 +339,14 @@ class ServiceWorker(QObject):
     def stop(self):
         if self.timer:
             self.timer.stop()
+        if self.env is not None:
+            for service in (self.env.sessions, self.env.tasks):
+                close = getattr(service, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        self.error.emit(f"关闭服务失败：{type(exc).__name__}: {exc}")
         self.stopped.emit()
         QThread.currentThread().quit()
 
@@ -849,6 +878,8 @@ class Workbench(QMainWindow):
         return self.views.get(task_id)
 
     def _create(self):
+        while f"gui-{self._next_task}" in self.views:
+            self._next_task += 1
         task_id = f"gui-{self._next_task}"
         self._next_task += 1
         self._select_task = task_id
@@ -988,7 +1019,9 @@ class Workbench(QMainWindow):
             return
         receipt = DisplayReceipt(delivery_id=command.delivery_id, task_id=command.task_id,
                                  task_version=command.task_version,
-                                 rendered_at=(datetime.now(timezone.utc) if self.latest["clock"] == "wall" else self.latest["now"]), outcome=outcome,
+                                 # A queued display can precede the next clock snapshot.
+                                 rendered_at=(datetime.now(timezone.utc) if self.latest["clock"] == "wall" else
+                                              max(command.requested_at, datetime.fromisoformat(self.latest["now"]))), outcome=outcome,
                                  source=source, error_code=error)
         self.receipts[command.delivery_id] = receipt
         if outcome == "displayed" and self._external_surface is None:
@@ -1091,8 +1124,9 @@ class Workbench(QMainWindow):
     @pyqtSlot()
     def _ready(self):
         self.ready_for_actions = True
-        if self.args.profile == "live-smoke":
+        if self.args.profile != "scenario":
             self.advance_button.setEnabled(False)
+        if self.args.profile == "live-smoke":
             self._start_live_sampling()
         if getattr(self.args, "auto_smoke", False):
             self._await_smoke_window()

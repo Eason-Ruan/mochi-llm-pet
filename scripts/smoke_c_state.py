@@ -12,6 +12,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',default='output/m0/c-p3/native')
     parser.add_argument('--offscreen',action='store_true')
+    parser.add_argument('--adapters',default='examples/m0/c-product.adapters.json')
     args=parser.parse_args()
     if args.offscreen:
         os.environ['QT_QPA_PLATFORM']='offscreen'
@@ -23,7 +24,7 @@ def main():
     from deskpet.m0.gui import Workbench
     output=Path(args.output); output.mkdir(parents=True,exist_ok=True)
     app=QApplication.instance() or QApplication([])
-    options=SimpleNamespace(profile='scenario',scenario='c-state',output=str(output),auto_smoke=False,adapters='examples/m0/c-product.adapters.json')
+    options=SimpleNamespace(profile='scenario',scenario='c-state',output=str(output),auto_smoke=False,adapters=args.adapters)
     w=Workbench(options); p=w.ui_surface; panel=p.state_panel; renderer=panel.renderer
     source='offscreen' if QGuiApplication.platformName() in ('offscreen','minimal') else 'native'
     checks={}; report={}; state=dict(index=0,sent=False,waits=0)

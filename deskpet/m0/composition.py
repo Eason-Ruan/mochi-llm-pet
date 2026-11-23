@@ -108,7 +108,7 @@ def build_observation_environment(*, profile="scenario", clock=None, adapters=No
     """Wire only measurement/estimation/correction; no task, GUI or model clients."""
     from deskpet.mocks.sampling import BufferedSamplingSource
     from .observation import ObservationPipeline
-    if profile not in {"scenario", "live-smoke"}:
+    if profile not in {"scenario", "live-smoke", "realtime"}:
         raise ValueError(f"unknown profile: {profile}")
     clock = clock if clock is not None else (FakeClock() if profile == "scenario" else RealClock())
     configured = load_adapters(adapters)
@@ -122,7 +122,7 @@ def build_observation_environment(*, profile="scenario", clock=None, adapters=No
             raise ValueError("a metrics adapter requires an output directory")
         trace = TraceRecorder(clock, run_id=f"m0-{scenario_id}", scenario_id=scenario_id, sink=sink)
     if sampling_source is None:
-        if external_sampling or profile == "live-smoke":
+        if external_sampling or profile in {"live-smoke", "realtime"}:
             sampling_source = BufferedSamplingSource(clock=clock)
         else:
             sampling_source = resolve_sampling_source(profile=profile, clock=clock, adapters=configured)
@@ -170,7 +170,7 @@ def build_environment(*, profile="scenario", scenario_id="manual", output=None,
     from deskpet.mocks.delivery import FakeDeliveryPort
     from .runtime import ToolRuntime
 
-    if profile not in {"scenario", "live-smoke"}:
+    if profile not in {"scenario", "live-smoke", "realtime"}:
         raise ValueError(f"unknown profile: {profile}")
     clock = clock if clock is not None else (FakeClock() if profile == "scenario" else RealClock())
     adapters = load_adapters(adapters)

@@ -136,6 +136,11 @@ def test_full_c_work_session_flow(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
     assert len([e for e in events if e["kind"] == "session.break_due"]) == 1
     assert len([e for e in events if e["kind"] == "session.applied" and e["payload"]["kind"] == "end"]) == 2
+    from deskpet.c_ui.review_evidence import summarize_reviews
+    evidence = summarize_reviews(events)
+    assert evidence["status"] == "passed" and evidence["linked_end_records"] == 2
+    assert evidence["review_statuses"] == {"confirmed": 1, "confirmed_none": 1}
+    assert evidence["real_user_confirmations"] == 0
 
 
 def test_review_conflicts_keep_drafts_and_refresh_expected_version(tmp_path):
@@ -160,6 +165,10 @@ p.sessions.setCurrentRow(0)
 p.buttons['end'].click()
 p.outcomes.setPlainText('草稿成果')
 p.next_steps.setPlainText('草稿下一步')
+p.confirm_none.setChecked(True)
+p.confirm_end.click()
+assert not p.pending and not calls, 'contradictory review was submitted'
+p.confirm_none.setChecked(False)
 p.confirm_end.click()
 assert p.pending and p.outcomes.isReadOnly()
 p.receive_result({'command_id':'unrelated', 'status':'applied'})
@@ -193,6 +202,37 @@ p.submit = closed
 p.confirm_end.click()
 assert p.pending is None and p.outcomes.toPlainText() == '另一段草稿'
 assert '已保留' in p.result.text()
+p.close()
+'''
+    process = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+        env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
+def test_saved_review_distinguishes_explicit_none_from_blank_and_stale_evidence():
+    code = r'''
+from PyQt6.QtWidgets import QApplication
+from deskpet.c_ui.work_panel import WorkPanel
+app = QApplication([])
+p = WorkPanel(submit=lambda *a, **kw: 'unused')
+view = dict(session_id='work', version=2, state='ended', goal='review', remaining_s=0,
+            task_id=None, confirmed_outcomes=[], next_steps=['继续阅读'])
+def render(evidence=None):
+    p.render_snapshot(dict(sessions=[view], tasks=[], session_reviews=evidence or {}))
+render()
+assert '未填写（未确认没有完成项）' in p.review.text()
+render({'work': {'version':2, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' in p.review.text()
+assert '继续阅读' in p.review.text()
+render({'work': {'version':2, 'status':'unconfirmed'}})
+assert '未填写（未确认没有完成项）' in p.review.text()
+render({'work': {'version':1, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' not in p.review.text(), 'old terminal version was used'
+render({'other': {'version':2, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' not in p.review.text(), 'another session evidence was used'
+view['confirmed_outcomes']=['读完第一章']
+render({'work': {'version':2, 'status':'confirmed_none'}})
+assert '读完第一章' in p.review.text() and '已确认：本轮没有完成项' not in p.review.text()
 p.close()
 '''
     process = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
