@@ -136,6 +136,11 @@ def test_full_c_work_session_flow(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
     assert len([e for e in events if e["kind"] == "session.break_due"]) == 1
     assert len([e for e in events if e["kind"] == "session.applied" and e["payload"]["kind"] == "end"]) == 2
+    from deskpet.c_ui.review_evidence import summarize_reviews
+    evidence = summarize_reviews(events)
+    assert evidence["status"] == "passed" and evidence["linked_end_records"] == 2
+    assert evidence["review_statuses"] == {"confirmed": 1, "confirmed_none": 1}
+    assert evidence["real_user_confirmations"] == 0
 
 
 def test_review_conflicts_keep_drafts_and_refresh_expected_version(tmp_path):
@@ -160,6 +165,10 @@ p.sessions.setCurrentRow(0)
 p.buttons['end'].click()
 p.outcomes.setPlainText('草稿成果')
 p.next_steps.setPlainText('草稿下一步')
+p.confirm_none.setChecked(True)
+p.confirm_end.click()
+assert not p.pending and not calls, 'contradictory review was submitted'
+p.confirm_none.setChecked(False)
 p.confirm_end.click()
 assert p.pending and p.outcomes.isReadOnly()
 p.receive_result({'command_id':'unrelated', 'status':'applied'})

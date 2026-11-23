@@ -13,6 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', default='output/m0/c-p2/native')
     parser.add_argument('--offscreen', action='store_true')
+    parser.add_argument('--adapters', default='examples/m0/c-product.adapters.json')
     args = parser.parse_args()
     if args.offscreen:
         os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -26,7 +27,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     app = QApplication.instance() or QApplication([])
     options = SimpleNamespace(profile='scenario', scenario='c-reminders', output=str(output),
-        auto_smoke=False, adapters='examples/m0/c-product.adapters.json')
+        auto_smoke=False, adapters=args.adapters)
     w = Workbench(options)
     p = w.ui_surface
     panel = p.reminder_panel

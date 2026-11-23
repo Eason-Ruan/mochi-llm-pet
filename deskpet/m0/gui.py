@@ -137,6 +137,7 @@ class ServiceWorker(QObject):
         if self.env is None:
             return
         ui = None
+        ui_action_seq = None
         try:
             self._sync_realtime_scenario()
             if action.get("kind") == "ui":
@@ -147,6 +148,7 @@ class ServiceWorker(QObject):
                                     payload={"event_id": ui.event_id, "action_id": ui.action_id,
                                              "surface_revision": ui.surface_revision,
                                              "automation": bool(getattr(self.args, "auto_smoke", False))})
+                ui_action_seq = self.env.trace.events[-1].seq
                 prefix, verb = ui.action_id.split(".", 1)
                 if prefix == "reminder":
                     task = self.env.tasks.get(ui.task_id) if ui.task_id else None
@@ -239,6 +241,8 @@ class ServiceWorker(QObject):
                 result = {"status": "estimate_submitted"}
             elif kind == "session":
                 payload = dict(action.get("payload", {}))
+                review = payload.pop("_review", None) if ui is not None else None
+                submitted_at = self.env.clock.wall_now().isoformat()
                 only_if_idle = action["command"] == "start" and payload.pop("only_if_idle", False)
                 command = SessionCommand(
                     command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
@@ -256,6 +260,18 @@ class ServiceWorker(QObject):
                                  "error_code": ErrorCode.INVALID_TRANSITION.value})
                 else:
                     result = self.env.sessions.apply(command)
+                if ui is not None and action["command"] == "end" and result.status == "applied":
+                    from deskpet.c_ui.review_evidence import end_record
+                    applied = next((e.seq for e in reversed(self.env.trace.events)
+                        if e.kind == "session.applied" and e.session_id == action["session_id"]
+                        and e.payload.get("command_id") == result.command_id), None)
+                    origin = ("automation" if getattr(self.args, "auto_smoke", False)
+                              or self._qt_source != "native" else "user")
+                    self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
+                        source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
+                        payload=end_record(result=result.model_dump(mode="json"), review=review,
+                            submitted_at=submitted_at, origin=origin,
+                            action_seq=ui_action_seq, applied_seq=applied))
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:
@@ -318,6 +334,14 @@ class ServiceWorker(QObject):
     def stop(self):
         if self.timer:
             self.timer.stop()
+        if self.env is not None:
+            for service in (self.env.sessions, self.env.tasks):
+                close = getattr(service, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        self.error.emit(f"关闭服务失败：{type(exc).__name__}: {exc}")
         self.stopped.emit()
         QThread.currentThread().quit()
 
@@ -1095,8 +1119,9 @@ class Workbench(QMainWindow):
     @pyqtSlot()
     def _ready(self):
         self.ready_for_actions = True
-        if self.args.profile == "live-smoke":
+        if self.args.profile != "scenario":
             self.advance_button.setEnabled(False)
+        if self.args.profile == "live-smoke":
             self._start_live_sampling()
         if getattr(self.args, "auto_smoke", False):
             self._await_smoke_window()
