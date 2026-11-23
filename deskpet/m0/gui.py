@@ -59,6 +59,7 @@ class ServiceWorker(QObject):
         self._realtime_scenario_elapsed = 0
         self._saved_envelope = None
         self._observation = None
+        self._session_reviews = {}
         self._qt_source = "offscreen" if QGuiApplication.platformName() in ("offscreen", "minimal") else "native"
 
     @pyqtSlot()
@@ -108,6 +109,7 @@ class ServiceWorker(QObject):
             "clock": getattr(self.env.clock, "kind", "wall"),
             "tasks": [v.model_dump(mode="json") for v in self.env.tasks.list_tasks()],
             "sessions": sessions,
+            "session_reviews": {key: dict(value) for key, value in self._session_reviews.items()},
             "observation": frame.observation.model_dump(mode="json"),
             "observation_frame": frame.model_dump(mode="json"),
             "sampling_editable": self.args.profile == "scenario" and hasattr(self.env.sampling, "set_signals"),
@@ -267,11 +269,14 @@ class ServiceWorker(QObject):
                         and e.payload.get("command_id") == result.command_id), None)
                     origin = ("automation" if getattr(self.args, "auto_smoke", False)
                               or self._qt_source != "native" else "user")
+                    record = end_record(result=result.model_dump(mode="json"), review=review,
+                        submitted_at=submitted_at, origin=origin,
+                        action_seq=ui_action_seq, applied_seq=applied)
+                    self._session_reviews[action["session_id"]] = {
+                        "version": result.view.version, "status": record["review_status"]}
                     self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
                         source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
-                        payload=end_record(result=result.model_dump(mode="json"), review=review,
-                            submitted_at=submitted_at, origin=origin,
-                            action_seq=ui_action_seq, applied_seq=applied))
+                        payload=record)
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:

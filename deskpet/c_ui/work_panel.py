@@ -193,7 +193,7 @@ class WorkPanel(QGroupBox):
                 self._review_offers.pop(pending["session_id"], None)
                 self._review_session = None
                 self.review_editor.hide()
-                self.result.setText("已结束，回顾已保存。空白回顾不计为确认没有完成项。")
+                self.result.setText("已结束，回顾已保存。")
             else:
                 self.result.setText("已暂停。" if pending["kind"] == "pause" else "已继续。")
         else:
@@ -277,7 +277,12 @@ class WorkPanel(QGroupBox):
             if view["state"] == "break_due":
                 self.summary.setText(self.summary.text() + "\n本轮时间已到，请结束并确认成果；尚未自动开始休息。")
             if view["state"] == "ended":
-                outcomes = "\n".join(f"• {s}" for s in view["confirmed_outcomes"]) or "未填写"
+                evidence = self.snapshot.get("session_reviews", {}).get(view["session_id"], {})
+                confirmed_none = (evidence.get("version") == view["version"]
+                                  and evidence.get("status") == "confirmed_none")
+                outcomes = "\n".join(f"• {s}" for s in view["confirmed_outcomes"])
+                if not outcomes:
+                    outcomes = "已确认：本轮没有完成项" if confirmed_none else "未填写（未确认没有完成项）"
                 next_steps = "\n".join(f"• {s}" for s in view["next_steps"]) or "未填写"
                 self.review.setText(f"工作回顾 · {view['goal']}\n确认成果：\n{outcomes}\n下一步：\n{next_steps}")
                 if self._review_session == view["session_id"]:

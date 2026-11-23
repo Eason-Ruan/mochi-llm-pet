@@ -207,3 +207,34 @@ p.close()
     process = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
         env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=15)
     assert process.returncode == 0, process.stdout + process.stderr
+
+
+def test_saved_review_distinguishes_explicit_none_from_blank_and_stale_evidence():
+    code = r'''
+from PyQt6.QtWidgets import QApplication
+from deskpet.c_ui.work_panel import WorkPanel
+app = QApplication([])
+p = WorkPanel(submit=lambda *a, **kw: 'unused')
+view = dict(session_id='work', version=2, state='ended', goal='review', remaining_s=0,
+            task_id=None, confirmed_outcomes=[], next_steps=['继续阅读'])
+def render(evidence=None):
+    p.render_snapshot(dict(sessions=[view], tasks=[], session_reviews=evidence or {}))
+render()
+assert '未填写（未确认没有完成项）' in p.review.text()
+render({'work': {'version':2, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' in p.review.text()
+assert '继续阅读' in p.review.text()
+render({'work': {'version':2, 'status':'unconfirmed'}})
+assert '未填写（未确认没有完成项）' in p.review.text()
+render({'work': {'version':1, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' not in p.review.text(), 'old terminal version was used'
+render({'other': {'version':2, 'status':'confirmed_none'}})
+assert '已确认：本轮没有完成项' not in p.review.text(), 'another session evidence was used'
+view['confirmed_outcomes']=['读完第一章']
+render({'work': {'version':2, 'status':'confirmed_none'}})
+assert '读完第一章' in p.review.text() and '已确认：本轮没有完成项' not in p.review.text()
+p.close()
+'''
+    process = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+        env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0, process.stdout + process.stderr

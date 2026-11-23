@@ -135,6 +135,7 @@ def main():
                 work.confirm_end.click()
                 stage(9)
             elif n == 9 and session and session["state"] == "ended" and not work.pending:
+                assert "已确认：本轮没有完成项" in work.review.text()
                 checks["accepted_review_after_real_timer"] = True
                 finish()
         except Exception:

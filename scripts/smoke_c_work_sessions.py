@@ -147,6 +147,9 @@ def main():
             return False
         assert current()["version"] == 3
         assert current()["confirmed_outcomes"] == current()["next_steps"] == []
+        assert "已确认：本轮没有完成项" in panel.review.text()
+        assert "未确认没有完成项" not in panel.review.text()
+        w._grab_evidence(output / "confirmed-none-review.png")
         return True
 
     def select_first():
