@@ -26,7 +26,7 @@ from .refine_delivery import Prompt, RefineDeliveryMixin
 from .refine_panels import RefineReminders, RefineSettings, RefineWork, active_reminders, current_work
 from .refine_proposals import ProposalCard
 from .refine_style import DetailPanel
-from .refine_window import RefinePet, RefineScroll
+from .refine_window import RefinePet
 from .time_format import ZONE
 
 DEMO_GOAL = "完成论文的方法部分"
@@ -125,9 +125,12 @@ class RefineSession(RefineDeliveryMixin):
             system2=self._queue_chat_message if self.production else None,
             configure_system2=self._open_model_settings if self.production else None,
             proposal_card=self.proposal_card,
+            preferred_height=self.settings.value("chatHeight", 0, type=int),
         )
         self.chat_store = chat_store
         self.chat.set_preference(self.input_mode)
+        self.chat.geometry_requested.connect(self.pet._layout_pet)
+        self.chat.height_committed.connect(lambda height: self.settings.setValue("chatHeight", height))
         self.chat.toolbar_mode_changed.connect(self.pet.set_chat_toolbar)
         self.chat.typing_requested.connect(self.pet.activate_for_input)
         self.chat.storage_error.connect(self._service_error)
@@ -137,7 +140,7 @@ class RefineSession(RefineDeliveryMixin):
             "work": (DetailPanel("专注与回顾", self.work, lambda: self._panel_details("work", False))
                      if self.production else self.work),
             "settings": self.settings_panel,
-            "input": RefineScroll(self.chat) if self.production else self.chat,
+            "input": self.chat,
         }
 
         if self.production:

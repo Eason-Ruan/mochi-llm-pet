@@ -193,6 +193,10 @@ class MenuField(QComboBox):
 class Toggle(QCheckBox):
     """A keyboard-accessible switch with the label on the left."""
 
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_LayoutUsesWidgetRect)
+
     def hitButton(self, position):
         return self.rect().contains(position)
 

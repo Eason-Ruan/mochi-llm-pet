@@ -118,6 +118,12 @@ def test_settings_widget_sends_edits_and_routes_each_sound_preview(tmp_path, mon
         assert panel.height() <= 245
         reminder_sound = panel.findChild(QCheckBox, "settings-reminder_sound")
         phase_sound = panel.findChild(QCheckBox, "settings-phase_end_sound")
+        row_toggles = (
+            reminder_sound, phase_sound,
+            panel.findChild(QCheckBox, "settings-allow_proactive_movement"),
+            panel.findChild(QCheckBox, "settings-reduce_motion"),
+        )
+        assert len({toggle.mapToGlobal(toggle.rect().topRight()).x() for toggle in row_toggles}) == 1
         reminder_sound.click()
         assert commands == [(0, {"reminder_sound": False})]
         assert store.read().reminder_sound

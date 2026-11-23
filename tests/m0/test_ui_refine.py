@@ -18,9 +18,10 @@ from time import monotonic
 from types import SimpleNamespace
 
 from PyQt6 import sip
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSettings, Qt
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from PyQt6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QScrollArea, QWidget
 
 from deskpet.c_ui.refine import RefineSession
 from deskpet.c_ui.time_format import local_time
@@ -127,11 +128,53 @@ try:
     assert new_due.date() == local_time(clock_start).date() + timedelta(days=1)
     assert (new_due.hour, new_due.minute, new_due.second) == (18, 0, 0)
     assert any(task == milk_after for task in session.snapshot['tasks'])
-    assert len(messages()) == 2
-    click(chat, 'refine-chat-history-up')
-    wait_for(lambda: any('确认这个时间吗' in text for text in messages()), 'history did not move up')
-    hold(chat, 'refine-chat-history-down', lambda: any('已将' in text for text in messages()))
-    wait_for(lambda: any('已将' in text for text in messages()), 'hold did not return to latest')
+    assert len(messages()) == 4
+    assert not chat.findChild(QPushButton, 'refine-chat-history-up')
+    assert not chat.findChild(QPushButton, 'refine-chat-history-down')
+    history = chat.findChild(QScrollArea, 'refine-chat-history')
+    grip = chat.findChild(QWidget, 'refine-chat-height-grip')
+    pet._home_anchor = QPoint(50, 40)
+    pet._layout_pet()
+    initial_height = chat.height()
+    direction = -1 if chat._panel_above else 1
+    origin = grip.mapToGlobal(grip.rect().center())
+    target = origin + QPoint(0, direction * 48)
+    left = Qt.MouseButton.LeftButton
+    for kind, point, button, buttons in (
+        (QEvent.Type.MouseButtonPress, origin, left, left),
+        (QEvent.Type.MouseMove, target, Qt.MouseButton.NoButton, left),
+        (QEvent.Type.MouseButtonRelease, target, left, Qt.MouseButton.NoButton),
+    ):
+        QApplication.sendEvent(grip, QMouseEvent(
+            kind, QPointF(grip.mapFromGlobal(point)), QPointF(point),
+            button, buttons, Qt.KeyboardModifier.NoModifier,
+        ))
+    assert chat.height() == initial_height + 48
+    assert settings.value('chatHeight', type=int) == chat.height()
+    chat.open('typing')
+    wait_for(lambda: visible_widget(chat, QLineEdit, 'refine-chat-editor'), 'composer did not appear')
+    editor = visible_widget(chat, QLineEdit, 'refine-chat-editor')
+    assert editor is not None
+    editor.setText('暂存的输入')
+    for _ in range(6):
+        chat.append_message('我可以帮你做这三件事。\n\n**提醒与事项**：' + '滚动验证。' * 14)
+    QTest.qWait(60)
+    body = chat._message_cards.itemAt(chat._message_cards.count() - 1).widget().body
+    assert body.height() == body.heightForWidth(body.width())
+    assert body.document.toPlainText().startswith('我可以帮你做这三件事。')
+    assert '**' not in body.document.toPlainText()
+    bar = history.verticalScrollBar()
+    wait_for(lambda: bar.maximum() > 0, 'scrollbar did not appear')
+    QTest.qWait(60)
+    bar.setValue(0)
+    chat.append_message('浏览历史时收到的新消息。')
+    QTest.qWait(60)
+    assert bar.value() == 0
+    editor = visible_widget(chat, QLineEdit, 'refine-chat-editor')
+    assert editor is not None and editor.text() == '暂存的输入'
+    bar.setValue(bar.maximum())
+    assert bar.value() > 0
+    chat.reset_input()
 
     session.show_message('一条可以关闭的测试消息')
     wait_for(lambda: session.prompt is not None and session.prompt.kind == 'message',

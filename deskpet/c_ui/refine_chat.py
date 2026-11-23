@@ -8,17 +8,22 @@ import sqlite3
 from uuid import uuid4
 
 from PyQt6.QtCore import QElapsedTimer, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFontDatabase, QPainter
+from PyQt6.QtGui import (
+    QAbstractTextDocumentLayout, QColor, QFontDatabase, QPainter, QPalette, QTextDocument, QTextOption,
+)
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from .refine_dialogue import DemoConversation, DemoTurn, LocalConversation, MILK_CONFIRM, MILK_REQUEST
 from .refine_icons import icon
+from .refine_style import _font, _scroll_area
 
 INK = "#433426"
 GREEN_INK = "#34513A"
 PANEL_WIDTH = 292
+DEFAULT_MAX_HEIGHT = 420
+MIN_HEIGHT = 134
 
 
 STYLE = """
@@ -45,6 +50,7 @@ QFrame#refine-chat-editbox {
     background: #FFFFFF; border: 1px solid #DEC8AA; border-radius: 6px;
 }
 QPushButton {
+    color: #433426;
     background: #FDFAF4; border: 2px solid #433426; border-radius: 7px;
     padding: 0;
 }
@@ -114,15 +120,111 @@ class _Waveform(QWidget):
                              QColor(GREEN_INK if index % 3 == 0 else "#789C74"))
 
 
+class _MessageDocument(QTextDocument):
+    def loadResource(self, resource_type, url):
+        # A response may mention an image URL or file. Chat never opens it.
+        return None
+
+
+class _MessageBody(QLabel):
+    def __init__(self, value, *, markdown):
+        super().__init__(value)
+        self.setObjectName("refine-chat-message-text")
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(True)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.document = _MessageDocument(self)
+        self.document.setDocumentMargin(0)
+        self.document.setDefaultFont(_font(12))
+        options = self.document.defaultTextOption()
+        options.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.document.setDefaultTextOption(options)
+        if markdown:
+            self.document.setMarkdown(value, QTextDocument.MarkdownFeature.MarkdownDialectGitHub
+                                      | QTextDocument.MarkdownFeature.MarkdownNoHTML)
+        else:
+            self.document.setPlainText(value)
+
+    def heightForWidth(self, width):
+        self.document.setTextWidth(max(1, width))
+        return ceil(self.document.size().height())
+
+    def paintEvent(self, event):
+        self.document.setTextWidth(max(1, self.width()))
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette.setColor(QPalette.ColorRole.Text, QColor("#302821"))
+        painter = QPainter(self)
+        self.document.documentLayout().draw(painter, context)
+
+
+class _MessageCard(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("refine-chat-message")
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.body = None
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.body is not None:
+            margins = self.layout().contentsMargins()
+            width = self.contentsRect().width() - margins.left() - margins.right()
+            height = self.body.heightForWidth(width)
+            if self.body.minimumHeight() != height:
+                self.body.setFixedHeight(height)
+
+
+class _HeightGrip(QWidget):
+    dragged = pyqtSignal(float)
+    finished = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("refine-chat-height-grip")
+        self.setAccessibleName("调整聊天面板高度")
+        self.setToolTip("拖动调整聊天面板高度")
+        self.setFixedHeight(14)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.origin = None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#9a8063") if self.underMouse() or self.origin is not None else QColor("#c8b7a1"))
+        painter.drawRoundedRect(self.width() // 2 - 17, 5, 34, 3, 1.5, 1.5)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.origin = event.globalPosition().y()
+            self.update()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.dragged.emit(event.globalPosition().y() - self.origin)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.origin is not None:
+            self.origin = None
+            self.update()
+            self.finished.emit()
+            event.accept()
+
+
 class RefineChat(QWidget):
-    """Displays two messages at most, counting an active composer as one."""
+    """Scrollable conversation with a fixed composer and a resizable panel."""
 
     toolbar_mode_changed = pyqtSignal(object)
     typing_requested = pyqtSignal()
     storage_error = pyqtSignal(str)
+    geometry_requested = pyqtSignal()
+    height_committed = pyqtSignal(int)
 
     def __init__(self, submit: Callable[[dict], str], snapshot: Callable[[], dict], parent=None, *,
-                 store=None, conversation=None, system2=None, configure_system2=None, proposal_card=None):
+                 store=None, conversation=None, system2=None, configure_system2=None, proposal_card=None,
+                 preferred_height=0):
         super().__init__(parent)
         self.setObjectName("refine-chat")
         font = self.font()
@@ -151,7 +253,11 @@ class RefineChat(QWidget):
         self.recovered_event = self._pending[0] if pending else None
         self._preferred = "voice" if self._voice_available else "typing"
         self._composition: str | None = None
-        self._history_end: int | None = None
+        self._preferred_height = preferred_height
+        self._resize_start = None
+        self._panel_above = False
+        self._resize_limit = 0
+        self._rendered_messages: list[Message] = []
         self._draft = draft
         self._follow_up = False
         self._voice_started = QElapsedTimer()
@@ -172,18 +278,91 @@ class RefineChat(QWidget):
         depth = QVBoxLayout(shadow)
         depth.setContentsMargins(0, 0, 0, 3)
         depth.addWidget(panel)
-        self._cards = QVBoxLayout(panel)
-        self._cards.setContentsMargins(11, 11, 11, 11)
-        self._cards.setSpacing(8)
+        self._panel_layout = QVBoxLayout(panel)
+        self._panel_layout.setContentsMargins(11, 7, 11, 7)
+        self._panel_layout.setSpacing(5)
+
+        history = QWidget()
+        self._history_layout = QVBoxLayout(history)
+        self._history_layout.setContentsMargins(0, 0, 3, 0)
+        self._history_layout.setSpacing(6)
+        self._history_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._history_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
+        self._message_cards = QVBoxLayout()
+        self._message_cards.setSpacing(6)
+        self._history_layout.addLayout(self._message_cards)
+        self._extras = QVBoxLayout()
+        self._history_layout.addLayout(self._extras)
+        self._history = _scroll_area(history)
+        self._history.setStyleSheet(self._history.styleSheet() + """
+            QScrollBar:vertical { width: 9px }
+            QScrollBar::handle:vertical { margin: 0 1px }
+            QScrollBar::handle:vertical:hover { background: #9a8063 }
+        """)
+        self._history.setObjectName("refine-chat-history")
+        self._history.setAccessibleName("聊天记录")
+        self._history.setMinimumHeight(0)
+        self._history.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self._history.hide()
+        self._panel_layout.addWidget(self._history, 1)
+
+        self._cards = QVBoxLayout()
+        self._cards.setSpacing(5)
+        self._panel_layout.addLayout(self._cards)
+        self._grip = _HeightGrip()
+        self._grip.dragged.connect(self._resize_from_grip)
+        self._grip.finished.connect(self._commit_height)
+        self._panel_layout.addWidget(self._grip)
         if self._system2 is not None:
             self.refresh_projection(self._store.projection_version())
 
     def sizeHint(self) -> QSize:
-        # Measuring wrapped labels at the panel width avoids Qt's default
-        # narrower text size hint adding empty lines to short messages.
-        layout = self.layout()
-        height = layout.totalHeightForWidth(PANEL_WIDTH) if layout.hasHeightForWidth() else layout.sizeHint().height()
-        return QSize(PANEL_WIDTH, height)
+        history = self._history_layout
+        chat_width = PANEL_WIDTH - 31
+        natural_height = max(history.sizeHint().height(), history.totalHeightForWidth(chat_width))
+        chrome = self.layout().sizeHint().height()
+        height = self._preferred_height or min(DEFAULT_MAX_HEIGHT, chrome + max(0, natural_height))
+        return QSize(PANEL_WIDTH, max(height, self._minimum_panel_height()))
+
+    def _minimum_panel_height(self):
+        return max(self.minimumSizeHint().height() + 32, MIN_HEIGHT)
+
+    def panel_geometry(self, *, below, above, limit):
+        height = self.sizeHint().height()
+        if self._grip.origin is None:
+            use_above = height > below and above > below
+            if use_above != self._panel_above:
+                self._panel_above = use_above
+                self._panel_layout.removeWidget(self._grip)
+                index = 0 if use_above else self._panel_layout.count()
+                self._panel_layout.insertWidget(index, self._grip)
+        self._resize_limit = min(limit, max(1, above if self._panel_above else below))
+        return min(height, self._resize_limit), self._panel_above
+
+    def _resize_from_grip(self, delta):
+        if self._resize_start is None:
+            self._resize_start = self.height()
+        scrollbar = self._history.verticalScrollBar()
+        follow_tail = scrollbar.value() == scrollbar.maximum()
+        offset = -delta if self._panel_above else delta
+        self._preferred_height = min(self._resize_limit,
+                                     max(self._minimum_panel_height(), round(self._resize_start + offset)))
+        self.geometry_requested.emit()
+        if follow_tail:
+            self._to_latest()
+
+    def _commit_height(self):
+        if self._resize_start is not None:
+            self._resize_start = None
+            self.height_committed.emit(self._preferred_height)
+
+    def ensureWidgetVisible(self, widget):
+        if self._history.widget().isAncestorOf(widget):
+            self._history.ensureWidgetVisible(widget)
+
+    def _to_latest(self):
+        scrollbar = self._history.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def set_preference(self, mode: str):
         self._preferred = mode if self._voice_available else "typing"
@@ -194,11 +373,11 @@ class RefineChat(QWidget):
             self._render()
             return
         self._compose(self._other(self._preferred) if alternate and self._voice_available else self._preferred)
+        QTimer.singleShot(0, self._to_latest)
 
     def reset_input(self):
         self._voice_timer.stop()
         self._composition = None
-        self._history_end = None
         self._supersedes_message_id = self._proposal_context = None
         if self._store is None:
             self._draft = ""
@@ -214,7 +393,6 @@ class RefineChat(QWidget):
 
     def _compose(self, mode: str):
         self._composition = mode
-        self._history_end = None
         if mode == "voice":
             self._voice_started.start()
             self._voice_timer.start()
@@ -271,7 +449,7 @@ class RefineChat(QWidget):
                 self.storage_error.emit("暂时无法保存对话。")
                 return
         self._messages.append(Message(speaker, value))
-        self._composition = self._history_end = None
+        self._composition = None
         self._voice_timer.stop()
         self._draft = ""
         self._follow_up = False
@@ -295,8 +473,8 @@ class RefineChat(QWidget):
             return
         self._draft = ""
         self._supersedes_message_id = self._proposal_context = None
-        self._history_end = None
         self.refresh_projection(self._store.projection_version())
+        QTimer.singleShot(0, self._to_latest)
         self._request_typing_focus()
 
     def refresh_projection(self, version):
@@ -364,23 +542,6 @@ class RefineChat(QWidget):
             self._finish_turn("未能更新。请查看最新状态后重试。", True)
         self._render()
 
-    def _history_count(self) -> int:
-        return len(self._messages) + (self._composition is not None or self._pending is not None)
-
-    def _older(self):
-        end = self._history_end if self._history_end is not None else self._history_count()
-        self._history_end = max(2, end - 1)
-        self._render()
-
-    def _newer(self, latest=False):
-        if latest or self._history_end + 1 >= self._history_count():
-            self._history_end = None
-        else:
-            self._history_end += 1
-        self._render()
-        if self._history_end is None:
-            self._request_typing_focus()
-
     @staticmethod
     def _label(text: str, *, sender=False, speaker=None) -> QLabel:
         label = QLabel(text)
@@ -396,8 +557,7 @@ class RefineChat(QWidget):
 
     def _message_card(self, message: Message) -> QFrame:
         mochi = message.speaker == "Mochi"
-        card = QFrame()
-        card.setObjectName("refine-chat-message")
+        card = _MessageCard()
         if mochi:
             card.setProperty("speaker", "mochi")
         layout = QVBoxLayout(card)
@@ -409,7 +569,8 @@ class RefineChat(QWidget):
             reply = self._label(f"回复「{quotation}」", sender=True)
             reply.setProperty("replyToMessageId", message.reply_to)
             layout.addWidget(reply)
-        layout.addWidget(self._label(message.text))
+        card.body = _MessageBody(message.text, markdown=mochi)
+        layout.addWidget(card.body)
         if message.pending:
             status = QHBoxLayout()
             status.addWidget(self._label("等待回复", sender=True), 1)
@@ -496,47 +657,54 @@ class RefineChat(QWidget):
             except sqlite3.Error:
                 self.storage_error.emit("暂时无法保存草稿。")
 
-    def _render(self):
-        self._editor = self._elapsed = self._waveform = None
-        while self._cards.count():
-            item = self._cards.takeAt(0).widget()
-            item.hide()
-            item.setParent(None)
-            if item is not self._proposal_card:
-                item.deleteLater()
+    def _clear_widgets(self, layout):
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            widget.hide()
+            if widget is not self._proposal_card:
+                widget.setParent(None)
+                widget.deleteLater()
 
+    def _render_messages(self):
+        for index, message in enumerate(self._messages):
+            if index < len(self._rendered_messages):
+                if self._rendered_messages[index] == message:
+                    continue
+                previous = self._message_cards.takeAt(index).widget()
+                previous.hide()
+                previous.setParent(None)
+                previous.deleteLater()
+            self._message_cards.insertWidget(index, self._message_card(message))
+        while self._message_cards.count() > len(self._messages):
+            widget = self._message_cards.takeAt(self._message_cards.count() - 1).widget()
+            widget.hide()
+            widget.setParent(None)
+            widget.deleteLater()
+        self._rendered_messages = self._messages.copy()
+
+    def _render(self):
+        scrollbar = self._history.verticalScrollBar()
+        follow_tail = scrollbar.value() == scrollbar.maximum()
+        self._editor = self._elapsed = self._waveform = None
+        self._clear_widgets(self._extras)
+        self._clear_widgets(self._cards)
+        self._render_messages()
         if self._proposal_card is not None and self._proposal_card.has_proposals:
-            self._cards.addWidget(self._proposal_card)
+            self._extras.addWidget(self._proposal_card)
             self._proposal_card.show()
         if self._configure_system2 and self._route_status in {"not_configured", "unverified"}:
             configure = QPushButton("配置对话模型" if self._route_status == "not_configured" else "验证对话模型")
             configure.setObjectName("refine-chat-configure-system2")
             configure.clicked.connect(self._configure_system2)
-            self._cards.addWidget(configure)
+            self._extras.addWidget(configure)
+        if self._pending is not None:
+            self._extras.addWidget(self._message_card(Message("Mochi", "正在更新…")))
+        self._history.setVisible(bool(self._messages or self._extras.count()))
 
-        browsing = self._history_end is not None
-        virtual = self._composition is not None or self._pending is not None
-        end = self._history_end if browsing else len(self._messages)
-        start = max(0, end - (1 if virtual and not browsing else 2))
-        if start:
-            up = _GestureButton("up", "查看更早消息", width=29, height=22)
-            up.setObjectName("refine-chat-history-up")
-            up.tapped.connect(self._older)
-            self._cards.addWidget(up, 0, Qt.AlignmentFlag.AlignHCenter)
-        for msg in self._messages[start:end]:
-            self._cards.addWidget(self._message_card(msg))
         self.toolbar_mode_changed.emit(self._composition if not self._messages else None)
-        if not browsing and self._composition is not None:
+        if self._composition is not None:
             self._cards.addWidget(self._composer())
-        elif not browsing and self._pending is not None:
-            self._cards.addWidget(self._message_card(Message("Mochi", "正在更新…")))
-        elif browsing:
-            down = _GestureButton("down", "查看较新消息，长按回到最新", hold=True, width=34)
-            down.setObjectName("refine-chat-history-down")
-            down.tapped.connect(self._newer)
-            down.held.connect(lambda: self._newer(latest=True))
-            self._cards.addWidget(down, 0, Qt.AlignmentFlag.AlignHCenter)
-        elif self._follow_up:
+        elif self._pending is None and self._follow_up:
             mode = "keyboard" if self._preferred == "typing" else "mic"
             button = _GestureButton(mode, "继续输入", accent=True, hold=self._voice_available, width=34)
             button.setObjectName("refine-chat-continue")
@@ -544,6 +712,8 @@ class RefineChat(QWidget):
             button.held.connect(lambda: self._compose(self._other(self._preferred)))
             self._cards.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         self.updateGeometry()
+        if follow_tail:
+            QTimer.singleShot(0, self._to_latest)
 
     def refresh_proposals(self):
         self._render()

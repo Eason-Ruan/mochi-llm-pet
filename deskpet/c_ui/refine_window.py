@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 
 from .desktop import DesktopPet
 from .refine_icons import icon as icon
+from .refine_chat import RefineChat
 
 
 CREAM = "#fff7e9"
@@ -171,23 +172,6 @@ class _PixelFade(QGraphicsEffect):
 class _Toolbar(QWidget):
     def paintEvent(self, event):
         _surface(self, 13)
-
-
-class RefineScroll(QScrollArea):
-    """Keep editable panels within the desktop without clipping their controls."""
-
-    def __init__(self, panel):
-        super().__init__()
-        self.setObjectName("refine-scroll")
-        self.setWidgetResizable(True)
-        self.setWidget(panel)
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet("QScrollArea#refine-scroll {background: transparent; border: 0}")
-        self.viewport().setAutoFillBackground(False)
-        panel.setAutoFillBackground(False)
-
-    def sizeHint(self):
-        return QSize(WIDTH, min(430, self.widget().sizeHint().height() + 4))
 
 
 class _Bubble(QFrame):
@@ -714,18 +698,23 @@ class RefinePet(DesktopPet):
         if self._panel is not None:
             fixed_height = 2 * MARGIN + bubble_height + CAT_HEIGHT + GAP + toolbar_height + GAP
             max_panel_height = max(1, available.height() - fixed_height) if available is not None else None
-            limiter = getattr(self._panel, "set_height_limit", None)
-            if limiter is not None and max_panel_height is not None:
-                limiter(max_panel_height)
-            panel_height = max(self._panel.minimumHeight(), self._panel.sizeHint().height(), 1)
-            if self._panel.hasHeightForWidth():
-                panel_height = max(panel_height, self._panel.heightForWidth(WIDTH))
-            if max_panel_height is not None and isinstance(self._panel, QScrollArea):
-                panel_height = min(panel_height, max_panel_height)
-            below = CAT_HEIGHT + GAP + toolbar_height + GAP + panel_height + MARGIN
-            above = MARGIN + panel_height + GAP + bubble_height
-            panel_above = bool(available is not None and anchor.y() + below > available.bottom() + 1
-                               and anchor.y() - above >= available.top())
+            if isinstance(self._panel, RefineChat) and available is not None:
+                below = available.bottom() + 1 - anchor.y() - CAT_HEIGHT - toolbar_height - 2 * GAP - MARGIN
+                above = anchor.y() - available.top() - MARGIN - GAP - bubble_height
+                panel_height, panel_above = self._panel.panel_geometry(
+                    below=below, above=above, limit=max_panel_height,
+                )
+            else:
+                limiter = getattr(self._panel, "set_height_limit", None)
+                if limiter is not None and max_panel_height is not None:
+                    limiter(max_panel_height)
+                panel_height = max(self._panel.minimumHeight(), self._panel.sizeHint().height(), 1)
+                if self._panel.hasHeightForWidth():
+                    panel_height = max(panel_height, self._panel.heightForWidth(WIDTH))
+                below = CAT_HEIGHT + GAP + toolbar_height + GAP + panel_height + MARGIN
+                above = MARGIN + panel_height + GAP + bubble_height
+                panel_above = bool(available is not None and anchor.y() + below > available.bottom() + 1
+                                   and anchor.y() - above >= available.top())
             if panel_above:
                 self._panel.setGeometry(MARGIN, y, WIDTH, panel_height)
                 regions += QRegion(self._panel.geometry())
