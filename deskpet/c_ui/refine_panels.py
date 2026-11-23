@@ -39,7 +39,7 @@ def active_reminders(snapshot: dict) -> list[dict]:
     return sorted(
         (task for task in snapshot.get("tasks", ()) if task["status"] == "registered"
          and task["draft"].get("reminder_enabled", True)
-         and not (task.get("acknowledged_at") or task.get("expired_at"))),
+         and not (task.get("acknowledged_at") or task.get("expired_at") or task.get("archived_at"))),
         key=lambda task: (
             task["draft"].get("remind_after") or task["draft"].get("earliest_at") or "",
             task["draft"]["mode"] != "hard",
@@ -111,6 +111,21 @@ class _Panel(QWidget):
         self.body.setContentsMargins(13, 13, 13, 16)
         self.body.setSpacing(8)
 
+    def add_manage_action(self, label, callback):
+        button = QPushButton(label)
+        button.setObjectName("refine-manage")
+        button.setFont(_font(11, bold=True))
+        button.setFixedHeight(22)
+        button.setStyleSheet(
+            f"QPushButton {{color: {GREEN}; background: {PAPER}; border: 1px solid {CARD_OUTLINE};"
+            "border-radius: 5px; padding: 0 6px}"
+            f"QPushButton:hover, QPushButton:focus {{background: {GREEN_TINT}}}"
+        )
+        button.clicked.connect(callback)
+        row = self.body.itemAt(0).layout()
+        row.insertWidget(1, button)
+        return button
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -132,9 +147,10 @@ def _card(*, spacing: int):
     return frame, layout
 
 
-def _schedule(draft, reference):
-    start = local_time(draft["earliest_at"])
-    today = reference.date() if reference is not None else None
+def _schedule(draft, reference, zone=None):
+    start_value = draft.get("remind_after") or draft.get("earliest_at")
+    end_value = draft.get("remind_by") or draft.get("latest_first_delivery_at")
+    today = local_time(reference, zone=zone).date() if reference is not None else None
 
     def day_and_clock(when):
         delta = (when.date() - today).days if today is not None else None
@@ -146,9 +162,15 @@ def _schedule(draft, reference):
     def clock(when):
         return when.strftime("%H:%M:%S" if when.second else "%H:%M")
 
-    if draft["mode"] == "hard":
-        return f"{day_and_clock(start)} · 到点提醒"
-    end = local_time(draft["latest_first_delivery_at"])
+    if draft["mode"] == "hard" and end_value:
+        return f"{day_and_clock(local_time(end_value, zone=zone))} · 到点提醒"
+    if not (start_value and end_value):
+        for key, label in (("target_at", "目标"), ("remind_after", "最早"), ("remind_by", "最迟")):
+            if draft.get(key):
+                return f"{label} {day_and_clock(local_time(draft[key], zone=zone))} · 柔性提醒"
+        return "择机提醒"
+    start = local_time(start_value, zone=zone)
+    end = local_time(end_value, zone=zone)
     finish = clock(end) if end.date() == start.date() else day_and_clock(end)
     return f"{day_and_clock(start)}–{finish} · 柔性提醒"
 
@@ -182,8 +204,9 @@ def _scroll_area(widget: QWidget) -> QScrollArea:
 class RefineReminders(_Panel):
     """List every registered reminder, including delivered reminders awaiting action."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, timezone=None):
         super().__init__(parent)
+        self.timezone = timezone
         self.setObjectName("refine-reminders")
         self.count = _badge("0 项")
         self.count.setObjectName("refine-reminder-count")
@@ -203,12 +226,12 @@ class RefineReminders(_Panel):
         self._rows = ()
 
     def render_snapshot(self, snapshot: dict):
-        reference = local_time(snapshot["now"]) if snapshot.get("now") else None
+        reference = snapshot.get("now")
         rows = tuple(
             (
                 task["task_id"],
                 task["draft"]["content"],
-                _schedule(task["draft"], reference),
+                _schedule(task["draft"], reference, task["draft"].get("timezone") or self.timezone),
                 bool(task.get("displayed_at")),
             )
             for task in active_reminders(snapshot)
@@ -319,6 +342,10 @@ class RefineWork(_Panel):
 
     def render_snapshot(self, snapshot: dict):
         view = current_work(snapshot)
+        phase = snapshot.get("active_phase")
+        if phase and phase["kind"] != "focus":
+            view = dict(state=phase["state"], goal=phase["title"], remaining_s=phase["remaining_s"],
+                        duration_s=phase["planned_duration_s"], task_id=phase.get("primary_issue_id"))
         self.summary.setVisible(view is not None)
         self.empty.setVisible(view is None)
         if view is None:
@@ -342,7 +369,7 @@ class RefineWork(_Panel):
             return
         self._last_detail = detail
         state, goal, duration, task, outcomes, next_steps = detail
-        self.status.setText(STATES[state])
+        self.status.setText({"running": "休息中", "elapsed": "休息结束", "ready": "待开始"}.get(state) or STATES[state])
         _style_badge(self.status, state == "focusing")
         self.goal.setText(goal)
         _size_wrapped_label(self.goal, 19, PANEL_WIDTH - 26)
@@ -363,7 +390,7 @@ class RefineSettings(_Panel):
 
     input_mode_changed = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, voice_available=True):
         super().__init__(parent)
         self.setObjectName("refine-settings")
         self.body.addLayout(_title("设置"))
@@ -371,9 +398,9 @@ class RefineSettings(_Panel):
         pomodoro, pomodoro_stack = _card(spacing=0)
         policy = QHBoxLayout()
         policy.addWidget(_text("自动番茄钟", bold=True), 1)
-        policy_badge = _badge("开始前询问")
-        policy_badge.setFixedHeight(23)
-        policy.addWidget(policy_badge)
+        self.policy_badge = _badge("开始前询问")
+        self.policy_badge.setFixedHeight(23)
+        policy.addWidget(self.policy_badge)
         pomodoro_stack.addLayout(policy)
         self.body.addWidget(pomodoro)
 
@@ -404,9 +431,12 @@ class RefineSettings(_Panel):
             self._modes[mode] = button
         choices.addStretch()
         preference_stack.addLayout(choices)
-        preference_stack.addWidget(_text("输入中长按方式图标，只切换本次输入。", size=11, color=MUTED, height=13))
+        hint = "输入中长按方式图标，只切换本次输入。" if voice_available else "当前版本支持文字输入。"
+        preference_stack.addWidget(_text(hint, size=11, color=MUTED, height=13))
         self.body.addWidget(preference)
-        self.set_input_mode("voice")
+        if not voice_available:
+            self._modes["voice"].setEnabled(False)
+        self.set_input_mode("voice" if voice_available else "typing")
 
     def set_input_mode(self, mode: str):
         button = self._modes.get(mode, self._modes["voice"])

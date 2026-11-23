@@ -338,6 +338,7 @@ class RefineDeliveryMixin:
             self._show_section("reminders")
             panel = getattr(self, "reminder_panel", self.reminders)
             if item.siblings:
+                self._panel_details("reminders", True)
                 panel.open_delivery_group({command.task_id for command in item.commands()})
                 scroll = self.panels["reminders"]
                 QTimer.singleShot(0, lambda: scroll.ensureWidgetVisible(panel.tasks) if self.section == "reminders" else None)

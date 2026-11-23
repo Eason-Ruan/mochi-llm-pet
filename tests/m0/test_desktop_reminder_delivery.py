@@ -41,6 +41,10 @@ try:
     wait(lambda: session.context and window.ready_for_actions and "settings" in session.snapshot)
     session.pet._open_toolbar()
     session.open_section("reminders")
+    from PyQt6.QtWidgets import QPushButton
+    wait(session.overviews["reminders"].isVisible)
+    session.overviews["reminders"].findChild(QPushButton, "refine-manage").click()
+    wait(session.detail_panels["reminders"].isVisible)
     base = datetime.now(timezone.utc)
     due = (base + timedelta(hours=4)).isoformat()
     target = (base + timedelta(minutes=30)).isoformat()

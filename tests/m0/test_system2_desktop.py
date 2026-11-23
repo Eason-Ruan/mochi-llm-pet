@@ -137,6 +137,9 @@ def exercise_desktop():
             if session.section != key:
                 click(session.pet.buttons[key])
             wait_for(session.panels[key].isVisible, key)
+            if key in session.overviews and session.panels[key] is session.overviews[key]:
+                click(find("refine-manage"))
+                wait_for(session.detail_panels[key].isVisible, "editor " + key)
 
         def active():
             return session.snapshot.get("active_phase")

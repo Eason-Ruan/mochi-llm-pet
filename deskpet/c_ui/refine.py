@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from PyQt6.QtCore import QLockFile, QPoint, QSettings, QStandardPaths, QTimer
 from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
@@ -137,6 +137,25 @@ class RefineSession(RefineDeliveryMixin):
             "input": RefineScroll(self.chat) if self.production else self.chat,
         }
 
+        if self.production:
+            self.detail_panels = self.panels.copy()
+            self.overviews = {
+                "reminders": RefineReminders(timezone=user_timezone),
+                "work": RefineWork(),
+                "settings": RefineSettings(voice_available=False),
+            }
+            for key, label in (("reminders", "管理提醒"), ("work", "管理计时"), ("settings", "更多设置")):
+                self.overviews[key].add_manage_action(label, lambda checked=False, name=key: self._panel_details(name, True))
+                back = QPushButton("返回摘要")
+                back.setObjectName("refine-back-to-summary")
+                back.clicked.connect(lambda checked=False, name=key: self._panel_details(name, False))
+                editor = {"work": self.work, "reminders": self.reminders, "settings": self.settings_panel}[key]
+                if key == "settings":
+                    editor.body.itemAt(0).layout().addWidget(back)
+                else:
+                    editor.layout().insertWidget(0, back)
+            self.panels.update(self.overviews)
+
         options = copy.copy(args)
         if self.production:
             from deskpet.observation_v2.desktop import DesktopObserver
@@ -209,8 +228,14 @@ class RefineSession(RefineDeliveryMixin):
         self.chat_store.queue_turn(message_id, text, context)
         self.window.action.emit({"kind": "system2_message", "event_id": message_id})
 
+    def _panel_details(self, key, show):
+        self.panels[key] = self.detail_panels[key] if show else self.overviews[key]
+        if self.section == key:
+            self.pet.set_section(key, self.panels[key])
+
     def _open_model_settings(self):
         self._show_section("settings")
+        self._panel_details("settings", True)
         self.settings_panel.show_system2_route()
 
     def _resolve_proposal(self, proposal, answer, amendments):
@@ -333,6 +358,9 @@ class RefineSession(RefineDeliveryMixin):
         self.snapshot = snapshot
         notes = self._render_reminder_delivery(snapshot)
         if self.production:
+            self.overviews["reminders"].render_snapshot(snapshot)
+            self.overviews["work"].render_snapshot(snapshot)
+            self.overviews["settings"].policy_badge.setText("开始前询问" if snapshot["settings"]["auto_adjust"] else "已关闭")
             self.reminders.render_snapshot({**snapshot, "presentation_pending": notes})
         else:
             self.reminders.render_snapshot(snapshot)
@@ -468,13 +496,17 @@ class RefineSession(RefineDeliveryMixin):
             self.chat.reset_input()
         previous = self.section
         self.section = key
+        if self.production and key in self.overviews:
+            self.panels[key] = self.overviews[key]
         if key == "input":
             self._chat_selected_ref = None
-            if self.production and previous == "reminders" and (item := self.reminders.selected()):
+            if (self.production and previous == "reminders" and self.panels[previous] is self.detail_panels[previous]
+                    and (item := self.reminders.selected())):
                 self._chat_selected_ref = {"kind": "item", "id": item["task_id"]}
             if self.production and previous == "work" and (phase := self.snapshot.get("active_phase")):
                 self._chat_selected_ref = {"kind": "phase", "id": phase["id"]}
-            if self.production and previous == "settings" and (habit := self.settings_panel.selected_habit_id()):
+            if (self.production and previous == "settings" and self.panels[previous] is self.detail_panels[previous]
+                    and (habit := self.settings_panel.selected_habit_id())):
                 self._chat_selected_ref = {"kind": "habit", "id": habit}
             self.chat.open(self.input_mode, alternate=alternate)
         self.pet.set_section(key, self.panels.get(key))

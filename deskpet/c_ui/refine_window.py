@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPen, QRegion
 from PyQt6.QtWidgets import (
-    QFrame, QGraphicsEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu,
+    QFrame, QGroupBox, QGraphicsEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu,
     QPushButton, QScrollArea,
     QVBoxLayout, QWidget,
 )
@@ -184,7 +184,14 @@ class RefineScroll(QScrollArea):
         self.setStyleSheet(
             f"QScrollArea#refine-scroll {{background: {CREAM}; border: 2px solid {INK}; border-radius: 10px}}"
         )
-        panel.setStyleSheet(f"QGroupBox {{background: {CREAM}; color: {TEXT}}}")
+        if not isinstance(panel, QGroupBox):
+            self.setFrameShape(QFrame.Shape.NoFrame)
+            self.setStyleSheet("QScrollArea#refine-scroll {background: transparent; border: 0}")
+            self.viewport().setAutoFillBackground(False)
+            panel.setAutoFillBackground(False)
+        else:
+            from .settings import _CONTROL_STYLE
+            panel.setStyleSheet(_CONTROL_STYLE + f"QGroupBox {{background: {CREAM}; color: {TEXT}}}")
 
     def sizeHint(self):
         return QSize(WIDTH, min(430, self.widget().sizeHint().height() + 4))
@@ -416,7 +423,7 @@ class RefinePet(DesktopPet):
         screen = self.screen()
         if self._home_anchor is None or QGuiApplication.screenAt(self._home_anchor) is None:
             area = screen.availableGeometry() if screen is not None else self.geometry()
-            bottom_margin = 245 if self._diagnostics else 32
+            bottom_margin = 245
             self._home_anchor = QPoint(
                 max(area.left() + MARGIN, area.right() - WIDTH - MARGIN - 24),
                 max(area.top() + MARGIN, area.bottom() - CAT_HEIGHT - GAP - self.toolbar.height() - bottom_margin),

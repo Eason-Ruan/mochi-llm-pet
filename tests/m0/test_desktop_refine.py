@@ -42,6 +42,11 @@ def wait_for(predicate, description):
 def section(name):
     QTest.mouseClick(session.pet.buttons[name], left)
     wait_for(lambda: session.section == name and session.panels[name].isVisible(), name)
+    if name in session.overviews:
+        overview = session.overviews[name]
+        assert session.pet._panel is overview and overview.width() == 292
+        QTest.mouseClick(overview.findChild(QPushButton, "refine-manage"), left)
+        wait_for(session.detail_panels[name].isVisible, "open editor")
 
 
 def active():
