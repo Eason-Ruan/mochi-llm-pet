@@ -28,6 +28,7 @@ OFFICIAL_BASE_URL = "https://api.openai.com/v1"
 _BAILIAN_PATH = "/compatible-mode/v1"
 BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com" + _BAILIAN_PATH
 BAILIAN_MODEL = "qwen4-max"
+BAILIAN_OBSERVATION_MODEL = "qwen3.7-flash"
 _BAILIAN_HOSTS = {
     "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com",
     "dashscope-us.aliyuncs.com", "cn-hongkong.dashscope.aliyuncs.com",
@@ -71,6 +72,12 @@ def _normalize_base_url(value: str) -> str:
     return str(url.copy_with(path=url.path.rstrip("/"))).rstrip("/")
 
 
+def is_bailian_endpoint(base_url: str) -> bool:
+    url = httpx.URL(base_url)
+    return bool(url.scheme == "https" and url.port is None and url.path == _BAILIAN_PATH
+                and (url.host in _BAILIAN_HOSTS or _BAILIAN_WORKSPACE_HOST.fullmatch(url.host)))
+
+
 @dataclass(frozen=True, slots=True)
 class CloudRoute:
     provider_kind: Literal["openai", "openai_compatible", "local_ollama", "bailian"]
@@ -97,9 +104,7 @@ class CloudRoute:
         if self.credential_ref is None and self.provider_kind == "openai":
             raise ValueError("The OpenAI route requires a local credential reference")
         if self.provider_kind == BAILIAN:
-            url = httpx.URL(self.base_url)
-            if (url.scheme != "https" or url.port is not None or url.path != _BAILIAN_PATH
-                    or (url.host not in _BAILIAN_HOSTS and not _BAILIAN_WORKSPACE_HOST.fullmatch(url.host))):
+            if not is_bailian_endpoint(self.base_url):
                 raise ValueError("Use an official Alibaba Cloud Model Studio HTTPS Chat Completions base URL")
             if self.model != BAILIAN_MODEL or self.credential_ref is None:
                 raise ValueError("The Alibaba Cloud Model Studio route requires qwen4-max and a local credential reference")

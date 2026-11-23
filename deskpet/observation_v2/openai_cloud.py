@@ -21,7 +21,8 @@ import httpx
 
 from .ollama import OllamaClient
 from .routes import (
-    STATE, VISION, CloudRoute, CloudRouteError, CloudRouteSnapshot, ObservationCloudSettings, Role,
+    BAILIAN_OBSERVATION_MODEL, STATE, VISION, CloudRoute, CloudRouteError, CloudRouteSnapshot,
+    ObservationCloudSettings, Role, is_bailian_endpoint,
 )
 from .vision import ScreenModel, cloud_screen_text
 
@@ -267,6 +268,8 @@ def _request(
             }},
         ]
     options = {"store": False} if route.provider_kind == "openai" else {}
+    if route.model == BAILIAN_OBSERVATION_MODEL and is_bailian_endpoint(route.base_url):
+        options.update(extra_body={"enable_thinking": False}, max_completion_tokens=512)
     with httpx.Client(
         transport=transport,
         timeout=httpx.Timeout(timeout, write=min(timeout, 2.0)), trust_env=False, follow_redirects=False,
