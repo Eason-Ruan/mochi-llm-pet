@@ -1,0 +1,4 @@
+{
+  "task_service": "deskpet.task_service:isolated_factory",
+  "metrics": "d_metrics:factory"
+}

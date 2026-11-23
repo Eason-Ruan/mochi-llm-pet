@@ -58,6 +58,54 @@ def test_qt_queued_workflow_uses_paint_receipts(tmp_path):
     assert (tmp_path / "observation.png").stat().st_size > 1000
 
 
+def test_queued_display_receipt_does_not_predate_request(tmp_path):
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONPATH=str(ROOT))
+    code = r'''
+from datetime import datetime, timedelta, timezone
+from PyQt6.QtWidgets import QApplication
+from deskpet.contracts import DisplayCommand
+from deskpet.m0.gui import Workbench
+app = QApplication([])
+now = datetime.now(timezone.utc)
+class Surface:
+    _finishing = False
+    latest = {"clock": "virtual", "now": now.isoformat()}
+    receipts = {}
+    class Action:
+        def emit(self, value): pass
+    action = Action()
+surface = Surface()
+command = DisplayCommand(delivery_id="queued", task_id="t", task_version=2,
+    occurrence=1, content="queued paint", requested_at=now+timedelta(seconds=10),
+    expires_at=now+timedelta(seconds=40), reason="hard_due")
+Workbench._receipt(surface, command, outcome="failed")
+assert surface.receipts["queued"].rendered_at == command.requested_at
+surface.latest["now"] = (now+timedelta(seconds=12)).isoformat()
+Workbench._receipt(surface, command, outcome="failed")
+assert surface.receipts["queued"].rendered_at == now+timedelta(seconds=12)
+'''
+    process = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                             capture_output=True, text=True, timeout=15)
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
+def test_create_after_restore_preserves_existing_task_ids():
+    from types import SimpleNamespace
+    from deskpet.m0.gui import Workbench
+
+    actions = []
+    restored = SimpleNamespace(
+        _next_task=1, views={"gui-1": {"status": "completed"}, "gui-2": {"status": "registered"}},
+        _draft_payload=lambda: {"content": "new reminder"},
+        _ui=lambda *args, **kwargs: actions.append((args, kwargs)),
+    )
+    Workbench._create(restored)
+    assert actions[0][1]["task_id"] == "gui-3"
+    assert actions[0][1]["version"] == 0
+    assert restored._select_task == "gui-3"
+    assert restored._next_task == 4
+
+
 def test_live_profile_cannot_silently_fall_back_to_offscreen(tmp_path):
     process = _gui(tmp_path, "live-smoke")
     assert process.returncode == 2, process.stdout + process.stderr
