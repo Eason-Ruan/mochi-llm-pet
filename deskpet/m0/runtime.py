@@ -7,13 +7,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from deskpet.contracts import (
     ErrorCode, ProposedPlan, SessionCommand, ToolCall, ToolResult,
 )
+
+
+if TYPE_CHECKING:
+    from deskpet.observation_v2.context import ObservationContext, ObservationContextReader
 
 
 class _Args(BaseModel):
@@ -63,13 +67,15 @@ class _PlanArgs(_Args):
 
 
 class ToolRuntime:
-    def __init__(self, tasks, sessions, clock, emit, *, max_steps=4, max_replans=1):
+    def __init__(self, tasks, sessions, clock, emit, *, max_steps=4, max_replans=1,
+                 observation_context_reader: ObservationContextReader | None = None):
         if not 1 <= max_steps <= 4 or not 0 <= max_replans <= 1:
             raise ValueError("M0 supports 1..4 steps and at most one replan")
         self.tasks = tasks
         self.sessions = sessions
         self.clock = clock
         self.emit = emit
+        self.observation_context_reader = observation_context_reader
         self.max_steps = max_steps
         self.max_replans = max_replans
         self.faults: dict[str, str] = {}
@@ -84,11 +90,15 @@ class ToolRuntime:
             "execute_plan": _PlanArgs,
         }
 
-    def execute(self, call: ToolCall) -> ToolResult:
+    def execute(self, call: ToolCall, *, observation_context: ObservationContext | None = None) -> ToolResult:
         self._emit("tool.requested", call)
         error = self.tasks.validate(call.envelope)
         if error:
             return self._finish(call, self._result(call, "rejected", error))
+        if observation_context is not None and call.tool_name == "show_reminder":
+            task = self.tasks.get(call.envelope.task_id)
+            if task is not None and task.draft.mode == "soft" and not self._still_available(observation_context):
+                return self._finish(call, self._result(call, "rejected", ErrorCode.STALE_CONTEXT))
         if call.tool_name not in self.registry:
             return self._finish(call, self._result(call, "rejected", ErrorCode.UNKNOWN_TOOL))
         try:
@@ -129,7 +139,8 @@ class ToolRuntime:
                 self._cache[call.idempotency_key] = (fingerprint, result)
         return self._finish(call, result)
 
-    def execute_plan(self, plan: ProposedPlan) -> tuple[ToolResult, ...]:
+    def execute_plan(self, plan: ProposedPlan, *,
+                     observation_context: ObservationContext | None = None) -> tuple[ToolResult, ...]:
         """Execute a flat plan; nesting and over-budget plans have no effects."""
         error = self.tasks.accept_decision(plan)
         if error is not None and error != ErrorCode.DUPLICATE:
@@ -153,7 +164,7 @@ class ToolRuntime:
                 return (self._finish(call, self._result(call, "rejected", ErrorCode.INVALID_ARGUMENT)),)
         results = []
         for call in plan.calls:
-            result = self.execute(call)
+            result = self.execute(call, observation_context=observation_context)
             results.append(result)
             if result.status in ("pending", "rejected", "failed", "timeout") or result.error_code:
                 break
@@ -169,14 +180,19 @@ class ToolRuntime:
             current_task = self.tasks.get(task.task_id) or task
             round_envelope = envelope if round_index == 0 else envelope.model_copy(
                 update={"request_id": f"{envelope.request_id}:replan:{round_index}"})
-            plan = planner.plan(observation, current_task, round_envelope, tuple(all_results))
+            context = None
+            if self.observation_context_reader is None:
+                plan = planner.plan(observation, current_task, round_envelope, tuple(all_results))
+            else:
+                context = self.observation_context_reader.read_observation_context(self.clock.wall_now())
+                plan = planner.plan_with_context(context, current_task, round_envelope, tuple(all_results))
             if not plan.calls:
                 break
             if len(plan.calls) > remaining_steps:
                 all_results.append(ToolResult(call_id=envelope.request_id, status="rejected",
                                               error_code=ErrorCode.BUDGET_EXCEEDED))
                 break
-            results = self.execute_plan(plan)
+            results = self.execute_plan(plan, observation_context=context)
             all_results.extend(results)
             remaining_steps -= len(results)
             self.emit("runtime.feedback", task_id=task.task_id,
@@ -187,6 +203,16 @@ class ToolRuntime:
             if not any(r.status in ("failed", "timeout") for r in results):
                 break
         return tuple(all_results)
+
+    def _still_available(self, snapshot: ObservationContext) -> bool:
+        now = self.clock.wall_now()
+        expected = snapshot.current
+        if (snapshot.current_status != "fresh" or expected is None or expected.state != "available"
+                or expected.valid_until <= now or self.observation_context_reader is None):
+            return False
+        current, status = self.observation_context_reader.read_current(now)
+        return (status == "fresh" and current is not None and current.state == "available"
+                and current.context_revision == expected.context_revision)
 
     def _dispatch(self, call, args) -> ToolResult:
         if call.tool_name == "show_reminder":

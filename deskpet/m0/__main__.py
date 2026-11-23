@@ -105,6 +105,8 @@ def parser() -> argparse.ArgumentParser:
     replay.add_argument("--scenario", help="bundled name or a Scenario JSON path")
     replay.add_argument("--output", default="output/m0/replay")
     replay.add_argument("--adapters")
+    replay.add_argument("--observation-database",
+                        help="Observation v2 SQLite snapshot source on the scenario clock")
     observe = commands.add_parser("observe", help="independently inspect raw sampling, estimation and correction boundaries")
     observe.add_argument("--profile", choices=("scenario", "live-smoke"), default="scenario")
     observe.add_argument("--input", help="a complete RawSignals JSON fixture; bypasses the sampling-source factory")
@@ -136,7 +138,8 @@ def main(argv=None) -> int:
         elif args.command == "observe":
             result = observe_once(args)
         elif args.command == "replay":
-            result = run_suite(scenario=args.scenario, output=args.output, adapters=args.adapters)
+            result = run_suite(scenario=args.scenario, output=args.output, adapters=args.adapters,
+                               observation_database=args.observation_database)
         elif args.command == "gui":
             return resolve_gui(args.adapters)(args)
         elif args.command == "smoke":

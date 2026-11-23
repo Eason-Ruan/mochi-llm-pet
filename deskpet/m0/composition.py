@@ -9,11 +9,15 @@ import os
 from pathlib import Path
 import platform
 import subprocess
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from deskpet.contracts.models import SCHEMA_VERSION
+from deskpet.contracts.models import Observation, SCHEMA_VERSION, UserStateEstimate
 from deskpet.mocks.clock import FakeClock, RealClock
 from .trace import JsonlMetricsSink, TraceRecorder
+
+if TYPE_CHECKING:
+    from deskpet.observation_v2.context import ObservationContextReader
+
 
 ROOT = Path(__file__).resolve().parents[2]
 ADAPTER_KEYS = frozenset({"task_service", "work_sessions", "metrics", "gui", "ui_surface", "sampling_source", "state_estimator"})
@@ -144,10 +148,26 @@ class Environment:
     adapters: dict[str, str]
     sampling: Any
     estimator: Any
+    observation_context_reader: ObservationContextReader | None = None
 
     def refresh_observation(self):
         """Refresh TTL/override semantics without running due work or changing input order."""
-        observation = self.observations.read()
+        return self.observe_for_tasks(self.observations.read())
+
+    def observe_for_tasks(self, observation: Observation) -> Observation:
+        if self.observation_context_reader is not None:
+            now = self.clock.wall_now()
+            current, _ = self.observation_context_reader.read_current(now)
+            observation = Observation(
+                observed_at=current.observed_at if current else now,
+                context_revision=observation.context_revision,
+                source=observation.source,
+                estimate=UserStateEstimate(
+                    state=current.state if current else "unknown",
+                    valid_until=current.valid_until if current else None,
+                    source="model",
+                ),
+            )
         self.tasks.observe(observation)
         return observation
 
@@ -159,7 +179,7 @@ class Environment:
 
 def build_environment(*, profile="scenario", scenario_id="manual", output=None,
                       clock=None, delivery=None, adapters=None, sampling_source=None,
-                      state_estimator=None, external_sampling=False) -> Environment:
+                      state_estimator=None, external_sampling=False, observation_database=None) -> Environment:
     """Factory contracts: task(clock, delivery, emit), session(clock, emit), sink(path).
 
     Call from the service's owner thread. Native observations are supplied by the
@@ -190,10 +210,16 @@ def build_environment(*, profile="scenario", scenario_id="manual", output=None,
         profile=profile, clock=clock, adapters=adapters, sampling_source=sampling_source,
         state_estimator=state_estimator, external_sampling=external_sampling, trace=trace)
     observations = observation_env.observations
-    tasks.observe(observations.read())
-    runtime = ToolRuntime(tasks=tasks, sessions=sessions, clock=clock, emit=trace.emit)
-    return Environment(clock, trace, tasks, sessions, observations, runtime, delivery, profile, adapters,
-                       observation_env.sampling, observation_env.estimator)
+    context_reader = None
+    if observation_database is not None:
+        from deskpet.observation_v2.context import ObservationContextReader
+        context_reader = ObservationContextReader(observation_database)
+    runtime = ToolRuntime(tasks=tasks, sessions=sessions, clock=clock, emit=trace.emit,
+                          observation_context_reader=context_reader)
+    environment = Environment(clock, trace, tasks, sessions, observations, runtime, delivery, profile, adapters,
+                              observation_env.sampling, observation_env.estimator, context_reader)
+    environment.refresh_observation()
+    return environment
 
 
 def provenance() -> dict:
