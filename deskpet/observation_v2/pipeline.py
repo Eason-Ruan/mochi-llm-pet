@@ -120,6 +120,13 @@ class ObservationStore(ActivityStore):
                         valid_until_monotonic_s REAL
                     )
                 """)
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS realtime_observation_departure (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        serial INTEGER NOT NULL, through_cursor INTEGER NOT NULL,
+                        reason TEXT NOT NULL, boot_id TEXT, policy_generation INTEGER
+                    )
+                """)
                 if not any(row["name"] == "policy_generation" for row in
                            self.connection.execute("PRAGMA table_info(realtime_observation_head)")):
                     self.connection.execute("ALTER TABLE realtime_observation_head ADD COLUMN policy_generation INTEGER")
@@ -172,6 +179,17 @@ class ObservationStore(ActivityStore):
             UPDATE effective_observations SET invalidated_at = ? WHERE observation_id = ?
         """, (_timestamp(as_of), latest["observation_id"]))
 
+    def _record_live_departure(self, reason: str) -> None:
+        """Persist a positive departure with the current publication watermark."""
+        self.connection.execute("""
+            INSERT INTO realtime_observation_departure
+            SELECT 1, 1, coalesce(publication_cursor, 0), ?, boot_id, policy_generation
+            FROM realtime_observation_head WHERE singleton = 1
+            ON CONFLICT(singleton) DO UPDATE SET serial = serial + 1,
+                through_cursor = excluded.through_cursor, reason = excluded.reason,
+                boot_id = excluded.boot_id, policy_generation = excluded.policy_generation
+        """, (reason,))
+
     def _record_live_sample(self, as_of: datetime, monotonic_s: float) -> None:
         """Refresh the source clock evidence inside the Activity transaction."""
         self.connection.execute("""
@@ -222,6 +240,9 @@ class ObservationStore(ActivityStore):
                     SET publication_cursor = ?, published_monotonic_s = ?, valid_until_monotonic_s = ?
                     WHERE singleton = 1
                 """, (cursor.lastrowid, monotonic_s, deadline))
+                if (observation.state in {"working", "away"} and monotonic_s is not None
+                        and observation.observed_at <= published_at < observation.valid_until):
+                    self._record_live_departure(observation.state)
 
     def counts(self) -> dict:
         activities = self.connection.execute("SELECT count(*) FROM activities").fetchone()[0]
@@ -361,6 +382,8 @@ def run_live(
                 if active_round is not None:
                     active_round.changed = True
             store._record_live_sample(sample.observed_at, sample.monotonic_s)
+            if sample.screen_locked is True and (last_sample is None or last_sample.screen_locked is not True):
+                store._record_live_departure("locked")
             last_sample = sample
             if activity is not None:
                 metrics.append({

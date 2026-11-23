@@ -33,6 +33,41 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def task_table_exists(db):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone() is not None
+
+
+def read_task(db, task_id):
+    row = db.execute("SELECT view FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    return TaskView.model_validate_json(row[0]) if row else None
+
+
+def transition_issue_for_interval(db, task_id, *, opened, now):
+    """Advance issue state alongside the focus interval which caused it."""
+    if not task_id or not task_table_exists(db):
+        return
+    task = read_task(db, task_id)
+    if task is None or task.draft.item_type != "issue" or task.status != "registered":
+        return
+    status = task.effective_issue_status
+    if opened and status in {"created", "paused"}:
+        updated_status = "in_progress"
+    elif not opened and status == "in_progress":
+        updated_status = "paused"
+    else:
+        return
+    updated = task.model_copy(update={
+        "issue_status": updated_status, "version": task.version + 1, "updated_at": now,
+    })
+    db.execute("UPDATE tasks SET view=? WHERE task_id=?", (updated.model_dump_json(), task_id))
+    db.execute("UPDATE rechecks SET version=? WHERE task_id=? AND version=?",
+               (updated.version, task_id, task.version))
+    payload = {"task_id": task_id, "task_version": updated.version,
+               "payload": {"status": updated_status, "reason": "focus_interval"}}
+    db.execute("INSERT INTO events(recorded_at,kind,fields) VALUES (?,?,?)",
+               (now.isoformat(), "task.status_changed", _json(payload)))
+
+
 def claim_opportunity_in_transaction(db, claim_id, now, *, context_revision=None):
     """Claim the current available window within a caller-owned business write transaction."""
     if not claim_id or not db.in_transaction:
@@ -97,6 +132,7 @@ class SQLiteTaskService:
         self.enforce_opportunities = enforce_opportunities
         self.auto_opportunity = auto_opportunity
         self.on_terminal_issue = None
+        self.on_occurrence_invalidated = None
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._session = uuid.uuid4().hex
@@ -123,6 +159,13 @@ class SQLiteTaskService:
                     "CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, task_id TEXT NOT NULL, task_version INTEGER NOT NULL, delivery_id TEXT, not_before TEXT NOT NULL)",
                     "CREATE UNIQUE INDEX IF NOT EXISTS one_queued_show ON outbox(delivery_id) WHERE kind='show'",
                     "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL, kind TEXT NOT NULL, fields TEXT NOT NULL, emitted INTEGER NOT NULL DEFAULT 0)",
+                    """CREATE TABLE IF NOT EXISTS item_occurrence_history (
+                        task_id TEXT NOT NULL, ordinal INTEGER NOT NULL, prior_view TEXT NOT NULL,
+                        closed_as TEXT NOT NULL, PRIMARY KEY(task_id,ordinal)
+                    )""",
+                    """CREATE TABLE IF NOT EXISTS item_api_commands (
+                        id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL
+                    )""",
                     PRESENTATION_TABLE,
                 ):
                     self._db.execute(statement)
@@ -146,7 +189,8 @@ class SQLiteTaskService:
             self._db.execute("ROLLBACK")
             raise
 
-    def _load(self):
+    def _load(self, db=None):
+        db = self._db if db is None else db
         effects, events = _Effects(), []
         core = _Domain(self.clock, effects,
                                  lambda kind, **fields: events.append((kind, fields)),
@@ -156,13 +200,13 @@ class SQLiteTaskService:
         core.auto_opportunity = self.auto_opportunity
         core.restart_floor = self._opened_at if self._recovering else None
         core._tasks = {r["task_id"]: TaskView.model_validate_json(r["view"])
-                       for r in self._db.execute("SELECT * FROM tasks")}
+                       for r in db.execute("SELECT * FROM tasks")}
         core._commands = {r["command_id"]: (r["fingerprint"], CommandResult.model_validate_json(r["result"]))
-                          for r in self._db.execute("SELECT * FROM commands")}
-        core._decisions = {r["request_id"]: r["fingerprint"] for r in self._db.execute("SELECT * FROM decisions")}
+                          for r in db.execute("SELECT * FROM commands")}
+        core._decisions = {r["request_id"]: r["fingerprint"] for r in db.execute("SELECT * FROM decisions")}
         core._rechecks = {r["task_id"]: (r["version"], datetime.fromisoformat(r["run_at"]), r["request_id"])
-                          for r in self._db.execute("SELECT * FROM rechecks")}
-        metadata = dict(self._db.execute("SELECT key,value FROM metadata"))
+                          for r in db.execute("SELECT * FROM rechecks")}
+        metadata = dict(db.execute("SELECT key,value FROM metadata"))
         # A's observation pipeline starts a new revision sequence after boot.
         # Keep the prior observation for audit, but require this session's fresh
         # observe() before using it. This also avoids trusting old no-TTL evidence.
@@ -170,13 +214,13 @@ class SQLiteTaskService:
             core._observation = Observation.model_validate_json(metadata["observation"])
         core._last_deferred = {k: tuple(v) for k, v in json.loads(metadata.get("deferred", "{}")).items()}
         core._opportunity = json.loads(metadata.get("opportunity", "{}"))
-        core._focus_running = running_focus(self._db) if self.enforce_opportunities else False
-        core._external_owner = {(row['task_id'], row['occurrence']) for row in self._db.execute(
+        core._focus_running = running_focus(db) if self.enforce_opportunities else False
+        core._external_owner = {(row['task_id'], row['occurrence']) for row in db.execute(
             "SELECT task_id,occurrence FROM presentations WHERE channel='os_notification' "
             "AND state NOT IN ('cancelled','failed','released','unavailable')"
         )}
         now, mono = self.clock.wall_now(), self.clock.monotonic_now()
-        for row in self._db.execute("SELECT * FROM deliveries"):
+        for row in db.execute("SELECT * FROM deliveries"):
             # Raw monotonic values are meaningful only in this service session.
             last_mono = row["last_attempt_mono"] if row["owner"] == self._session else (
                 mono - max(0.0, (now - datetime.fromisoformat(row["last_attempt_at"])).total_seconds()))
@@ -192,8 +236,8 @@ class SQLiteTaskService:
                 core._active_delivery[view.task_id] = row["delivery_id"]
         return core, effects, events
 
-    def _save(self, core, effects, events):
-        db = self._db
+    def _save(self, core, effects, events, db=None):
+        db = self._db if db is None else db
         db.executemany("INSERT OR REPLACE INTO tasks VALUES (?,?)",
                        [(k, v.model_dump_json()) for k, v in core._tasks.items()])
         db.executemany("INSERT OR REPLACE INTO commands VALUES (?,?,?)",
@@ -225,32 +269,77 @@ class SQLiteTaskService:
         for kind, fields in events:
             db.execute("INSERT INTO events(recorded_at,kind,fields) VALUES (?,?,?)", (now.isoformat(), kind, _json(fields)))
 
-    def _change(self, method, *args):
-        with self._transaction():
-            core, effects, events = self._load()
-            result = getattr(core, method)(*args)
-            self._save(core, effects, events)
-            if (method == "apply" and self.on_terminal_issue is not None and result.status == "applied"
-                    and result.view.draft.item_type == "issue" and result.view.status in {"completed", "cancelled"}):
-                self.on_terminal_issue(result.view.task_id, db=self._db)
-        self._flush_events()
-        self._drain()
+    def _change_in_transaction(self, db, method, *args, on_applied=None):
+        core, effects, events = self._load(db)
+        previous = core._tasks.copy()
+        result = getattr(core, method)(*args)
+        self._save(core, effects, events, db)
+        now = self.clock.wall_now().isoformat()
+        for task_id, old in previous.items():
+            updated = core._tasks[task_id]
+            if old == updated or not old.draft.reminder_enabled:
+                continue
+            replaced = old.occurrence != updated.occurrence
+            if replaced:
+                closed_as = ("snoozed" if updated.last_snoozed_at is not None else
+                             "expired" if old.expired_at else "acknowledged" if old.acknowledged_at else
+                             "cancelled" if old.status in {"cancelled", "completed"} else "superseded")
+                db.execute("INSERT OR IGNORE INTO item_occurrence_history VALUES (?,?,?,?)",
+                           (task_id, old.occurrence, old.model_dump_json(), closed_as))
+            if old.active_reminder and (replaced or not updated.active_reminder):
+                db.execute("""UPDATE presentations
+                              SET state='cancel_intent', reason='occurrence_invalidated', updated_at=?
+                              WHERE task_id=? AND occurrence=? AND channel='os_notification'
+                              AND state IN ('submitting','scheduled','submitted','unknown')""",
+                           (now, task_id, old.occurrence))
+                if self.on_occurrence_invalidated is not None:
+                    self.on_occurrence_invalidated(task_id, old.occurrence, db=db)
+        if (method == "apply" and self.on_terminal_issue is not None and result.status == "applied"
+                and result.view.draft.item_type == "issue" and result.view.status in {"completed", "cancelled"}):
+            self.on_terminal_issue(result.view.task_id, db=db)
+        if on_applied is not None and result.status == "applied":
+            command = args[0]
+            on_applied(db, command, previous.get(command.task_id))
         return result
 
-    def get(self, task_id):
-        row = self._db.execute("SELECT view FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-        return TaskView.model_validate_json(row[0]) if row else None
+    def apply_in_transaction(self, db, command: TaskCommand):
+        """Persist domain changes and outbox under the caller's business transaction."""
+        if not db.in_transaction:
+            raise ValueError("a write transaction is required")
+        return self._change_in_transaction(db, "apply", command)
 
-    def list_tasks(self):
-        return [TaskView.model_validate_json(row[0]) for row in self._db.execute("SELECT view FROM tasks ORDER BY task_id")]
+    def _change(self, method, *args, on_applied=None):
+        with self._transaction():
+            result = self._change_in_transaction(self._db, method, *args, on_applied=on_applied)
+        self.flush()
+        return result
+
+    def flush(self):
+        """Flush committed events and delivery effects from the service's owner thread."""
+        self._flush_events()
+        self._drain()
+
+    def get(self, task_id, *, db=None):
+        db = self._db if db is None else db
+        return read_task(db, task_id)
+
+    def list_tasks(self, *, db=None):
+        db = self._db if db is None else db
+        return [TaskView.model_validate_json(row[0]) for row in db.execute("SELECT view FROM tasks ORDER BY task_id")]
+
+    def command_result(self, command_id, *, db=None):
+        db = self._db if db is None else db
+        row = db.execute("SELECT result FROM commands WHERE command_id=?", (command_id,)).fetchone()
+        return CommandResult.model_validate_json(row[0]) if row else None
 
     def pending_deliveries(self) -> dict[str, int]:
         return {row["task_id"]: row["task_version"] for row in self._db.execute(
             "SELECT task_id,task_version FROM deliveries WHERE active=1 AND status<>'displayed'"
         )}
 
-    def apply(self, command: TaskCommand):
-        return self._change("apply", command)
+    def apply(self, command: TaskCommand, *, on_applied=None):
+        """Commit the command, including any caller-owned admission fence, before delivery."""
+        return self._change("apply", command, on_applied=on_applied)
 
     def observe(self, observation: Observation):
         return self._change("observe", observation)

@@ -27,7 +27,8 @@ from deskpet.task_service.sqlite import SQLiteTaskService
 app = QApplication([])
 app.setQuitOnLastWindowClosed(False)
 session = RefineSession(app, SimpleNamespace(profile="realtime", scenario="delivery-regression",
-    data_dir=sys.argv[1], output=sys.argv[1], synthetic_delivery=True, adapters=None))
+    data_dir=sys.argv[1], output=sys.argv[1], synthetic_delivery=True, adapters=None,
+    user_timezone="America/New_York"))
 panel, window = session.reminders, session.window
 
 def wait(predicate):
@@ -52,6 +53,7 @@ try:
     panel.create_button.click()
     wait(lambda: len(window.views) == 1 and not panel.pending)
     item_id, before = next(iter(window.views.items()))
+    assert before["draft"]["timezone"] == window.worker.system2.host.timezone == "America/New_York"
     assert before["draft"]["remind_by"] is None
     assert before["draft"]["target_at"] and before["draft"]["due_at"]
     panel.open_edit(item_id)
@@ -68,6 +70,7 @@ try:
                         payload={"draft": {"content": task_id, "mode": "hard", "target_at": when,
                                            "remind_after": when, "remind_by": when}})
     wait(lambda: all(task_id in window.views for task_id in ids))
+    assert all(window.views[task_id]["draft"]["timezone"] == "America/New_York" for task_id in ids)
     for task_id in ids:
         session._action("reminder.confirm", task_id=task_id, version=1)
     wait(lambda: session.prompt and session.prompt.painted

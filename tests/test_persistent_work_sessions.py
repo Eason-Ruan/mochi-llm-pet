@@ -345,3 +345,38 @@ def test_expired_break_during_sleep_does_not_start_overdue_habit_focus(tmp_path)
     assert service.snapshot_fields()["phase_habit_continuation"]["habit_id"] == habit.id
     assert len(service.list_phases()) == 2
     service.close()
+
+
+@pytest.mark.parametrize("wake_before_deadline", [False, True])
+def test_habit_focus_after_sleep_depends_on_break_deadline(tmp_path, wake_before_deadline):
+    path = tmp_path / "business.sqlite3"
+    clock = FakeClock()
+    settings = SettingsStore(path)
+    habit = settings.save_habit(title="论文", expected_version=0, behavior=HabitBehavior(
+        focus_s=20, short_break_s=10, auto_start_break=True, auto_start_focus=True,
+    ))
+    primary = PersistentWorkSessionService(path=path, clock=clock, settings_store=settings)
+    other = PersistentWorkSessionService(path=path, clock=clock, settings_store=settings)
+    try:
+        write(primary, "start", habit_id=habit.id, expected_habit_version=habit.version)
+        clock.advance(20)
+        rest = primary.current_phase()
+        assert rest.kind == "short_break"
+        primary.record_sleep()
+        clock.advance(5)
+        if wake_before_deadline:
+            primary.record_wake()
+        clock.advance(5)
+        active = other.current_phase()
+        assert other.get_phase(rest.id).state == "elapsed"
+        if wake_before_deadline:
+            assert (active.kind, active.source) == ("focus", "habit")
+            assert len(primary.list_phases()) == 3
+        else:
+            assert active is None
+            primary.record_wake()
+            assert len(primary.list_phases()) == 2
+            assert primary.snapshot_fields()["phase_habit_continuation"]["habit_id"] == habit.id
+    finally:
+        other.close()
+        primary.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -124,6 +125,7 @@ class ObservationFrame(Model):
 
 class TaskDraft(Model):
     content: str = Field(min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=4000)
     mode: Literal["hard", "soft"] = "soft"
     timezone: str = "UTC"
     earliest_at: datetime | None = None
@@ -138,6 +140,21 @@ class TaskDraft(Model):
     window_open_at: datetime | None = None
     window_close_at: datetime | None = None
     window_computed_at: datetime | None = None
+    urgency_until: datetime | None = None
+    urgency_reason: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @field_validator("timezone")
+    @classmethod
+    def iana_timezone(cls, value):
+        # Windows without a tzdata package still accepts the names used by
+        # legacy desktop records. Every stored time already includes an offset.
+        if value in {"UTC", "Asia/Shanghai"}:
+            return value
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("timezone must be an IANA time zone") from exc
+        return value
 
     @property
     def opens_at(self) -> datetime | None:
@@ -148,6 +165,11 @@ class TaskDraft(Model):
     @property
     def hard_deadline(self) -> datetime | None:
         return self.remind_by or self.latest_first_delivery_at
+
+    @property
+    def opportunity_close_at(self) -> datetime | None:
+        return min((value for value in (self.window_close_at, self.hard_deadline, self.expires_at)
+                    if value is not None), default=None)
 
     @model_validator(mode="after")
     def window_valid(self):
@@ -162,16 +184,24 @@ class TaskDraft(Model):
             raise ValueError("exact reminders require one confirmed time")
         if self.window_close_at is not None and start is not None and self.window_close_at < start:
             raise ValueError("window_close_at precedes the opening time")
-        if self.target_at is not None and ((start and self.target_at < start)
+        explicit_start = max((value for value in (self.earliest_at, self.remind_after) if value), default=None)
+        if self.target_at is not None and ((explicit_start and self.target_at < explicit_start)
                                            or (deadline and self.target_at > deadline)):
-            raise ValueError("target_at is outside the reminder window")
+            raise ValueError("target_at is outside the explicit reminder bounds")
         if self.expires_at is not None and any(
             value is not None and value >= self.expires_at for value in (start, self.target_at, deadline)
         ):
             raise ValueError("expires_at must follow the other reminder times")
         if self.item_type == "reminder" and (self.due_at is not None or not self.reminder_enabled):
             raise ValueError("only issues have work deadlines or can omit reminders")
+        if bool(self.urgency_reason) != (self.urgency_until is not None):
+            raise ValueError("time-sensitive reminders require a reason and time limit")
+        if self.urgency_until is not None and start is not None and self.urgency_until <= start:
+            raise ValueError("the time-sensitive interval must extend past the opening time")
         return self
+
+
+IssueStatus = Literal["created", "in_progress", "paused", "completed", "cancelled"]
 
 
 class TaskView(Model):
@@ -183,11 +213,38 @@ class TaskView(Model):
     confirmed_at: datetime | None = None
     displayed_at: datetime | None = None
     acknowledged_at: datetime | None = None
+    issue_status: IssueStatus | None = None
+    rule_version: int = Field(default=1, ge=1)
+    occurrence_rule_version: int | None = Field(default=None, ge=1)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    last_snoozed_at: datetime | None = None
+    archived_at: datetime | None = None
+    expired_at: datetime | None = None
+
+    @field_validator("issue_status", mode="before")
+    @classmethod
+    def legacy_issue_status(cls, value):
+        return "paused" if value == "issue_hangging" else value
+
+    @property
+    def active_reminder(self) -> bool:
+        return (self.status == "registered" and self.draft.reminder_enabled
+                and self.acknowledged_at is None and self.expired_at is None and self.archived_at is None)
+
+    @property
+    def occurrence_id(self) -> str:
+        return f"{self.task_id}:{self.occurrence}"
+
+    @property
+    def effective_issue_status(self) -> IssueStatus:
+        return self.issue_status or (self.status if self.status in {"completed", "cancelled"} else "created")
 
 
 class TaskCommand(Model):
     command_id: str
-    kind: Literal["create", "confirm", "edit", "snooze", "ack", "cancel", "complete"]
+    kind: Literal["create", "create_registered", "confirm", "edit", "configure", "estimate_window", "snooze", "ack", "cancel", "complete",
+                  "set_status", "archive"]
     task_id: str
     expected_version: int = Field(default=0, ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -293,7 +350,8 @@ class UiSpec(Model):
 class UiAction(Model):
     event_id: str
     action_id: Literal["reminder.create", "reminder.confirm", "reminder.done", "reminder.snooze",
-                       "reminder.edit", "reminder.cancel", "state.override", "session.start",
+                       "reminder.edit", "reminder.cancel", "reminder.ack", "reminder.archive",
+                       "reminder.set_status", "state.override", "session.start",
                        "session.pause", "session.resume", "session.end", "session.adjust",
                        "session.start_break", "session.skip_break", "session.set_links", "session.set_details",
                        "session.review",

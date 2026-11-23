@@ -38,7 +38,8 @@ SHADOW = "#c9b79f"
 def active_reminders(snapshot: dict) -> list[dict]:
     return sorted(
         (task for task in snapshot.get("tasks", ()) if task["status"] == "registered"
-         and task["draft"].get("reminder_enabled", True) and not task.get("acknowledged_at")),
+         and task["draft"].get("reminder_enabled", True)
+         and not (task.get("acknowledged_at") or task.get("expired_at"))),
         key=lambda task: (
             task["draft"].get("remind_after") or task["draft"].get("earliest_at") or "",
             task["draft"]["mode"] != "hard",

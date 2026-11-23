@@ -2,25 +2,14 @@
 
 https://github.com/user-attachments/assets/4e0e6054-b2d3-41e2-8e87-6cdb13ce9ff7
 
-**Mochi is an AI desktop pet / desktop mascot driven by a multimodal LLM.** A
-transparent, always-on-top pixel cat that *sees your whole desktop* — window
-layout, cursor, the active app — and a single vision LLM (local **Ollama**, or
-Gemini / OpenAI / Anthropic / any OpenAI-compatible endpoint) decides, in
-character, how it reacts: stalking your cursor, pouncing, perching on a window,
-napping when you're idle, sulking when poked, demanding pets. It talks like a
-self-absorbed cat (not an assistant), learns your habits, and its energy / mood /
-bond persist across sessions — so its personality grows.
+Mochi is a desktop cat for focus sessions, work items, and reminders. Start a
+timer from the cat, or ask it to find a suitable moment for a reminder. The
+desktop stores timers and explicit deadlines locally. Observation describes
+recent activity. System 2 uses DeepSeek Harness (DSH) to interpret requests and
+propose actions through the same services that power the buttons.
 
-Think Shimeji / desktop buddy, but its behaviour is decided by an LLM agent that
-actually looks at your screen — a virtual pet with a brain.
-
-> **Keywords:** LLM desktop pet · AI desktop pet · virtual pet LLM · multimodal
-> desktop mascot · Ollama desktop pet · Shimeji-style AI companion · Python /
-> PyQt6 · Windows.
-
-It's built to **just run**: a built-in placeholder cat animates before you add
-real art, and it falls back to simple rule-based behaviour if the LLM is
-unreachable. Nothing hard-crashes.
+See the [desktop quick start](#quick-start-windows-and-macos) for setup. The
+original sprite pet is also available through `python -m deskpet --legacy`.
 
 ---
 
@@ -127,6 +116,25 @@ After setup, double-click `start_mochi.bat` on Windows or
 focus, chat, or settings. The focus panel can start a timer with the supplied
 duration and an optional title. Text chat also accepts local commands such as
 「开始 25 分钟」 and 「暂停专注」.
+
+System 2 defaults to Alibaba Cloud Model Studio (阿里云百炼) and `qwen4-max`.
+Run `uv run --locked python -m deskpet --configure-system2` to open the local
+key form. Enter a Beijing pay-as-you-go **百炼 API Key** and choose **保存并验证**.
+Mochi saves the secret in the system credential store and tests the connection
+with a synthetic tool call. The form uses the desktop's profile and also accepts
+`--data-dir PATH`. A regional workspace can use its matching official endpoint.
+[Model details](https://help.aliyun.com/zh/model-studio/qwen4-max) ·
+[Regional endpoints](https://help.aliyun.com/zh/model-studio/base-url) ·
+[Create a Bailian API key](https://help.aliyun.com/zh/model-studio/get-api-key).
+
+From the cat, open **设置 → 模型与隐私 → 对话与动作 → 配置** to change the
+connection and use **验证能力** to test it. Existing profiles can select
+**阿里云百炼** there. Manual timers and explicit reminder deadlines also work
+offline.
+
+Configure the screen transcriber and Observation state model independently in
+the same panel. Image sharing, filtered screen text, and published activity
+summaries each have a separate control for their respective recipient.
 
 Mochi stores its reminders, focus history, settings, chat, and draft in the
 platform's local application data directory. Use `python -m deskpet --data-dir PATH`
@@ -361,7 +369,18 @@ DESKPET_CONFIG (path to config.toml)     DESKPET_LOG_LEVEL (DEBUG|INFO|...)
 
 ---
 
-## Privacy
+## Desktop privacy
+
+The production pet starts with screen capture off. Its settings distinguish
+three recipients. The vision model can receive an eligible window image. The
+Observation state model can receive structured signals and, with separate
+permission, filtered screen text. System 2 receives current and compressed
+historical state. Sharing published activity summaries with a cloud System 2
+model is a separate choice. User messages and relevant user-entered items are
+included when needed for a requested action. Credentials are referenced through
+the local credential store. [Observation design](docs/adr/0009-observation-v2.md)
+
+### Privacy in the original sprite pet
 
 With the default local Ollama, **the screenshot and window titles never leave your
 machine**. The app never writes screenshots to disk, stores only a *hash* of the

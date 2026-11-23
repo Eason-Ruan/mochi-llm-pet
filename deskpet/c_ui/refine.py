@@ -5,6 +5,7 @@ import copy
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
+import sqlite3
 import sys
 from types import SimpleNamespace
 from uuid import uuid4
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
+from deskpet.timezones import resolve_timezone
 
 from .desktop import DesktopWorkbench
 from .desktop_power import DesktopPower
@@ -22,6 +24,7 @@ from .refine_chat import RefineChat
 from .refine_conversation_store import ConversationStore
 from .refine_delivery import Prompt, RefineDeliveryMixin
 from .refine_panels import RefineReminders, RefineSettings, RefineWork, active_reminders, current_work
+from .refine_proposals import ProposalCard
 from .refine_window import RefinePet, RefineScroll
 from .time_format import ZONE
 
@@ -42,6 +45,7 @@ class RefineSession(RefineDeliveryMixin):
         self.production = args.profile == "realtime"
         if not self.production and args.profile != "scenario":
             raise ValueError("Mochi 需要实时或演示配置")
+        user_timezone = resolve_timezone(getattr(args, "user_timezone", None)).key if self.production else None
         self.app = app
         self.context = None
         self.snapshot = {}
@@ -53,6 +57,10 @@ class RefineSession(RefineDeliveryMixin):
         self._invite_waiting = False
         self._closing = False
         self._last_service_error = None
+        self._chat_selected_ref = None
+        self._system2 = None
+        self._display_capabilities = {"pet_card": False, "pet_badge": True, "os_notification": False}
+        self._presented_proposals = set()
         self._synthetic_delivery = getattr(args, "synthetic_delivery", False)
         self.data_dir = Path(args.data_dir).expanduser().resolve() if self.production else None
         if self.data_dir is not None:
@@ -83,8 +91,8 @@ class RefineSession(RefineDeliveryMixin):
             from .reminder import ReminderPanel
             from .work_panel import PhasePanel
 
-            self.reminders = ReminderPanel(submit=self._action, advanced=True)
-            self.work = PhasePanel(submit=self._action)
+            self.reminders = ReminderPanel(submit=self._action, advanced=True, timezone=user_timezone)
+            self.work = PhasePanel(submit=self._action, timezone=user_timezone)
         else:
             self.reminders = RefineReminders()
             self.work = RefineWork()
@@ -98,6 +106,7 @@ class RefineSession(RefineDeliveryMixin):
             self.settings_panel = SettingsPanel(
                 self.settings_store, submit=self._settings_submit,
                 save_preferences=self._save_preferences,
+                save_habit=self._save_habit,
                 sound_preview=self.presentation.preview_sound,
                 notification_status=self.presentation.notification_status,
                 refresh_notification_permission=self.presentation.refresh_notification_permission,
@@ -109,7 +118,14 @@ class RefineSession(RefineDeliveryMixin):
             self.settings_panel.input_mode_changed.connect(self.set_input_mode)
 
         chat_store = ConversationStore(self.business_db) if self.production else None
-        self.chat = RefineChat(self.submit, lambda: self.snapshot, store=chat_store, conversation=conversation)
+        self.proposal_card = ProposalCard(self._resolve_proposal, self._reply_to_proposal) if self.production else None
+        self.chat = RefineChat(
+            self.submit, lambda: self.snapshot, store=chat_store, conversation=conversation,
+            system2=self._queue_chat_message if self.production else None,
+            configure_system2=self._open_model_settings if self.production else None,
+            proposal_card=self.proposal_card,
+        )
+        self.chat_store = chat_store
         self.chat.set_preference(self.input_mode)
         self.chat.toolbar_mode_changed.connect(self.pet.set_chat_toolbar)
         self.chat.typing_requested.connect(self.pet.activate_for_input)
@@ -118,7 +134,7 @@ class RefineSession(RefineDeliveryMixin):
             "reminders": RefineScroll(self.reminders) if self.production else self.reminders,
             "work": RefineScroll(self.work) if self.production else self.work,
             "settings": self.settings_panel,
-            "input": self.chat,
+            "input": RefineScroll(self.chat) if self.production else self.chat,
         }
 
         options = copy.copy(args)
@@ -128,6 +144,10 @@ class RefineSession(RefineDeliveryMixin):
             self.observer = DesktopObserver(self.data_dir)
             options.business_database = self.business_db
             options.observation_database = self.observer.database
+            options.enable_system2 = True
+            options.desktop_lock_probe = lambda: self.presentation.lock_probe()
+            options.user_timezone = user_timezone
+            options.desktop_display_capabilities = lambda: self._display_capabilities
             if QGuiApplication.platformName() not in {"offscreen", "minimal"}:
                 self.observer.start()
                 self._observer_timer = QTimer(self.pet)
@@ -174,8 +194,38 @@ class RefineSession(RefineDeliveryMixin):
         self.pet.show()
 
     def _service_ready(self):
+        self._system2 = self.window.worker.system2
+        if self._system2 is not None:
+            self.presentation.ledger.authorize_early = self._system2.scheduler.authorize_qt
         if self.chat.recovered_event:
             self.window.action.emit({"kind": "recover_chat_result", "event_id": self.chat.recovered_event})
+
+    def _queue_chat_message(self, message_id, text, *, proposal=None, supersedes_message_id=None):
+        context = {"selected_ref": self._chat_selected_ref}
+        if proposal:
+            context.update(reply_to_proposal_id=proposal[0], reply_to_proposal_version=proposal[1])
+        if supersedes_message_id:
+            context["supersedes_message_id"] = supersedes_message_id
+        self.chat_store.queue_turn(message_id, text, context)
+        self.window.action.emit({"kind": "system2_message", "event_id": message_id})
+
+    def _open_model_settings(self):
+        self._show_section("settings")
+        self.settings_panel.show_system2_route()
+
+    def _resolve_proposal(self, proposal, answer, amendments):
+        if not self.window.ready_for_actions or self._system2 is None:
+            return None
+        event_id = uuid4().hex
+        self.window.action.emit({
+            "kind": "system2_proposal", "event_id": event_id, "proposal_id": proposal["id"],
+            "expected_version": proposal["version"], "origin": "user", "answer": answer,
+            "amendments": amendments,
+        })
+        return event_id
+
+    def _reply_to_proposal(self, proposal):
+        self.chat.reply_to_proposal(proposal)
 
     def _settings_changed(self, settings):
         self.pet.set_reduce_motion(settings.reduce_motion)
@@ -196,6 +246,13 @@ class RefineSession(RefineDeliveryMixin):
             return
         self._pending_habit = uuid4().hex
         self.window.action.emit({**action, "event_id": self._pending_habit})
+
+    def _save_habit(self, function, args):
+        if not self.window.ready_for_actions:
+            return None
+        event_id = uuid4().hex
+        self.window.action.emit({"kind": "habit_save", "function": function, "args": args, "event_id": event_id})
+        return event_id
 
     def _install_demo_controls(self):
         demo = self.window.menuBar().addMenu("小猫演示")
@@ -243,6 +300,8 @@ class RefineSession(RefineDeliveryMixin):
         self.chat.receive_result(result)
         event = result.get("command_id") or result.get("event_id")
         if self.production:
+            self.proposal_card.complete(event)
+            self.settings_panel.receive_habit_result(result)
             self.reminders.receive_result(result)
             self.work.receive_result(result)
             if event and event == self._pending_settings:
@@ -283,9 +342,105 @@ class RefineSession(RefineDeliveryMixin):
         if self.production:
             settings = snapshot["settings"]
             self.settings_panel.sync_settings_version(settings["version"])
+            self.settings_panel.sync_habits(snapshot.get("system2_habits_version", ()))
             self.pet.set_reduce_motion(settings["reduce_motion"])
             self.pet.set_proactive_movement(settings["allow_proactive_movement"])
+            self._render_system2(snapshot)
         self._render_toolbar()
+
+    def _render_system2(self, snapshot):
+        can_show = self._can_show_reminder()
+        self._display_capabilities = {
+            "pet_card": can_show, "pet_badge": True,
+            "os_notification": (self.presentation.notifications.available
+                                and snapshot["settings"]["allow_system_notifications"]),
+        }
+        try:
+            if "system2_chat_version" in snapshot:
+                self.chat.refresh_projection(snapshot["system2_chat_version"])
+        except sqlite3.Error:
+            self._service_error("暂时无法读取聊天记录。")
+        self.chat.refresh_route(snapshot.get("system2_route_status"))
+        proposals = snapshot.get("system2_proposals", ())
+        self.pet.set_proposal_count(len(proposals))
+        if self.proposal_card.refresh(proposals):
+            self.chat.refresh_proposals()
+        if self._system2 is None or self.section == "input" or not can_show:
+            return
+        indexed = {proposal["id"]: proposal for proposal in proposals}
+        queued = {item.delivery_id for item in self.waiting_prompts if item.delivery_id}
+        if self.prompt:
+            queued.add(self.prompt.delivery_id)
+        for delivery in snapshot.get("system2_proposal_presentations", ()):
+            delivery_id = delivery["delivery_id"]
+            proposal = indexed.get(delivery["proposal_id"])
+            if (delivery_id in self._presented_proposals or delivery_id in queued or not proposal
+                    or delivery["proposal_version"] != proposal["version"]):
+                continue
+            self.waiting_prompts.append(self._proposal_prompt(delivery, proposal))
+        if self.prompt is None:
+            self._show_next_prompt()
+        self._render_pet_intents(snapshot)
+
+    def _proposal_prompt(self, delivery, proposal):
+        delivery_id = delivery["delivery_id"]
+        deadline = datetime.fromisoformat(delivery["valid_until"])
+        scope = self.settings_store.user_scope
+        gateway = self._system2.gateway
+        permitted = False
+        generation = delivery["presentation_generation"]
+
+        def current():
+            return (self._can_show_reminder() and self.section != "input" and self.presentation.now() < deadline
+                    and any((item["id"], item["version"]) == (proposal["id"], proposal["version"])
+                            for item in self.snapshot.get("system2_proposals", ())))
+
+        def permit():
+            nonlocal permitted
+            if not current():
+                return False
+            try:
+                if permitted:
+                    return gateway.validate_presentation(delivery_id, scope, generation=generation)
+                permitted = bool(gateway.permit_presentation(delivery_id, scope, generation=generation))
+                if permitted and not gateway.validate_presentation(delivery_id, scope, generation=generation):
+                    gateway.ack_presentation(delivery_id, scope, displayed=False, generation=generation)
+                    permitted = False
+                return permitted
+            except sqlite3.OperationalError:
+                return False
+
+        def painted():
+            try:
+                result = gateway.ack_presentation(delivery_id, scope, displayed=True, generation=generation)
+            except sqlite3.OperationalError:
+                return False
+            if result:
+                self._presented_proposals.add(delivery_id)
+            return result
+
+        def open_proposal(yes):
+            if yes and current():
+                self.proposal_card.select(proposal["id"])
+                self._show_section("input")
+
+        return Prompt("proposal", proposal["display_text"], open_proposal,
+                      delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted)
+
+    def _render_pet_intents(self, snapshot):
+        if self.prompt is not None or self.pet._press is not None:
+            return
+        for delivery_id in snapshot.get("system2_pet_intents", ()):
+            intent = self._system2.pet.claim(delivery_id, self.presentation.now())
+            if intent is None:
+                continue
+            self.pet.apply_motion_intent(intent["position_hint"], intent["animation"])
+            sound = bool(intent["sound"] and self.presentation.native and self.presentation.lock_probe() is False)
+            if sound:
+                self.app.beep()
+            self._system2.pet.receipt(delivery_id, sound_requested=sound)
+            QTimer.singleShot(1000, self.pet.end_temporary_motion)
+            break
 
     def _render_toolbar(self):
         work = current_work(self.snapshot)
@@ -311,8 +466,16 @@ class RefineSession(RefineDeliveryMixin):
             return
         if self.section == "input":
             self.chat.reset_input()
+        previous = self.section
         self.section = key
         if key == "input":
+            self._chat_selected_ref = None
+            if self.production and previous == "reminders" and (item := self.reminders.selected()):
+                self._chat_selected_ref = {"kind": "item", "id": item["task_id"]}
+            if self.production and previous == "work" and (phase := self.snapshot.get("active_phase")):
+                self._chat_selected_ref = {"kind": "phase", "id": phase["id"]}
+            if self.production and previous == "settings" and (habit := self.settings_panel.selected_habit_id()):
+                self._chat_selected_ref = {"kind": "habit", "id": habit}
             self.chat.open(self.input_mode, alternate=alternate)
         self.pet.set_section(key, self.panels.get(key))
 
@@ -400,8 +563,7 @@ def run_gui(args):
         session.quit()
 
 
-def run_desktop(data_dir=None):
-    """Launch the daily desktop pet with a single writer for the local profile."""
+def _desktop_profile(data_dir):
     set_dpi_awareness()
     app = QApplication.instance() or QApplication(["Mochi"])
     app.setOrganizationName("Mochi")
@@ -411,6 +573,53 @@ def run_desktop(data_dir=None):
         data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
     data_dir = Path(data_dir).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    return app, data_dir
+
+
+def configure_system2(data_dir=None):
+    """Open the local credential editor without starting screen observation or the pet."""
+    from PyQt6.QtCore import Qt, pyqtSignal
+    from PyQt6.QtWidgets import QDialog, QDialogButtonBox
+    from deskpet.observation_v2.routes import SYSTEM2
+    from deskpet.settings import SettingsStore
+    from .settings import _RouteEditor, verify_route_in_background
+
+    class VerificationDialog(QMessageBox):
+        probe_finished = pyqtSignal(str)
+
+    app, data_dir = _desktop_profile(data_dir)
+    store = SettingsStore(data_dir / "business.sqlite3")
+    editor = _RouteEditor(store.routes, SYSTEM2, None, preset_provider="bailian")
+    editor.setWindowTitle("Mochi · System 2 模型连接")
+    buttons = editor.findChild(QDialogButtonBox)
+    buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并验证")
+    if editor.exec() != QDialog.DialogCode.Accepted or store.routes.snapshot(SYSTEM2).route is None:
+        return 0
+
+    outcome = VerificationDialog()
+    outcome.setWindowTitle("Mochi · System 2 连接验证")
+    outcome.setTextFormat(Qt.TextFormat.PlainText)
+    outcome.setText("正在使用合成数据验证文本和工具调用…")
+    outcome.setStandardButtons(QMessageBox.StandardButton.Close)
+    outcome.button(QMessageBox.StandardButton.Close).setText("关闭")
+
+    def finished(role):
+        route = store.routes.snapshot(role)
+        if route.verified and route.route:
+            outcome.setText(f"连接已验证。System 2 将使用 {route.route.model}。")
+        else:
+            outcome.setText("连接已保存，验证未通过。请核对 API Key、模型权限和地域。")
+        outcome.adjustSize()
+
+    outcome.probe_finished.connect(finished)
+    verify_route_in_background(store.routes, SYSTEM2, outcome.probe_finished)
+    outcome.exec()
+    return 0
+
+
+def run_desktop(data_dir=None):
+    """Launch the daily desktop pet with a single writer for the local profile."""
+    app, data_dir = _desktop_profile(data_dir)
     lock = QLockFile(str(data_dir / "desktop.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock():

@@ -134,6 +134,14 @@ class RealtimeHead:
     producer_generation: str | None = None
 
 
+@dataclass(frozen=True)
+class RealtimeBridge:
+    head: RealtimeHead
+    departure_serial: int | None = None
+    departure_through_cursor: int | None = None
+    departure_reason: str | None = None
+
+
 def project_observation_context(context: ObservationContext, *, share_summary: bool = False) -> dict:
     """Allowlist the System 2 context, including only explicitly shared descriptions."""
     return {
@@ -226,9 +234,10 @@ class ObservationContextReader:
         self._latest_read: tuple[tuple[str, int], datetime, float] | None = None
 
     @contextmanager
-    def _snapshot(self, *, realtime: bool = False):
+    def _snapshot(self, *, realtime: bool = False, busy_timeout_s: float = 0):
         try:
-            connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0 if realtime else 5)
+            connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True,
+                                         timeout=busy_timeout_s if realtime else 5)
         except sqlite3.OperationalError:
             if self.path.exists():
                 raise
@@ -364,6 +373,26 @@ class ObservationContextReader:
         with self._snapshot(realtime=True) as connection:
             return self._live_head(connection, at, mono, policy_generation=policy_generation)
 
+    def read_realtime_bridge(
+        self, as_of: datetime, *, monotonic_s: float, policy_generation: int | None = None,
+    ) -> RealtimeBridge:
+        """Read the live head and a replayable watermark of intervening departures."""
+        _timestamp(as_of)
+        with self._snapshot(realtime=True) as connection:
+            head = self._live_head(connection, as_of, monotonic_s, policy_generation=policy_generation)
+            if connection is None or not connection.execute("""
+                SELECT 1 FROM sqlite_master WHERE name='realtime_observation_departure' AND type='table'
+            """).fetchone():
+                return RealtimeBridge(head)
+            departure = connection.execute("""
+                SELECT serial, through_cursor, reason, boot_id, policy_generation
+                FROM realtime_observation_departure WHERE singleton = 1
+            """).fetchone()
+            if (departure is None or departure["boot_id"] != (self._boot_id or system_boot_id())
+                    or departure["policy_generation"] != policy_generation):
+                return RealtimeBridge(head)
+            return RealtimeBridge(head, departure["serial"], departure["through_cursor"], departure["reason"])
+
     def read_realtime_current(
         self, as_of: datetime | None = None, *, monotonic_s: float | None = None,
         policy_generation: int | None = None,
@@ -373,14 +402,14 @@ class ObservationContextReader:
 
     def read_realtime_context(
         self, as_of: datetime | None = None, *, monotonic_s: float | None = None,
-        policy_generation: int | None = None, include_current: bool = True,
+        policy_generation: int | None = None, include_current: bool = True, busy_timeout_s: float = 0,
     ) -> ObservationContext:
         """Read the validated live head and wall-time history in one transaction."""
         at = as_of if as_of is not None else datetime.now(UTC)
         stamp = _timestamp(at)
         at = at.astimezone(UTC)
         mono = monotonic_s if monotonic_s is not None else time.monotonic()
-        with self._snapshot(realtime=True) as connection:
+        with self._snapshot(realtime=True, busy_timeout_s=busy_timeout_s) as connection:
             head = (self._live_head(connection, at, mono, policy_generation=policy_generation)
                     if include_current else RealtimeHead(None, "context_changed"))
             exists, managed = self._tables(connection)

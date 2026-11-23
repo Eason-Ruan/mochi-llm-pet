@@ -1,4 +1,4 @@
-"""Qt workbench with an optional embedded C surface. No model client is started.
+"""Qt workbench with an optional embedded C surface.
 
 Domain adapters are constructed in ServiceWorker.start, on their owning thread.
 Widgets only exchange immutable views/actions/receipts through queued signals.
@@ -62,6 +62,7 @@ class ServiceWorker(QObject):
         self._observation = None
         self._settings_store = None
         self._settings = None
+        self.system2 = None
         self._qt_source = "offscreen" if QGuiApplication.platformName() in ("offscreen", "minimal") else "native"
 
     @pyqtSlot()
@@ -89,6 +90,10 @@ class ServiceWorker(QObject):
                 self._settings_store = SettingsStore(business_db, initial_input_mode="typing")
                 self.env.sessions.attach_settings(self._settings_store)
                 self._reload_settings()
+            if getattr(self.args, "enable_system2", False):
+                from deskpet.c_ui.desktop_system2 import DesktopSystem2
+
+                self.system2 = DesktopSystem2(self.args, self.env, self._settings_store)
             self._observation = self.env.observations.snapshot().observation
             if self.args.profile == "scenario" and getattr(self.args, "realtime_scenario", False):
                 self._realtime_scenario_timer = QElapsedTimer()
@@ -131,6 +136,8 @@ class ServiceWorker(QObject):
         if self._settings is not None:
             snapshot["settings"] = self._settings.to_dict()
             snapshot.update(self.env.sessions.snapshot_fields())
+        if self.system2 is not None:
+            snapshot.update(self.system2.snapshot_fields())
         self.snapshot_ready.emit(snapshot)
 
     def _reload_settings(self):
@@ -151,6 +158,11 @@ class ServiceWorker(QObject):
         try:
             self._sync_realtime_scenario()
             self.env.pump()
+            if self.system2 is not None:
+                self._reload_settings()
+                for event in self.system2.pump():
+                    if event.reply_to_message_id:
+                        self.result_ready.emit({"event_id": event.reply_to_message_id, "status": "system2_answer"})
             self.snapshot()
         except Exception as exc:
             self.error.emit(f"pump: {type(exc).__name__}: {exc}")
@@ -211,7 +223,12 @@ class ServiceWorker(QObject):
                 if cmd_kind in ("create", "edit") and "draft" in payload:
                     if set(payload) != {"draft"}:
                         raise ValueError("事项表单包含多余字段")
-                    draft = TaskDraft.model_validate(payload["draft"])
+                    draft_fields = payload["draft"]
+                    if self.system2 is not None and isinstance(draft_fields, dict) and "timezone" not in draft_fields:
+                        current = self.env.tasks.get(action["task_id"]) if cmd_kind == "edit" else None
+                        zone = current.draft.timezone if current else self.system2.host.timezone
+                        draft_fields = draft_fields | {"timezone": zone}
+                    draft = TaskDraft.model_validate(draft_fields)
                     payload = {"draft": draft.model_dump(mode="json")}
                 elif cmd_kind in ("create", "edit"):
                     window = float(payload.pop("window_s", 20))
@@ -230,10 +247,14 @@ class ServiceWorker(QObject):
                                       latest_first_delivery_at=start + timedelta(
                                           seconds=0 if mode == "hard" else window))
                     payload = {"draft": draft.model_dump(mode="json")}
-                result = self.env.tasks.apply(TaskCommand(
+                command = TaskCommand(
                     command_id=action.get("event_id") or _id("command"), kind=cmd_kind,
                     task_id=action["task_id"], expected_version=action.get("version", 0),
-                    payload=payload))
+                    payload=payload)
+                if self.system2 is not None and ui is not None:
+                    result = self.env.tasks.apply(command, on_applied=self.system2.fence_task)
+                else:
+                    result = self.env.tasks.apply(command)
             elif kind == "advance":
                 if not hasattr(self.env.clock, "advance"):
                     raise ValueError("真实时钟不支持快进")
@@ -270,10 +291,15 @@ class ServiceWorker(QObject):
             elif kind == "settings_update":
                 result = {"status": "applied", "event_id": action["event_id"]}
                 try:
-                    self._settings = self._settings_store.update(
-                        expected_version=action["expected_version"],
-                        before_commit=self.env.sessions.apply_settings_update, **action["changes"],
-                    )
+                    admitted = self.system2.apply_preferences(action) if self.system2 is not None else None
+                    if admitted is None:
+                        self._settings = self._settings_store.update(
+                            expected_version=action["expected_version"],
+                            before_commit=self.env.sessions.apply_settings_update, **action["changes"],
+                        )
+                    else:
+                        self._settings = self._settings_store.read()
+                        result["status"] = admitted.original_status or admitted.status
                 except (ValueError, sqlite3.Error):
                     self._settings = self._settings_store.read()
                     result["status"] = "rejected"
@@ -282,17 +308,37 @@ class ServiceWorker(QObject):
                 result = self.env.sessions.command_result(event_id)
                 if result is None:
                     result = {"command_id": event_id, "status": "result_unavailable"}
+            elif kind == "habit_save":
+                outcome = self.system2.gateway.execute_local(action["function"], action["args"],
+                                                             event_id=action["event_id"])
+                result = {"event_id": action["event_id"], "status": outcome.original_status or outcome.status,
+                          "error_code": outcome.error_code,
+                          "view": json.dumps(outcome.view, ensure_ascii=False) if outcome.view else None}
+            elif kind == "system2_message":
+                # The message and its stable event ID are already in the local outbox.
+                pass
+            elif kind == "system2_proposal":
+                try:
+                    self.system2.resolve(action)
+                except (ValueError, RuntimeError):
+                    result = {"event_id": action["event_id"], "status": "rejected"}
             elif kind == "system_sleep":
                 self.env.sessions.record_sleep()
+                if self.system2 is not None:
+                    self.system2.scheduler.close_opportunity(reason="sleep", now=self.env.clock.wall_now())
             elif kind == "system_wake":
                 self.env.sessions.record_wake()
+                if self.system2 is not None:
+                    self.system2.scheduler.resume(self.env.clock.wall_now())
             elif kind == "start_habit":
                 from deskpet.work_sessions.models import PhaseCommand
 
-                result = self.env.sessions.apply_phase(PhaseCommand(
+                command = PhaseCommand(
                     command_id=action["event_id"], phase_id=f"habit-phase-{action['event_id']}", kind="start",
                     payload={"habit_id": action["habit_id"], "expected_habit_version": action["expected_version"]},
-                ))
+                )
+                result = (self.system2.gateway.execute_local_phase(command) if self.system2 is not None
+                          else self.env.sessions.apply_phase(command))
             elif kind == "set_estimate":
                 setter = getattr(self.env.estimator, "set_estimate", None)
                 if not callable(setter):
@@ -317,11 +363,13 @@ class ServiceWorker(QObject):
                         if payload["kind"] not in ("short_break", "long_break"):
                             raise ValueError("请选择休息类型")
                         verb = "start"
-                    result = apply_phase(PhaseCommand(
+                    command = PhaseCommand(
                         command_id=action.get("event_id") or _id("phase-command"),
                         phase_id=action["session_id"], expected_version=action.get("version", 0),
                         kind=verb, source=source, payload=self.env.sessions.phase_payload(verb, payload),
-                    ))
+                    )
+                    result = (self.system2.gateway.execute_local_phase(command) if self.system2 is not None and ui
+                              else apply_phase(command))
                 else:
                     command = SessionCommand(
                         command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
@@ -413,6 +461,8 @@ class ServiceWorker(QObject):
     def stop(self):
         if self.timer:
             self.timer.stop()
+        if self.system2 is not None:
+            self.system2.close()
         if self.env is not None:
             for service in (self.env.sessions, self.env.tasks):
                 close = getattr(service, "close", None)

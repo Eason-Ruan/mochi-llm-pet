@@ -78,7 +78,7 @@ class MemoryTaskService:
     @staticmethod
     def _fingerprint(model) -> str:
         fields = model.model_dump(mode="json")
-        if isinstance(model, TaskCommand) and model.kind in {"create", "edit"}:
+        if isinstance(model, TaskCommand) and model.kind in {"create", "create_registered", "edit", "configure"}:
             if set(model.payload) == {"draft"}:
                 try:
                     fields["payload"] = {"draft": TaskDraft.model_validate(model.payload["draft"]).model_dump(mode="json")}
@@ -110,7 +110,7 @@ class MemoryTaskService:
         previous = self._commands.get(command.command_id)
         if previous:
             matches = fingerprint == previous[0]
-            if not matches and command.kind in {"create", "edit"}:
+            if not matches and command.kind in {"create", "create_registered", "edit", "configure"}:
                 # Schema-one receipts recorded raw TaskDraft JSON with the older field set.
                 matches = fingerprint == self._fingerprint(TaskCommand.model_validate_json(previous[0]))
             if not matches:
@@ -135,7 +135,7 @@ class MemoryTaskService:
         if not command.command_id.strip() or not command.task_id.strip():
             return reject(ErrorCode.INVALID_ARGUMENT, "command_id and task_id must be nonempty")
         view = self.get(command.task_id)
-        if command.kind == "create":
+        if command.kind in {"create", "create_registered"}:
             if view is not None or command.expected_version != 0:
                 return reject(ErrorCode.STALE_TASK, "create requires absent task and expected_version=0")
         else:
@@ -143,66 +143,132 @@ class MemoryTaskService:
                 return reject(ErrorCode.NOT_FOUND, "task does not exist")
             if command.expected_version != view.version:
                 return reject(ErrorCode.STALE_TASK, "expected_version does not match task")
-            if view.status == "cancelled":
+            if view.archived_at is not None:
+                return reject(ErrorCode.CANCELLED, "task was archived")
+            if view.status == "cancelled" and command.kind not in {"set_status", "archive"}:
                 return reject(ErrorCode.CANCELLED, "task was cancelled")
-            if view.status == "completed":
+            if view.status == "completed" and command.kind not in {"set_status", "archive"}:
                 return reject(ErrorCode.INVALID_TRANSITION, "completed task is terminal")
 
-        expected_fields = {"draft"} if command.kind in {"create", "edit"} else (
-            {"seconds"} if command.kind == "snooze" else set())
+        expected_fields = {"draft"} if command.kind in {"create", "create_registered", "edit", "configure"} else (
+            {"seconds"} if command.kind == "snooze" else {"status"} if command.kind == "set_status" else set())
+        if command.kind == "estimate_window":
+            expected_fields = {"window_open_at", "window_close_at"}
         fields = set(command.payload)
-        if fields != expected_fields and not (command.kind == "snooze" and fields == {"seconds", "mode"}):
+        if fields != expected_fields and not (command.kind == "snooze" and "seconds" in fields
+                and fields <= {"seconds", "mode", "window_before_s", "window_after_s", "snoozed_at"}):
             return reject(ErrorCode.INVALID_ARGUMENT,
                           f"{command.kind} payload requires exactly {sorted(expected_fields)}")
         try:
-            if command.kind in {"create", "edit"}:
+            if command.kind in {"create", "create_registered", "edit", "configure"}:
                 draft = TaskDraft.model_validate(command.payload["draft"])
             elif command.kind == "snooze":
                 seconds = command.payload["seconds"]
                 mode = command.payload.get("mode", "legacy")
+                snoozed_at = (datetime.fromisoformat(command.payload["snoozed_at"])
+                              if "snoozed_at" in command.payload else None)
+                if snoozed_at is not None and snoozed_at.utcoffset() is None:
+                    raise ValueError("snooze event time must include a UTC offset")
                 if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
                     raise ValueError("seconds must be numeric")
                 if not math.isfinite(seconds) or seconds <= 0:
                     raise ValueError("seconds must be finite and positive")
                 if mode not in ("legacy", "flexible_target", "no_earlier", "exact"):
                     raise ValueError("invalid snooze mode")
+                for name in ("window_before_s", "window_after_s"):
+                    if name in command.payload:
+                        extra = command.payload[name]
+                        if (mode != "flexible_target" or isinstance(extra, bool)
+                                or not isinstance(extra, (int, float)) or not math.isfinite(extra)
+                                or not 0 <= extra < seconds):
+                            raise ValueError("snooze window offsets must be shorter than the delay")
         except (ValidationError, ValueError, TypeError) as exc:
             return reject(ErrorCode.INVALID_ARGUMENT, str(exc))
 
         now = self.clock.wall_now()
-        if command.kind == "create":
-            updated = TaskView(task_id=command.task_id, version=1, draft=draft)
+        if command.kind in {"create", "create_registered"}:
+            registered = command.kind == "create_registered"
+            updated = TaskView(task_id=command.task_id, version=1, draft=draft,
+                               status="registered" if registered else "draft",
+                               confirmed_at=now if registered else None, created_at=now, updated_at=now,
+                               issue_status="created" if draft.item_type == "issue" else None)
         elif command.kind == "confirm":
             if view.status != "draft":
                 return reject(ErrorCode.INVALID_TRANSITION, "only a draft can be confirmed")
             updated = view.model_copy(update={"status": "registered", "version": view.version+1,
                                                "confirmed_at": now})
-        elif command.kind == "edit":
-            unchanged_rule = all(getattr(draft, name) == getattr(view.draft, name)
-                                 for name in type(draft).model_fields if name not in {"content", "due_at"})
+        elif command.kind in {"edit", "configure"}:
+            if draft.item_type != view.draft.item_type:
+                return reject(ErrorCode.INVALID_TRANSITION, "an existing item cannot change type")
+            unchanged_rule = command.kind == "edit" and all(
+                getattr(draft, name) == getattr(view.draft, name) for name in type(draft).model_fields
+                if name not in {"content", "description", "due_at"}
+            )
+            new_rule = not unchanged_rule and (draft.reminder_enabled or view.draft.reminder_enabled)
             updated = view.model_copy(update={"draft": draft, "version": view.version+1,
                                                "displayed_at": view.displayed_at if unchanged_rule else None,
                                                "acknowledged_at": view.acknowledged_at if unchanged_rule else None,
-                                               "occurrence": view.occurrence + (view.status == "registered" and not unchanged_rule)})
-        elif command.kind == "snooze":
-            if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
-                return reject(ErrorCode.INVALID_TRANSITION, "only a registered task can be snoozed")
+                                               "expired_at": view.expired_at if unchanged_rule else None,
+                                               "last_snoozed_at": view.last_snoozed_at if unchanged_rule else None,
+                                               "rule_version": view.rule_version + int(new_rule),
+                                               "occurrence_rule_version": (view.rule_version+1 if new_rule
+                                                                           else view.occurrence_rule_version),
+                                               "occurrence": view.occurrence + int(
+                                                   view.status == "registered" and new_rule and view.draft.reminder_enabled)})
+        elif command.kind == "estimate_window":
+            current = view.draft
+            target_only = (current.target_at is not None and current.window_open_at is None
+                           and current.window_close_at is None)
+            closed = current.window_close_at is not None and current.window_close_at <= now
+            if (not view.active_reminder or view.displayed_at is not None or current.mode != "soft"
+                    or not (target_only or closed)):
+                return reject(ErrorCode.INVALID_TRANSITION, "an active soft estimate cannot be replaced early")
             try:
-                target = now + timedelta(seconds=seconds)
+                draft = TaskDraft.model_validate(current.model_dump() | command.payload | {"window_computed_at": now})
+            except (ValidationError, ValueError, TypeError) as exc:
+                return reject(ErrorCode.INVALID_ARGUMENT, str(exc))
+            if draft.window_open_at is None or draft.window_close_at is None:
+                return reject(ErrorCode.INVALID_ARGUMENT, "an estimate requires both window endpoints")
+            start = max(edge for edge in (draft.opens_at, draft.earliest_at) if edge is not None)
+            close = draft.opportunity_close_at
+            if close <= max(start, now):
+                return reject(ErrorCode.OUTSIDE_WINDOW, "the estimate must have a remaining valid opportunity")
+            # Persist the intersection so the UI and scheduler show the same window.
+            updated = view.model_copy(update={
+                "draft": draft.model_copy(update={"window_open_at": start, "window_close_at": close}),
+                "version": view.version + 1,
+            })
+        elif command.kind == "snooze":
+            if not view.active_reminder or (view.draft.expires_at and now >= view.draft.expires_at):
+                return reject(ErrorCode.INVALID_TRANSITION, "only a registered task can be snoozed")
+            if snoozed_at is not None and snoozed_at > now:
+                return reject(ErrorCode.INVALID_ARGUMENT, "snooze event time cannot be in the future")
+            snoozed_at = snoozed_at or now
+            try:
+                target = snoozed_at + timedelta(seconds=seconds)
                 old = view.draft
                 if (mode == "legacy" and old.earliest_at is not None
                         and old.latest_first_delivery_at is not None):
                     bounds = {"earliest_at": target, "latest_first_delivery_at":
                               target + (old.latest_first_delivery_at - old.earliest_at)}
                 else:
-                    early = target - timedelta(seconds=min(60, seconds / 3))
+                    before = command.payload.get("window_before_s")
+                    after = command.payload.get("window_after_s")
+                    if mode == "flexible_target" and old.target_at is not None:
+                        if before is None and old.window_open_at is not None:
+                            before = min(seconds / 3, max(0, (old.target_at - old.window_open_at).total_seconds()))
+                        if after is None and old.window_close_at is not None:
+                            after = min(seconds / 3, max(0, (old.window_close_at - old.target_at).total_seconds()))
                     bounds = {"mode": "hard" if mode == "exact" else "soft", "latest_first_delivery_at": None,
-                              "earliest_at": None, "window_close_at": None,
-                              "window_open_at": early if mode in ("legacy", "flexible_target") else None,
-                              "window_computed_at": now if mode in ("legacy", "flexible_target") else None,
+                              "earliest_at": None,
+                              "window_close_at": target + timedelta(seconds=after) if after else None,
+                              "window_open_at": target - timedelta(seconds=before) if before else None,
+                              "window_computed_at": now if before or after else None,
                               "remind_after": target if mode in ("exact", "no_earlier") else None,
                               "target_at": target if mode in ("legacy", "flexible_target", "exact") else None,
                               "remind_by": target if mode == "exact" else None}
+                if old.urgency_until and old.urgency_until <= target:
+                    bounds.update(urgency_until=None, urgency_reason=None)
                 draft = TaskDraft.model_validate(old.model_dump() | bounds)
             except OverflowError:
                 return reject(ErrorCode.INVALID_ARGUMENT, "snooze exceeds supported datetime range")
@@ -210,26 +276,67 @@ class MemoryTaskService:
                 return reject(ErrorCode.INVALID_ARGUMENT, str(exc))
             updated = view.model_copy(update={"draft": draft, "version": view.version+1,
                                                "occurrence": view.occurrence+1, "displayed_at": None,
-                                               "acknowledged_at": None})
+                                               "rule_version": view.rule_version+1, "last_snoozed_at": snoozed_at,
+                                               "occurrence_rule_version": view.rule_version+1,
+                                               "acknowledged_at": None, "expired_at": None})
         elif command.kind == "ack":
-            if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
+            if not view.active_reminder or (view.draft.expires_at and now >= view.draft.expires_at):
                 return reject(ErrorCode.INVALID_TRANSITION, "only an active reminder can be acknowledged")
             updated = view.model_copy(update={"version": view.version+1, "acknowledged_at": now,
                                               "status": "completed" if view.draft.item_type == "reminder" else "registered"})
         elif command.kind == "cancel":
-            updated = view.model_copy(update={"status": "cancelled", "version": view.version+1})
+            updated = view.model_copy(update={"status": "cancelled", "version": view.version+1,
+                                              "issue_status": "cancelled" if view.draft.item_type == "issue" else None})
         elif command.kind == "complete":
             if view.status != "registered":
                 return reject(ErrorCode.INVALID_TRANSITION, "only a registered task can be completed")
-            updated = view.model_copy(update={"status": "completed", "version": view.version+1})
+            updated = view.model_copy(update={"status": "completed", "version": view.version+1,
+                                              "issue_status": "completed" if view.draft.item_type == "issue" else None})
+        elif command.kind == "set_status":
+            status = command.payload["status"]
+            allowed = ("created", "in_progress", "paused", "completed", "cancelled")
+            if view.draft.item_type != "issue" or status not in allowed or status == view.effective_issue_status:
+                return reject(ErrorCode.INVALID_TRANSITION, "invalid issue status transition")
+            if view.status in {"completed", "cancelled"}:
+                if status != "created":
+                    return reject(ErrorCode.INVALID_TRANSITION, "reopen the issue before changing its status")
+                draft = TaskDraft(content=view.draft.content, description=view.draft.description,
+                                  item_type="issue", reminder_enabled=False, due_at=view.draft.due_at,
+                                  timezone=view.draft.timezone)
+                updated = view.model_copy(update={"draft": draft, "status": "registered", "issue_status": status,
+                                                  "version": view.version+1, "rule_version": view.rule_version+1,
+                                                  "occurrence_rule_version": None,
+                                                  "occurrence": view.occurrence+1, "displayed_at": None,
+                                                  "acknowledged_at": None, "expired_at": None, "last_snoozed_at": None})
+            else:
+                updated = view.model_copy(update={"issue_status": status, "version": view.version+1,
+                                                  "status": status if status in {"completed", "cancelled"} else view.status})
+        elif command.kind == "archive":
+            status = "completed" if view.status == "completed" else "cancelled"
+            updated = view.model_copy(update={"archived_at": now, "status": status, "version": view.version+1,
+                                              "issue_status": status if view.draft.item_type == "issue" else None})
         else:  # Defensive for non-validated callers; normal TaskCommand rejects unknown kinds.
             return reject(ErrorCode.INVALID_ARGUMENT, "unknown command")
 
+        rule_closed = view is not None and view.active_reminder and (
+            not updated.active_reminder or updated.occurrence != view.occurrence)
+        if (rule_closed and updated.status in {"completed", "cancelled"}
+                and updated.draft.item_type == "issue"):
+            updated = updated.model_copy(update={
+                "rule_version": view.rule_version + 1,
+                "occurrence_rule_version": view.occurrence_rule_version or view.rule_version,
+            })
+        updated = updated.model_copy(update={"updated_at": now})
         self._tasks[command.task_id] = updated
-        if command.kind in {"edit", "snooze", "ack", "cancel", "complete"}:
+        if command.kind in {"edit", "configure", "estimate_window", "snooze", "ack", "cancel", "complete", "archive", "set_status"}:
+            recheck = self._rechecks.get(command.task_id)
             self._invalidate_pending(command.task_id)
-        kind = {"create": "created", "confirm": "confirmed", "edit": "edited",
-                "snooze": "snoozed", "ack": "acknowledged", "cancel": "cancelled", "complete": "completed"}[command.kind]
+            if recheck and not rule_closed and updated.active_reminder:
+                self._rechecks[command.task_id] = (updated.version, *recheck[1:])
+        kind = {"create": "created", "create_registered": "created", "confirm": "confirmed", "edit": "edited",
+                "configure": "edited", "estimate_window": "window_estimated",
+                "snooze": "snoozed", "ack": "acknowledged", "cancel": "cancelled", "complete": "completed",
+                "archive": "archived", "set_status": "status_changed"}[command.kind]
         self.emit(f"task.{kind}", task_id=updated.task_id, task_version=updated.version,
                   payload={"command_id": command.command_id, "status": updated.status,
                            "occurrence": updated.occurrence})
@@ -282,7 +389,7 @@ class MemoryTaskService:
             return ErrorCode.CANCELLED
         if envelope.task_version != view.version:
             return ErrorCode.STALE_TASK
-        if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
+        if not view.active_reminder:
             return ErrorCode.INVALID_TRANSITION
         now = self.clock.wall_now()
         if now >= envelope.expires_at:
@@ -529,8 +636,14 @@ class MemoryTaskService:
                     self.emit("recheck.fired", task_id=task_id, task_version=version,
                               request_id=request_id, payload={"run_at": run_at.isoformat()})
         for view in sorted(self._tasks.values(), key=lambda v: (v.draft.opens_at or now, v.task_id)):
-            if (view.status != "registered" or view.displayed_at is not None or view.acknowledged_at is not None
-                    or not view.draft.reminder_enabled or (view.draft.expires_at and now >= view.draft.expires_at)
+            if view.active_reminder and view.draft.expires_at and now >= view.draft.expires_at:
+                self._tasks[view.task_id] = view.model_copy(update={
+                    "expired_at": view.draft.expires_at, "updated_at": now, "version": view.version+1,
+                })
+                self._invalidate_pending(view.task_id)
+                self.emit("task.expired", task_id=view.task_id, task_version=view.version+1)
+                continue
+            if (not view.active_reminder or view.displayed_at is not None
                     or (view.task_id, view.occurrence) in self._external_owner):
                 continue
             deadline = view.draft.hard_deadline
@@ -545,6 +658,8 @@ class MemoryTaskService:
                     self._dispatch(attempt)
                     continue
                 if self.enforce_opportunities and attempt.command.reason in {"opportunity", "tool"}:
+                    if not self.auto_opportunity:
+                        continue
                     obs = self._observation
                     if (self._focus_running or not self._available()
                             or (view.draft.window_close_at is not None and now >= view.draft.window_close_at)):

@@ -15,6 +15,7 @@ import psutil
 from pydantic import ValidationError
 
 from deskpet.contracts import ErrorCode, SessionCommand, SessionResult, WorkSession
+from deskpet.task_service.sqlite import read_task, task_table_exists, transition_issue_for_interval
 
 from .models import (
     AdjustInput, CreditRecoveryInput, CreditSleepInput, DetailsInput, FocusInterval, HabitRun,
@@ -92,6 +93,9 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS phase_recovery (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL REFERENCES phase_views(id), interval TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS phase_sleeping_break (
+        phase_id TEXT PRIMARY KEY REFERENCES phase_views(id), started_at TEXT NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS phase_defaults (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         focus_s REAL NOT NULL, break_s REAL NOT NULL, link_issues INTEGER NOT NULL
@@ -115,6 +119,7 @@ class PersistentWorkSessionService:
         self._closed = False
         self._sleeping = False
         self._pending_sleep_recovery: str | None = None
+        self.on_focus_released = None
         defaults = self._validate_defaults(default_focus_s, default_break_s)
         if path != ":memory:":
             path = Path(path).expanduser()
@@ -215,11 +220,15 @@ class PersistentWorkSessionService:
         row = db.execute("SELECT id FROM phase_views ORDER BY rowid DESC LIMIT 1").fetchone()
         return row[0] if row else None
 
-    @staticmethod
-    def _save(db, phase, *, active):
+    def _save(self, db, phase, *, active):
+        callback = self.on_focus_released
+        previous = (self._active(db) if callback is not None and phase.kind == "focus"
+                    and (not active or phase.state != "running") else None)
         db.execute("""INSERT INTO phase_views VALUES (?, ?, ?)
                       ON CONFLICT(id) DO UPDATE SET active=excluded.active, view=excluded.view""",
                    (phase.id, active, phase.model_dump_json()))
+        if previous and previous.id == phase.id and previous.state == "running":
+            callback(phase.id, phase.version, db=db)
         return phase
 
     @staticmethod
@@ -272,6 +281,7 @@ class PersistentWorkSessionService:
             id=uuid4().hex, phase_id=phase.id, started_at=tick.wall,
             primary_issue_id=phase.primary_issue_id, origin=phase.source,
         ))
+        transition_issue_for_interval(db, phase.primary_issue_id, opened=True, now=tick.wall)
         self._save_checkpoint(db, phase, tick)
 
     def _update_interval(self, db, phase_id, delta=0, *, close=False):
@@ -283,7 +293,20 @@ class PersistentWorkSessionService:
                 "ended_at": interval.started_at + timedelta(seconds=seconds) if close else None,
             })
             self._store_interval(db, interval)
+            if close:
+                transition_issue_for_interval(db, interval.primary_issue_id, opened=False, now=self._tick().wall)
         return interval
+
+    @staticmethod
+    def _validate_issue_links(db, issue_ids, *, historical=False):
+        if not issue_ids or not task_table_exists(db):
+            return
+        for issue_id in issue_ids:
+            issue = read_task(db, issue_id)
+            if issue is None:
+                raise Rejected(ErrorCode.NOT_FOUND)
+            if issue.draft.item_type != "issue" or (not historical and issue.status != "registered"):
+                raise Rejected(ErrorCode.INVALID_TRANSITION)
 
     def _refresh(self, db, tick, *, force=False, allow_automatic=True):
         allow_automatic = allow_automatic and not self._sleeping
@@ -297,7 +320,12 @@ class PersistentWorkSessionService:
             elapsed = phase.model_copy(update={"state": "elapsed", "remaining_s": 0,
                 "ended_at": phase.phase_due_at, "phase_due_at": None, "version": phase.version + 1})
             self._save(db, elapsed, active=False)
-            successor = self._automatic_follow_on(db, elapsed, tick) if allow_automatic else None
+            # A different timer may reach this break's deadline before the power
+            # event recipient processes wake.
+            slept_through_break = db.execute(
+                "DELETE FROM phase_sleeping_break WHERE phase_id=?", (phase.id,),
+            ).rowcount > 0
+            successor = self._automatic_follow_on(db, elapsed, tick) if allow_automatic and not slept_through_break else None
             if successor is None:
                 self._change_run_state(db, elapsed, "paused")
             return successor
@@ -359,13 +387,19 @@ class PersistentWorkSessionService:
         with self._write() as db:
             tick = self._tick()
             phase = self._refresh(db, tick, force=True, allow_automatic=False)
-            if phase and phase.kind == "focus" and phase.state == "running":
+            if phase is None or phase.state != "running":
+                return
+            if phase.kind == "focus":
                 self._interrupt(db, phase, self._checkpoint(db, phase.id), tick, origin="sleep")
+            else:
+                db.execute("INSERT OR IGNORE INTO phase_sleeping_break VALUES (?, ?)",
+                           (phase.id, tick.wall.isoformat()))
 
     def record_wake(self):
         with self._write() as db:
             tick = self._tick()
             self._refresh(db, tick, allow_automatic=False)
+            db.execute("DELETE FROM phase_sleeping_break")
             for interval in self._list_recovery(db):
                 if interval.origin == "sleep" and interval.observed_until_at is None:
                     observed = max(tick.wall, interval.started_at)
@@ -408,10 +442,20 @@ class PersistentWorkSessionService:
             raise ValueError("a write transaction is required to resolve the active phase")
         return self._refresh(db, self._tick())
 
-    def get_phase(self, phase_id):
-        with self._write() as db:
-            active = self._refresh(db, self._tick())
-            return active if active and active.id == phase_id else self._get(db, phase_id)
+    def get_phase(self, phase_id, *, db=None):
+        if db is None:
+            with self._write() as owned_db:
+                return self.get_phase(phase_id, db=owned_db)
+        active = self.current_phase_in_transaction(db)
+        return active if active and active.id == phase_id else self._get(db, phase_id)
+
+    def get_focus_interval(self, interval_id, *, db):
+        row = db.execute("SELECT interval FROM phase_intervals WHERE id=?", (interval_id,)).fetchone()
+        return FocusInterval.model_validate_json(row[0]) if row else None
+
+    def get_recovery_interval(self, interval_id, *, db):
+        row = db.execute("SELECT interval FROM phase_recovery WHERE id=?", (interval_id,)).fetchone()
+        return RecoveryInterval.model_validate_json(row[0]) if row else None
 
     def list_phases(self):
         with self._write() as db:
@@ -483,15 +527,23 @@ class PersistentWorkSessionService:
 
     def apply_phase(self, command: PhaseCommand) -> PhaseResult:
         with self._write() as db:
-            tick = self._tick()
-            result = self._apply(db, command, tick)
+            result = self.apply_phase_in_transaction(db, command)
+        self.emit_phase_result(command, result)
+        return result
+
+    def emit_phase_result(self, command, result):
         self.emit("session." + result.status, session_id=command.phase_id, payload={
             "command_id": command.command_id, "kind": command.kind,
             "version": result.view.version if result.view else None,
             "state": result.view.state if result.view else None,
             "error_code": result.error_code.value if result.error_code else None,
         })
-        return result
+
+    def apply_phase_in_transaction(self, db, command: PhaseCommand) -> PhaseResult:
+        """Commit a phase command with the caller's authorization and receipt."""
+        if not db.in_transaction:
+            raise ValueError("a write transaction is required to apply a phase command")
+        return self._apply(db, command, self._tick())
 
     def _apply(self, db, command, tick, *, automatic=False):
         fingerprint = json.dumps(command.model_dump(mode="json"), sort_keys=True,
@@ -552,6 +604,7 @@ class PersistentWorkSessionService:
             links = LinksInput.model_validate(command.payload)
             if current.kind != "focus" or (links.issue_links and not self._defaults(db)["link_issues"]):
                 raise Rejected(ErrorCode.INVALID_TRANSITION)
+            self._validate_issue_links(db, links.issue_links)
             return self._set_links(db, current, links, tick)
         if command.kind == "end":
             return self._end(db, current, ReviewInput.model_validate(command.payload), tick)
@@ -579,6 +632,7 @@ class PersistentWorkSessionService:
         defaults = self._defaults(db)
         if args.issue_links and not defaults["link_issues"]:
             raise Rejected(ErrorCode.INVALID_TRANSITION)
+        self._validate_issue_links(db, args.issue_links)
         habit, run = self._habit_for_start(db, args, previous, command.source)
         duration = args.planned_duration_s
         if habit:
@@ -669,6 +723,8 @@ class PersistentWorkSessionService:
             raise Rejected(ErrorCode.INVALID_ARGUMENT)
         self._update_interval(db, phase.id, close=True)
         db.execute("DELETE FROM phase_checkpoints WHERE phase_id=?", (phase.id,))
+        if phase.kind != "focus":
+            db.execute("DELETE FROM phase_sleeping_break WHERE phase_id=?", (phase.id,))
         if review.count_as_completed:
             self._count_habit_completion(db, phase)
         self._change_run_state(db, phase, "paused" if skipped_break or review.count_as_completed else "ended")
@@ -777,6 +833,8 @@ class PersistentWorkSessionService:
             raise Rejected(ErrorCode.INVALID_TRANSITION)
         if args.target_issue_id is not None and not args.target_issue_id.strip():
             raise Rejected(ErrorCode.INVALID_ARGUMENT)
+        if args.target_issue_id is not None:
+            self._validate_issue_links(db, (args.target_issue_id,), historical=True)
         self._store_interval(db, interval.model_copy(update={
             "primary_issue_id": args.target_issue_id, "version": interval.version + 1,
         }))

@@ -5,11 +5,13 @@ import math
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from PyQt6.QtCore import QDateTime, Qt, pyqtSignal
+from PyQt6.QtCore import QDateTime, Qt, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDateTimeEdit, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
 )
+
+from deskpet.timezones import resolve_timezone
 
 
 STATES = {"focusing": "专注中", "paused": "已暂停", "break_due": "本轮时间到", "ended": "已结束"}
@@ -297,10 +299,11 @@ PHASE_STATES = {
 class PhasePanel(QGroupBox):
     """The desktop timer, driven by acknowledged actions and the shared phase view."""
 
-    def __init__(self, *, submit, parent=None):
+    def __init__(self, *, submit, timezone=None, parent=None):
         super().__init__("专注与回顾", parent)
         self.setObjectName("phase-panel")
         self.submit = submit
+        self.zone = resolve_timezone(timezone) if timezone is not None else None
         self.snapshot = {}
         self.pending = None
         self._duration_edited = False
@@ -405,7 +408,9 @@ class PhasePanel(QGroupBox):
         self.credit_start = QDateTimeEdit(QDateTime.currentDateTime())
         self.credit_end = QDateTimeEdit(QDateTime.currentDateTime())
         for text, editor in (("开始", self.credit_start), ("结束", self.credit_end)):
-            editor.setDisplayFormat("MM-dd HH:mm:ss")
+            editor.setDisplayFormat("MM-dd HH:mm:ss" + (" ttt" if self.zone is not None else ""))
+            if self.zone is not None:
+                editor.setTimeZone(QTimeZone(self.zone.key.encode("ascii")))
             editor.setAccessibleName(text)
             row = QHBoxLayout()
             row.addWidget(label(text))
@@ -570,7 +575,7 @@ class PhasePanel(QGroupBox):
             blocked = self.review_intervals.blockSignals(True)
             self.review_intervals.clear()
             for interval in intervals:
-                started = datetime.fromisoformat(interval["started_at"]).astimezone()
+                started = datetime.fromisoformat(interval["started_at"]).astimezone(self.zone)
                 self.review_intervals.addItem(
                     f"{started:%m-%d %H:%M:%S} · {duration_text(interval['seconds'])}", interval)
                 if selected and selected["id"] == interval["id"]:
@@ -603,8 +608,12 @@ class PhasePanel(QGroupBox):
             start = datetime.fromisoformat(item["started_at"])
             end = min(datetime.fromisoformat(item["observed_until_at"]),
                       start + timedelta(seconds=phase["remaining_s"]))
-            self.credit_start.setDateTime(QDateTime.fromMSecsSinceEpoch(math.ceil(start.timestamp() * 1000)))
-            self.credit_end.setDateTime(QDateTime.fromMSecsSinceEpoch(math.floor(end.timestamp() * 1000)))
+            self.credit_start.setDateTime(QDateTime.fromMSecsSinceEpoch(
+                math.ceil(start.timestamp() * 1000), self.credit_start.timeZone(),
+            ))
+            self.credit_end.setDateTime(QDateTime.fromMSecsSinceEpoch(
+                math.floor(end.timestamp() * 1000), self.credit_end.timeZone(),
+            ))
         self._recovery_target = key
 
     def _command(self, action):

@@ -134,9 +134,16 @@ class DesktopPresentation(QObject):
     def _submit_os(self, task, due_at, *, sound):
         now = self.now()
         delivery_id = self._delivery_id(task)
-        if any(row["delivery_id"] == delivery_id and row["state"] != "unavailable" for row in self.rows):
-            return
         identifier = notification_id(delivery_id)
+        if sound:
+            deadline = task.draft.hard_deadline
+            sound = not any(
+                row["delivery_id"] != delivery_id and row["deadline"] and deadline is not None
+                and datetime.fromisoformat(row["deadline"]) == deadline
+                and row["state"] in {"submitting", "scheduled", "submitted", "delivered", "unknown",
+                                     "cancel_intent", "cancelling", "painted", "grouped"}
+                for row in self.ledger.rows()
+            )
         if not self.ledger.prepare_os(task, delivery_id, identifier, now):
             return
 
@@ -163,6 +170,9 @@ class DesktopPresentation(QObject):
 
     def soft_valid(self, command):
         if command.reason not in {"opportunity", "tool"} or self.ledger is None:
+            return True
+        if self.ledger.authorize_early is not None:
+            # The ledger checks current authority under the same transaction as the permit.
             return True
         if self.observations is None:
             return False
@@ -224,13 +234,13 @@ class DesktopPresentation(QObject):
 
     def _apply_inventory(self, now, rows, pending, delivered):
         self._in_progress = False
-        active = {(item.task_id, item.version, item.occurrence) for item in self._active_tasks()
+        active = {(item.task_id, item.occurrence, item.draft.hard_deadline) for item in self._active_tasks()
                   if item.draft.expires_at is None or now < item.draft.expires_at}
         enabled = bool(self.settings.get("allow_system_notifications"))
         for row in rows:
             delivery, identifier, state = row["delivery_id"], row["os_id"], row["state"]
             due = datetime.fromisoformat(row["deadline"]) if row["deadline"] else None
-            live = (row["task_id"], row["task_version"], row["occurrence"]) in active
+            live = (row["task_id"], row["occurrence"], due) in active
             if delivered is not None and identifier in delivered:
                 self.ledger.update(delivery, {state}, "delivered", now)
             elif pending is not None and identifier in pending:

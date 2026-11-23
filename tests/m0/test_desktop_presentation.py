@@ -216,6 +216,37 @@ def test_hidden_deadline_reports_permission_failure_and_unknown_after_acceptance
         assert not tasks.get(task.task_id).displayed_at and not tasks.get(task.task_id).acknowledged_at
 
 
+def test_hidden_deadline_retries_known_failure_with_same_platform_id(business):
+    clock, delivery, tasks = business
+
+    class RejectedOnce(NotificationProbe):
+        def submit(self, identifier, due_at, *, sound, complete):
+            if not self.submissions:
+                self.submissions.append((identifier, due_at, sound))
+                complete("failed", "synthetic platform rejection")
+            else:
+                super().submit(identifier, due_at, sound=sound, complete=complete)
+
+    notifications = RejectedOnce()
+    notifications.can_schedule = False
+    register(tasks, clock, mode="hard", due=0)
+    tasks.pump()
+    presenter = DesktopPresentation(path=tasks.path, notifications=notifications,
+                                    lock_probe=lambda: True, synthetic=True)
+    presenter.observe(snapshot(clock, tasks, allow_system_notifications=True, reminder_sound=True))
+    presenter.route_hidden(delivery.commands[-1])
+    assert presenter.ledger.rows()[0]["state"] == "failed"
+    presenter.route_hidden(delivery.commands[-1])
+    assert len(notifications.submissions) == 1
+    clock.advance(5)
+    tasks.pump()
+    presenter.observe(snapshot(clock, tasks, allow_system_notifications=True, reminder_sound=True))
+    presenter.route_hidden(delivery.commands[-1])
+    assert presenter.ledger.rows()[0]["state"] == "submitted"
+    assert len(notifications.submissions) == 2
+    assert notifications.submissions[0][0] == notifications.submissions[1][0]
+
+
 def test_estimated_target_does_not_create_a_hard_fallback(business):
     clock, delivery, tasks = business
     target = clock.wall_now() + timedelta(minutes=5)

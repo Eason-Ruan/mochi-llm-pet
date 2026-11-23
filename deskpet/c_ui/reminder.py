@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from functools import partial
 from uuid import uuid4
 
-from PyQt6.QtCore import QDateTime, QSignalBlocker, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QDateTime, QSignalBlocker, Qt, QTimer, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDateTimeEdit, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from deskpet.contracts import TaskDraft
+from deskpet.timezones import resolve_timezone
 from .work_panel import label
-from .time_format import ZONE, ZONE_NAME, format_time, local_time
+from .time_format import ZONE_NAME, format_time, local_time
 
 ERRORS = {
     "STALE_TASK": "事项已更新，请查看最新安排后重试。",
@@ -23,45 +25,60 @@ ERRORS = {
 }
 
 
-def display_time(value, reference=None):
-    return format_time(value, reference)
+def display_time(value, reference=None, *, zone=None):
+    return format_time(value, reference, zone=zone)
 
 
-def schedule_text(draft, reference=None):
+def schedule_text(draft, reference=None, *, zone=None):
+    show_time = partial(display_time, reference=reference, zone=zone)
     start = draft.get("remind_after") or draft.get("earliest_at")
     deadline = draft.get("remind_by") or draft.get("latest_first_delivery_at")
     parts = []
     if not draft.get("reminder_enabled", True):
         parts.append("未设置提醒")
     elif draft["mode"] == "hard" and deadline:
-        parts.append("准点提醒 " + display_time(deadline, reference))
+        parts.append("准点提醒 " + show_time(deadline))
     elif draft.get("latest_first_delivery_at") and draft.get("earliest_at") and not draft.get("remind_by"):
-        parts.append("柔性提醒窗口 " + display_time(start, reference) + " 至 " + display_time(deadline, reference))
+        parts.append("柔性提醒窗口 " + show_time(start) + " 至 " + show_time(deadline))
     else:
         parts.append("择机提醒")
         for title, value in (("最早", draft.get("remind_after")), ("目标", draft.get("target_at")), ("最迟", deadline)):
             if value:
-                parts.append(title + " " + display_time(value, reference))
+                parts.append(title + " " + show_time(value))
+        estimate_start = draft.get("window_open_at")
+        estimate_end = draft.get("window_close_at")
+        if estimate_start and estimate_end:
+            opened = max(datetime.fromisoformat(value) for value in (estimate_start, start) if value)
+            closed = min(datetime.fromisoformat(value) for value in (estimate_end, deadline, draft.get("expires_at")) if value)
+            parts.append("预计在 " + show_time(opened) + " 至 " + show_time(closed) + " 找空档提醒")
     for title, key in (("提醒失效", "expires_at"), ("事项截止", "due_at")):
         if draft.get(key):
-            parts.append(title + " " + display_time(draft[key], reference))
+            parts.append(title + " " + show_time(draft[key]))
     return "\n".join(parts)
 
 
 def task_status(view):
+    if view.get("archived_at"):
+        return "已归档"
+    issue = view["draft"].get("item_type") == "issue"
+    issue_label = {"created": "事项待开始", "in_progress": "事项进行中", "paused": "事项已暂停"}
     if view["status"] == "registered":
-        if view.get("acknowledged_at"):
-            return "已确认收到，事项进行中"
-        if not view["draft"].get("reminder_enabled", True):
-            return "事项进行中"
-        return "已提醒，待处理" if view["displayed_at"] else "已确认，等待提醒"
+        reminder = ""
+        if view.get("expired_at"):
+            reminder = "提醒已失效"
+        elif view.get("acknowledged_at"):
+            reminder = "已确认收到"
+        elif view["draft"].get("reminder_enabled", True):
+            reminder = "已提醒，待处理" if view["displayed_at"] else "等待提醒"
+        result = issue_label.get(view.get("issue_status"), "事项待开始") if issue else ""
+        return " · ".join(part for part in (result, reminder) if part)
     return {"draft": "草稿，待确认", "completed": "已完成", "cancelled": "已取消"}[view["status"]]
 
 
 class OptionalTime(QWidget):
     changed = pyqtSignal()
 
-    def __init__(self, *, required=False):
+    def __init__(self, *, required=False, timezone=None):
         super().__init__()
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -70,23 +87,32 @@ class OptionalTime(QWidget):
         self.enabled.setVisible(not required)
         row.addWidget(self.enabled)
         self.editor = QDateTimeEdit(calendarPopup=True)
-        self.editor.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.editor.setDisplayFormat("yyyy-MM-dd HH:mm:ss" + (" ttt" if timezone is not None else ""))
+        self.set_timezone(timezone)
         self.editor.setEnabled(required)
         row.addWidget(self.editor, 1)
         self.enabled.toggled.connect(self.editor.setEnabled)
         self.enabled.toggled.connect(self.changed)
         self.editor.dateTimeChanged.connect(self.changed)
 
+    def set_timezone(self, timezone):
+        self.zone = resolve_timezone(timezone or ZONE_NAME)
+        with QSignalBlocker(self.editor):
+            self.editor.setTimeZone(QTimeZone(self.zone.key.encode("ascii")))
+
     def load(self, value, default, *, required=False):
-        local = local_time(value or default).replace(tzinfo=None)
+        local = local_time(value or default, zone=self.zone.key)
         with QSignalBlocker(self.editor), QSignalBlocker(self.enabled):
-            self.editor.setDateTime(QDateTime(local))
+            self.editor.setDateTime(QDateTime.fromMSecsSinceEpoch(
+                round(local.timestamp() * 1000), self.editor.timeZone(),
+            ))
             self.enabled.setChecked(required or value is not None)
             self.editor.setEnabled(self.enabled.isChecked())
 
     def value(self):
-        return (self.editor.dateTime().toPyDateTime().replace(tzinfo=ZONE).isoformat()
-                if self.enabled.isChecked() else None)
+        if self.enabled.isChecked():
+            return datetime.fromtimestamp(self.editor.dateTime().toMSecsSinceEpoch() / 1000, self.zone).isoformat()
+        return None
 
 
 class GroupTitle(QLabel):
@@ -113,10 +139,11 @@ class ReminderPanel(QGroupBox):
     actions_changed = pyqtSignal()
     edit_opened = pyqtSignal()
 
-    def __init__(self, *, submit, advanced=False, parent=None):
+    def __init__(self, *, submit, advanced=False, timezone=None, parent=None):
         super().__init__("提醒事项", parent)
         self.submit = submit
         self.advanced = advanced
+        self.timezone = timezone
         self.snapshot = {}
         self.pending = {}
         self._editing = None
@@ -148,6 +175,9 @@ class ReminderPanel(QGroupBox):
         self.window.setSuffix(" 秒")
         form.addRow("标题", self.content)
         if advanced:
+            self.description = QLineEdit()
+            self.description.setMaxLength(4000)
+            form.addRow("说明", self.description)
             self.item_type = QComboBox()
             self.item_type.addItem("纯提醒", "reminder")
             self.item_type.addItem("工作事项", "issue")
@@ -158,7 +188,7 @@ class ReminderPanel(QGroupBox):
         if advanced:
             for key, title in (("exact", "准点时间"), ("remind_after", "最早提醒"), ("target_at", "目标时间"),
                                ("remind_by", "最迟提醒"), ("expires_at", "提醒失效"), ("due_at", "事项截止")):
-                editor = OptionalTime(required=key == "exact")
+                editor = OptionalTime(required=key == "exact", timezone=self.timezone)
                 self.times[key] = editor
                 form.addRow(title, editor)
                 editor.changed.connect(self._refresh_controls)
@@ -204,6 +234,7 @@ class ReminderPanel(QGroupBox):
         buttons = [("confirm", "确认"), ("done", "标记完成"), ("edit", "修改安排"), ("cancel", "取消")]
         if advanced:
             buttons.insert(1, ("ack", "确认收到"))
+            buttons.extend((("archive", "归档"), ("reopen", "重开事项")))
         for index, (kind, title) in enumerate(buttons):
             button = QPushButton(title)
             button.setObjectName(f"c-reminder-{kind}")
@@ -257,10 +288,12 @@ class ReminderPanel(QGroupBox):
         if self._edit_original is not None and self._edit_timing is not None:
             editable_fields = {"due_at"} if self.advanced else set()
             if all(timing[key] == self._edit_timing.get(key) for key in timing.keys() - editable_fields):
-                updates = {key: timing[key] for key in editable_fields}
+                updates = {key: timing[key] for key in editable_fields if timing[key] != self._edit_timing.get(key)}
+                if self.advanced:
+                    updates["description"] = self.description.text().strip() or None
                 return {"draft": self._edit_original | updates | {"content": content}}
         if self.advanced:
-            return {"draft": {"content": content, **timing}}
+            return {"draft": {"content": content, "description": self.description.text().strip() or None, **timing}}
         return {"content": content, **timing}
 
     def _timing_input(self):
@@ -269,8 +302,9 @@ class ReminderPanel(QGroupBox):
             return {"mode": mode, "delay_s": self.delay.value(), "window_s": self.window.value()}
         values = {key: editor.value() for key, editor in self.times.items()}
         item_type = self.item_type.currentData()
-        draft = {"mode": "hard" if mode == "hard" else "soft", "item_type": item_type,
-                 "timezone": ZONE_NAME, "reminder_enabled": mode != "none",
+        timezone = (self._edit_original or {}).get("timezone", self.timezone or ZONE_NAME)
+        draft = {"mode": "hard" if mode == "hard" else "soft", "item_type": item_type, "timezone": timezone,
+                 "reminder_enabled": mode != "none",
                  "due_at": values["due_at"] if item_type == "issue" else None}
         if mode == "hard":
             draft.update(remind_after=values["exact"], target_at=values["exact"], remind_by=values["exact"],
@@ -295,7 +329,9 @@ class ReminderPanel(QGroupBox):
             self.result.setText("事项已更新或操作尚未完成，请查看最新安排。")
             return None
         try:
-            event_id = self.submit(f"reminder.{kind}", task_id=task_id, version=version, payload=payload or {})
+            action = "set_status" if kind == "reopen" else kind
+            event_id = self.submit(f"reminder.{action}", task_id=task_id, version=version,
+                                   payload={"status": "created"} if kind == "reopen" else payload or {})
         except (RuntimeError, ValueError) as exc:
             self.result.setText(f"暂时无法提交：{exc}。输入已保留。")
             return None
@@ -322,7 +358,10 @@ class ReminderPanel(QGroupBox):
         self._editing = (task_id, view["version"])
         draft = view["draft"]
         self._edit_original = draft.copy()
+        self._edit_timing = None
         self.content.setText(draft["content"])
+        if self.advanced:
+            self.description.setText(draft.get("description") or "")
         mode = draft["mode"] if draft.get("reminder_enabled", True) else "none"
         self.mode.setCurrentIndex(max(0, self.mode.findData(mode)))
         now = datetime.fromisoformat(self.snapshot["now"])
@@ -337,6 +376,7 @@ class ReminderPanel(QGroupBox):
                 "remind_by": deadline,
             }
             for key, editor in self.times.items():
+                editor.set_timezone(self._display_zone(draft))
                 editor.load(values.get(key), now + timedelta(minutes=5), required=key == "exact")
         else:
             earliest = datetime.fromisoformat(start) if start else now
@@ -357,6 +397,8 @@ class ReminderPanel(QGroupBox):
         self._editing = None
         self._edit_original = None
         self._edit_timing = None
+        for editor in self.times.values():
+            editor.set_timezone(self.timezone)
         self.edit_note.setText("")
         self._refresh_controls()
 
@@ -369,7 +411,8 @@ class ReminderPanel(QGroupBox):
         if success:
             self._select_next = pending["task_id"]
             titles = {"create": "草稿已创建，请核对时间后确认。", "confirm": "安排已确认。", "done": "事项已完成。", "ack": "已记录确认收到。",
-                      "snooze": "已延后，请查看新的提醒时间。", "edit": "安排已更新。", "cancel": "提醒已取消。"}
+                      "snooze": "已延后，请查看新的提醒时间。", "edit": "安排已更新。", "cancel": "事项已取消。",
+                      "archive": "已归档。", "reopen": "事项已重开，可重新设置提醒。"}
             self.result.setText(titles[pending["kind"]])
             if pending["kind"] == "edit":
                 self._cancel_edit()
@@ -381,6 +424,8 @@ class ReminderPanel(QGroupBox):
     def render_snapshot(self, snapshot):
         self.snapshot = snapshot
         views = snapshot.get("tasks", [])
+        if self.advanced:
+            views = [view for view in views if not view.get("archived_at")]
         if self._delivery_group is not None:
             views = [view for view in views if view["task_id"] in self._delivery_group]
         rows = [(v["task_id"], v["version"], v["displayed_at"], self._delivery_note(v)) for v in views]
@@ -421,7 +466,9 @@ class ReminderPanel(QGroupBox):
                 self.detail_title.subject = None
         detail = "尚无事项。创建草稿后，请核对时间并确认。"
         if view:
-            lines = [self._delivery_note(view) or task_status(view), schedule_text(view["draft"], self.snapshot.get("now"))]
+            lines = [self._delivery_note(view) or task_status(view), self._schedule(view["draft"])]
+            if view["draft"].get("description"):
+                lines.insert(1, view["draft"]["description"])
             if not self.advanced:
                 lines.insert(0, view["draft"]["content"])
             detail = "\n".join(lines)
@@ -443,6 +490,17 @@ class ReminderPanel(QGroupBox):
     def _delivery_note(self, view):
         return self.snapshot.get("presentation_pending", {}).get(view["task_id"], "")
 
+    def _display_zone(self, draft):
+        return draft.get("timezone", self.timezone) if self.timezone is not None else None
+
+    def _schedule(self, draft):
+        return schedule_text(draft, self.snapshot.get("now"), zone=self._display_zone(draft))
+
+    def _snooze_time(self, seconds, view):
+        now = datetime.fromisoformat(self.snapshot["now"])
+        zone = self._display_zone(view["draft"]) if view else self.timezone
+        return display_time(now + timedelta(seconds=seconds), now, zone=zone)
+
     def _refresh_controls(self):
         ready = bool(self.snapshot)
         view = self.selected()
@@ -453,6 +511,7 @@ class ReminderPanel(QGroupBox):
         if self.advanced:
             mode = self.mode.currentData()
             issue = self.item_type.currentData() == "issue"
+            self.item_type.setEnabled(self._editing is None)
             for key, editor in self.times.items():
                 visible = issue if key == "due_at" else mode != "none" if key == "expires_at" else (mode == "hard") == (key == "exact") and mode != "none"
                 self.time_form.setRowVisible(editor, visible)
@@ -465,7 +524,7 @@ class ReminderPanel(QGroupBox):
                     valid = False
                     self.preview.setText("请检查最早时间、目标、最迟时间和失效时间的先后顺序。")
                 else:
-                    self.preview.setText(schedule_text(draft.model_dump(mode="json"), self.snapshot["now"]))
+                    self.preview.setText(self._schedule(draft.model_dump(mode="json")))
         self.create_button.setEnabled(valid and self._editing is None and not any(p["kind"] == "create" for p in self.pending.values()))
         self.save_edit.setVisible(self._editing is not None)
         self.cancel_edit.setVisible(self._editing is not None)
@@ -475,7 +534,12 @@ class ReminderPanel(QGroupBox):
         for kind, button in self.buttons.items():
             allowed = status == "draft" if kind == "confirm" else status in ("draft", "registered") if kind in ("edit", "cancel") else status == "registered"
             if kind in ("ack", "snooze") and view:
-                allowed = allowed and view["draft"].get("reminder_enabled", True) and not view.get("acknowledged_at")
+                allowed = allowed and view["draft"].get("reminder_enabled", True) and not (
+                    view.get("acknowledged_at") or view.get("expired_at"))
+            if kind == "reopen" and view:
+                allowed = status in ("completed", "cancelled") and view["draft"].get("item_type") == "issue"
+            if kind == "archive" and view:
+                allowed = not view.get("archived_at")
             button.setEnabled(available and allowed)
         if ready:
             now = datetime.fromisoformat(self.snapshot["now"])
@@ -486,8 +550,8 @@ class ReminderPanel(QGroupBox):
                     start = now + timedelta(seconds=self.delay.value())
                     end = start + timedelta(seconds=self.window.value() if self.mode.currentData() == "soft" else 0)
                     draft = {"mode": self.mode.currentData(), "earliest_at": start.isoformat(), "latest_first_delivery_at": end.isoformat()}
-                self.preview.setText(schedule_text(draft, now))
-            self.snooze_preview.setText("延后时间 " + display_time(now + timedelta(seconds=self.snooze_seconds.value()), now))
+                self.preview.setText(self._schedule(draft))
+            self.snooze_preview.setText("延后时间 " + self._snooze_time(self.snooze_seconds.value(), view))
 
 
 class ReminderCard(QFrame):
@@ -548,10 +612,9 @@ class ReminderCard(QFrame):
             button.setEnabled(enabled)
         view = self.controller.view(self.command.task_id)
         if view:
-            self.arrangement.setText(schedule_text(view["draft"], self.controller.snapshot.get('now')))
+            self.arrangement.setText(self.controller._schedule(view["draft"]))
         if self.controller.snapshot:
-            now = datetime.fromisoformat(self.controller.snapshot["now"])
-            self.snooze_preview.setText("延后后的最早时间：" + display_time(now + timedelta(seconds=self.snooze_seconds.value()), now))
+            self.snooze_preview.setText("延后后的最早时间：" + self.controller._snooze_time(self.snooze_seconds.value(), view))
         if not self._reported and not self._retired:
             self.update()
 

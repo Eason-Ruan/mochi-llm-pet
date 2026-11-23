@@ -15,11 +15,13 @@ dependencies = [
     "anthropic==0.39.0",
     "openai==1.109.1",
     "keyring==25.6.0",
-    "pydantic==2.9.2",
+    "pydantic==2.14.4",
+    "deepseek-harness-sdk==0.2.2rc2 ; (sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'x86_64')) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
     "tenacity==9.0.0",
     "PyYAML==6.0.2",
     "psutil==6.0.0",
     "PyQt6==6.10.0 ; sys_platform == 'win32' or sys_platform == 'darwin'",
+    "tzdata ; sys_platform == 'win32'",
     "pyobjc-framework-Cocoa>=10,<12 ; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10,<12 ; sys_platform == 'darwin'",
     "pyobjc-framework-ScreenCaptureKit>=10,<12 ; sys_platform == 'darwin'",
@@ -39,6 +41,9 @@ deskpet = "deskpet.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["deskpet*"]
+
+[tool.setuptools.package-data]
+"deskpet.system2" = ["dsh_bridge.mjs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

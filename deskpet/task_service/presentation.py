@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 import json
 import sqlite3
 from uuid import uuid4
@@ -36,8 +37,9 @@ def _stored_preferences(db):
 
 
 class PresentationLedger:
-    def __init__(self, path, *, source="reference"):
+    def __init__(self, path, *, source="reference", authorize_early=None):
         self.path = path
+        self.authorize_early = authorize_early
         self.session = uuid4().hex
         self.source = source
 
@@ -90,6 +92,9 @@ class PresentationLedger:
                     current = self._current(db, command.task_id, command.task_version, command.occurrence, now)
                     if current is None or not command.requested_at <= now < command.expires_at:
                         return False
+                    if command.reason in {"opportunity", "tool"} and self.authorize_early is not None:
+                        if not self.authorize_early(db, command, now):
+                            return False
                     preferences = _stored_preferences(db)
                     key = "phase_end_sound" if command.sound == "phase_end" else "reminder_sound"
                     if not preferences.get(key, True):
@@ -123,9 +128,13 @@ class PresentationLedger:
                 if task is None:
                     return False
                 if command.reason in {"opportunity", "tool"}:
-                    close = task.draft.window_close_at
-                    if (close is not None and now >= close) or running_focus(db):
-                        return False
+                    if self.authorize_early is not None:
+                        if not self.authorize_early(db, command, now):
+                            return False
+                    else:
+                        close = task.draft.window_close_at
+                        if (close is not None and now >= close) or running_focus(db):
+                            return False
                 if self._other_owner(db, task, command.delivery_id):
                     return False
                 row = db.execute("SELECT * FROM presentations WHERE delivery_id=?", (command.delivery_id,)).fetchone()
@@ -177,9 +186,18 @@ class PresentationLedger:
                     return False
                 if not _stored_preferences(db).get("allow_system_notifications", True):
                     return False
-                if (db.execute("SELECT 1 FROM presentations WHERE delivery_id=? AND state<>'unavailable'", (delivery_id,)).fetchone()
-                        or self._other_owner(db, task, delivery_id)):
+                existing = db.execute("SELECT state, updated_at FROM presentations WHERE delivery_id=?",
+                                      (delivery_id,)).fetchone()
+                if self._other_owner(db, task, delivery_id):
                     return False
+                if existing and existing["state"] != "unavailable":
+                    if existing["state"] != "failed" or now < datetime.fromisoformat(existing["updated_at"]) + timedelta(seconds=5):
+                        return False
+                    tries = db.execute("""SELECT count(*) FROM events WHERE kind='presentation.claimed'
+                        AND json_extract(fields, '$.delivery_id')=?
+                        AND json_extract(fields, '$.payload.channel')='os_notification'""", (delivery_id,)).fetchone()[0]
+                    if tries >= 3:
+                        return False
                 self._write_owner(db, delivery_id, task, "os_notification", "submitting", now, identifier)
                 return True
         except sqlite3.OperationalError:

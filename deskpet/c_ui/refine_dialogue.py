@@ -152,7 +152,7 @@ class DemoConversation:
 class LocalConversation:
     """Recognize explicit work controls when the model connection is offline."""
 
-    def reply(self, text: str, snapshot: dict) -> DemoTurn:
+    def reply(self, text: str, snapshot: dict) -> DemoTurn | None:
         phrase, _separator, title = text.replace("：", ":", 1).partition(":")
         phrase = _normalize(phrase)
         phase = snapshot.get("active_phase")
@@ -191,7 +191,7 @@ class LocalConversation:
             }[command[1]]
             return self._action(verb, phase_id, version, {}, reply)
 
-        return DemoTurn("离线时可以输入「开始专注」「开始 25 分钟」「暂停专注」或「再加 10 分钟」。", True)
+        return None
 
     @staticmethod
     def _action(verb, phase_id, version, payload, reply):

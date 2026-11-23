@@ -6,7 +6,8 @@ httpcore==1.0.9
 anthropic==0.39.0
 openai==1.109.1
 keyring==25.6.0
-pydantic==2.9.2
+pydantic==2.14.4
+deepseek-harness-sdk==0.2.2rc2 ; (sys_platform == "darwin" and (platform_machine == "arm64" or platform_machine == "x86_64")) or (sys_platform == "win32" and platform_machine == "AMD64") or (sys_platform == "linux" and (platform_machine == "x86_64" or platform_machine == "aarch64"))
 tenacity==9.0.0
 PyYAML==6.0.2
 psutil==6.0.0
@@ -14,6 +15,7 @@ tomli==2.0.1 ; python_version < "3.11"
 
 # Native GUI, perception, and notifications
 PyQt6==6.10.0 ; sys_platform == "win32" or sys_platform == "darwin"
+tzdata ; sys_platform == "win32"
 pyobjc-framework-Cocoa>=10,<12 ; sys_platform == "darwin"
 pyobjc-framework-Quartz>=10,<12 ; sys_platform == "darwin"
 pyobjc-framework-ScreenCaptureKit>=10,<12 ; sys_platform == "darwin"

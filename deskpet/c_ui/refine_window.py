@@ -195,6 +195,7 @@ class _Bubble(QFrame):
         self, pet, text: str, on_answer: Callable[[bool], None] | None,
         on_painted: Callable[[], bool | None] | None, on_dismiss: Callable[[], None] | None,
         before_paint: Callable[[], bool] | None = None,
+        answer_labels: tuple[str, str] | None = None,
     ):
         super().__init__(pet)
         self.setObjectName("refine-bubble")
@@ -244,7 +245,8 @@ class _Bubble(QFrame):
         if on_answer is not None:
             row = QHBoxLayout()
             row.setSpacing(7)
-            for action, label_text, value in (("yes", "是", True), ("no", "否", False)):
+            yes, no = answer_labels or ("是", "否")
+            for action, label_text, value in (("yes", yes, True), ("no", no, False)):
                 button = _button(self, f"refine-bubble-{action}", label_text, 52, 29)
                 button.setText(label_text)
                 button.setProperty("affirmative", value)
@@ -345,6 +347,7 @@ class RefinePet(DesktopPet):
         self._closing_panel: QWidget | None = None
         self._section: str | None = None
         self._chat_toolbar: str | None = None
+        self._proposal_count = 0
         self._input_mode = "voice"
         self._work_state: str | None = None
         self._cat_area = QRect(0, 0, WIDTH, CAT_HEIGHT)
@@ -396,6 +399,14 @@ class RefinePet(DesktopPet):
         """)
         badge_layout.addWidget(self._badge)
         badge_layout.addStretch()
+
+        self._proposal_badge = QLabel(self.buttons["input"])
+        self._proposal_badge.setObjectName("refine-proposal-count")
+        self._proposal_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._proposal_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._proposal_badge.setGeometry(24, 3, 17, 15)
+        self._proposal_badge.setStyleSheet(f"color: {TEXT}; background: {PEACH}; border-radius: 5px; font: 700 10px;")
+        self._proposal_badge.hide()
 
         self._expand = _button(self, "refine-menu-expand", "展开菜单", 32, 26)
         self._expand.setIcon(icon("down", INK, 14))
@@ -480,6 +491,13 @@ class RefinePet(DesktopPet):
             self._chat_toolbar = mode
             self._update_buttons()
 
+    def set_proposal_count(self, count):
+        if count != self._proposal_count:
+            self._proposal_count = count
+            self._proposal_badge.setText(str(count) if count < 10 else "9+")
+            self._proposal_badge.setVisible(bool(count))
+            self._update_buttons()
+
     def _update_buttons(self):
         for key, button in self.buttons.items():
             selected = key == self._section
@@ -499,6 +517,8 @@ class RefinePet(DesktopPet):
                     "typing": ("keyboard", "打字输入"),
                     None: ("back", "返回"),
                 }[mode]
+                if self._proposal_count:
+                    label += f" · {self._proposal_count} 条待确认提议"
                 button.hold_enabled = self._voice_available and mode is not None
                 button.setIcon(icon(icon_name, color, 16))
             elif key == "work":
@@ -611,9 +631,10 @@ class RefinePet(DesktopPet):
         on_painted: Callable[[], bool | None] | None = None, *,
         on_dismiss: Callable[[], None] | None = None, animate: bool = False,
         before_paint: Callable[[], bool] | None = None,
+        answer_labels: tuple[str, str] | None = None,
     ) -> None:
         self.clear_bubble()
-        self.bubble = _Bubble(self, text, on_answer, on_painted, on_dismiss, before_paint)
+        self.bubble = _Bubble(self, text, on_answer, on_painted, on_dismiss, before_paint, answer_labels)
         self._layout_pet()
         if animate and not self._reduce_motion:
             self._animate_bubble(self.bubble)

@@ -1,20 +1,66 @@
 import io
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 
 from deskpet.contracts import TaskCommand
 from deskpet.m0.composition import build_environment
+from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import FakeClock
 from deskpet.observation_v2.context import ObservationContextReader
 from deskpet.observation_v2.desktop import DesktopObserver
 from deskpet.observation_v2.pipeline import ObservationStore
 from deskpet.observation_v2.state import Observation
 from deskpet.settings import SettingsStore
+
+
+@pytest.mark.parametrize("locked_database", ["business", "observation"])
+def test_full_desktop_context_waits_for_a_short_sqlite_commit(tmp_path, monkeypatch, locked_database):
+    monkeypatch.setattr("deskpet.observation_v2.context.system_boot_id", lambda: "test-boot")
+    database = tmp_path / "observation.sqlite3"
+    business = tmp_path / "business.db"
+    SettingsStore(business)
+    with ObservationStore(database, live=True, boot_id="test-boot") as producer:
+        now, mono = datetime.now(UTC), time.monotonic()
+        producer.begin_live_run(now, monotonic_s=mono, policy_generation=0)
+        producer.save_observation(
+            Observation("work", "available", None, (), now, now + timedelta(seconds=10), 71),
+            published_at=now, monotonic_s=mono,
+        )
+    path = business if locked_database == "business" else database
+    reader = DesktopObservationInput(database, settings_path=business)
+    started = Event()
+
+    def read_context():
+        started.set()
+        return reader.read_observation_context(datetime.now(UTC))
+
+    with closing(sqlite3.connect(path)) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        writer.execute("PRAGMA journal_mode = DELETE")
+        writer.execute("BEGIN EXCLUSIVE")
+        assert reader.read_current(datetime.now(UTC))[0] is None
+        assert reader.read_observation_context(datetime.now(UTC)).current is None
+        future = pool.submit(read_context)
+        assert started.wait(1)
+        with pytest.raises(FutureTimeout):
+            future.result(timeout=0.02)
+        writer.rollback()
+        context = future.result(timeout=2)
+
+    assert context.current_status == "fresh" and context.current.context_revision == 71
+
+    # Even if a transient wait returns an older context, the consumer cannot
+    # authorize an observation whose validity ended during the read.
+    timestamp = time.monotonic()
+    elapsed = iter((timestamp, timestamp + 11))
+    monkeypatch.setattr("deskpet.m0.observation_input.monotonic", lambda: next(elapsed))
+    assert reader.read_observation_context(datetime.now(UTC)).current is None
 
 
 def test_locked_optional_database_does_not_delay_a_hard_deadline(tmp_path):

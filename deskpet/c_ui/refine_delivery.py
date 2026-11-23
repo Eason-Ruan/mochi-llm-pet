@@ -22,6 +22,10 @@ class Prompt:
     painted: bool = False
     siblings: tuple[DisplayCommand, ...] = ()
     preview: tuple[DisplayCommand, ...] | None = None
+    delivery_id: str | None = None
+    valid: Callable[[], bool] | None = None
+    before_paint: Callable[[], bool] | None = None
+    on_painted: Callable[[], bool] | None = None
 
     def commands(self):
         return (self.command, *self.siblings) if self.command else ()
@@ -120,7 +124,7 @@ class RefineDeliveryMixin:
 
     def _valid_prompt(self, item):
         if not item.command:
-            return item.kind != "pomodoro" or self._can_start_focus()
+            return item.valid() if item.valid is not None else (item.kind != "pomodoro" or self._can_start_focus())
         if not all(self._valid_command(command) for command in item.commands()):
             return False
         if item.painted:
@@ -192,7 +196,8 @@ class RefineDeliveryMixin:
         if self.prompt:
             if self.prompt.command or not reminders:
                 return
-            self.waiting_prompts.appendleft(self.prompt)
+            if self.prompt.kind != "proposal":
+                self.waiting_prompts.appendleft(self.prompt)
             self._clear_prompt()
         if reminders:
             command = reminders[0]
@@ -207,7 +212,8 @@ class RefineDeliveryMixin:
             if siblings:
                 text, preview = self._group_preview((command, *siblings))
             else:
-                text = f"现在该{command.content}了。要查看这条提醒吗？"
+                text = (f"提醒：{command.content}" if self.production
+                        else f"现在该{command.content}了。要查看这条提醒吗？")
             item = Prompt("reminder", text, command=command, siblings=siblings, preview=preview)
         elif self.waiting_prompts:
             item = self.waiting_prompts.popleft()
@@ -220,12 +226,34 @@ class RefineDeliveryMixin:
                 self.answer_prompt(yes)
 
         interactive = bool(item.command or item.on_answer)
+        before_paint = None
+        painted = None
+        if item.command:
+            before_paint = (lambda: self._permit_prompt(item)) if self.production else None
+            painted = lambda: self._painted(item)
+        elif item.before_paint:
+            def before_paint():
+                if item.painted or item.before_paint():
+                    return self._valid_prompt(item)
+                QTimer.singleShot(0, lambda: self._clear_prompt() if self.prompt is item else None)
+                return False
+
+            def painted():
+                item.painted = item.on_painted()
+                return item.painted
+
+        labels = None
+        if item.kind == "proposal":
+            labels = ("查看", "稍后")
+        elif self.production and item.command and not item.siblings:
+            labels = ("好的", "关闭")
         self.pet.show_bubble(
             item.text, on_answer=answer if interactive else None,
-            on_painted=(lambda: self._painted(item)) if item.command else None,
+            on_painted=painted,
             on_dismiss=(lambda: answer(False)) if not interactive else None,
             animate=item.kind == "pomodoro",
-            before_paint=(lambda: self._permit_prompt(item)) if item.command and self.production else None,
+            before_paint=before_paint,
+            answer_labels=labels,
         )
 
     def _permit_prompt(self, item):
@@ -303,7 +331,10 @@ class RefineDeliveryMixin:
         if item is None:
             return
         self._clear_prompt()
-        if yes and item.command:
+        if yes and item.command and self.production and not item.siblings:
+            command = item.command
+            self.reminders.request("ack", command.task_id, command.task_version)
+        elif yes and item.command:
             self._show_section("reminders")
             panel = getattr(self, "reminder_panel", self.reminders)
             if item.siblings:

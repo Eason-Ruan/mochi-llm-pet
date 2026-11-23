@@ -22,10 +22,27 @@ VISION = "observation_vision"
 STATE = "observation_state"
 SYSTEM2 = "system2"
 OLLAMA = "local_ollama"
+BAILIAN = "bailian"
 Role = Literal["observation_vision", "observation_state", "system2"]
 OFFICIAL_BASE_URL = "https://api.openai.com/v1"
+_BAILIAN_PATH = "/compatible-mode/v1"
+BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com" + _BAILIAN_PATH
+BAILIAN_MODEL = "qwen4-max"
+_BAILIAN_HOSTS = {
+    "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com",
+    "dashscope-us.aliyuncs.com", "cn-hongkong.dashscope.aliyuncs.com",
+}
+_BAILIAN_WORKSPACE_HOST = re.compile(
+    r"(?!trial\.|token-plan\.)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\."
+    r"(?:cn-beijing|ap-southeast-1|ap-northeast-1|eu-central-1|us-east-1|cn-hongkong)\.maas\.aliyuncs\.com"
+)
 _CAPABILITY_PROBE_VERSION = "openai-1.109.1-chat-json-schema-v1"
+_SYSTEM2_PROBE_VERSION = "dsh-0.2.2rc2-native-tools-v1"
 _SAFE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+
+def _capability_probe_version(role: Role) -> str:
+    return _SYSTEM2_PROBE_VERSION if role == SYSTEM2 else _CAPABILITY_PROBE_VERSION
 
 
 class CloudRouteError(RuntimeError):
@@ -56,7 +73,7 @@ def _normalize_base_url(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CloudRoute:
-    provider_kind: Literal["openai", "openai_compatible", "local_ollama"]
+    provider_kind: Literal["openai", "openai_compatible", "local_ollama", "bailian"]
     base_url: str
     model: str
     display_name: str
@@ -64,7 +81,7 @@ class CloudRoute:
     timeout_s: float = 90.0
 
     def __post_init__(self) -> None:
-        if self.provider_kind not in {"openai", "openai_compatible", OLLAMA}:
+        if self.provider_kind not in {"openai", "openai_compatible", OLLAMA, BAILIAN}:
             raise ValueError("Unsupported model provider")
         object.__setattr__(self, "base_url", _normalize_base_url(self.base_url))
         if self.provider_kind == "openai" and self.base_url != OFFICIAL_BASE_URL:
@@ -79,6 +96,13 @@ class CloudRoute:
             raise ValueError("Invalid local credential reference")
         if self.credential_ref is None and self.provider_kind == "openai":
             raise ValueError("The OpenAI route requires a local credential reference")
+        if self.provider_kind == BAILIAN:
+            url = httpx.URL(self.base_url)
+            if (url.scheme != "https" or url.port is not None or url.path != _BAILIAN_PATH
+                    or (url.host not in _BAILIAN_HOSTS and not _BAILIAN_WORKSPACE_HOST.fullmatch(url.host))):
+                raise ValueError("Use an official Alibaba Cloud Model Studio HTTPS Chat Completions base URL")
+            if self.model != BAILIAN_MODEL or self.credential_ref is None:
+                raise ValueError("The Alibaba Cloud Model Studio route requires qwen4-max and a local credential reference")
 
         if self.provider_kind == OLLAMA:
             url = httpx.URL(self.base_url)
@@ -162,7 +186,7 @@ class ObservationCloudSettings:
         route, generation, consent, permission, verified, success, failure = row
         return CloudRouteSnapshot(
             role, self.user_scope, CloudRoute(**json.loads(route)) if route else None,
-            generation, consent, bool(permission), verified == _CAPABILITY_PROBE_VERSION,
+            generation, consent, bool(permission), verified == _capability_probe_version(role),
             success, failure,
         )
 
@@ -189,6 +213,8 @@ class ObservationCloudSettings:
     def configure(
         self, role: Role, route: CloudRoute | None, *, expected: CloudRouteSnapshot | None = None,
     ) -> CloudRouteSnapshot:
+        if route is not None and route.provider_kind == BAILIAN and role != SYSTEM2:
+            raise ValueError("Alibaba Cloud Model Studio is available for System 2 only")
         with observation_privacy_gate(self.path), self._write() as connection:
             current = self._get(connection, role)
             if expected is not None:
@@ -258,7 +284,7 @@ class ObservationCloudSettings:
                 connection.execute("""
                     UPDATE observation_cloud_routes SET verified = ?
                     WHERE user_scope = ? AND role = ?
-                """, (None if failure else _CAPABILITY_PROBE_VERSION, self.user_scope, expected.role))
+                """, (None if failure else _capability_probe_version(expected.role), self.user_scope, expected.role))
             if failure:
                 connection.execute("""
                     UPDATE observation_cloud_routes SET last_failure = ?

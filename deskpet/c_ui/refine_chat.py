@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil, sin
 import sqlite3
+from uuid import uuid4
 
 from PyQt6.QtCore import QElapsedTimer, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontDatabase, QPainter
@@ -57,6 +58,10 @@ QPushButton:disabled { background: #F1E9DA; border-color: #B8A48A; }
 class Message:
     speaker: str
     text: str
+    id: str | None = None
+    pending: bool = False
+    reply_to: str | None = None
+    reply_source: str | None = None
 
 
 class _GestureButton(QPushButton):
@@ -117,7 +122,7 @@ class RefineChat(QWidget):
     storage_error = pyqtSignal(str)
 
     def __init__(self, submit: Callable[[dict], str], snapshot: Callable[[], dict], parent=None, *,
-                 store=None, conversation=None):
+                 store=None, conversation=None, system2=None, configure_system2=None, proposal_card=None):
         super().__init__(parent)
         self.setObjectName("refine-chat")
         font = self.font()
@@ -131,6 +136,13 @@ class RefineChat(QWidget):
         self._submit = submit
         self._snapshot = snapshot
         self._store = store
+        self._system2 = system2
+        self._configure_system2 = configure_system2
+        self._proposal_card = proposal_card
+        self._supersedes_message_id = None
+        self._proposal_context = None
+        self._projection_version = None
+        self._route_status = None
         self._voice_available = store is None
         self._script = conversation or (DemoConversation() if store is None else LocalConversation())
         messages, draft, pending = store.load() if store is not None else ([], "", None)
@@ -163,6 +175,8 @@ class RefineChat(QWidget):
         self._cards = QVBoxLayout(panel)
         self._cards.setContentsMargins(11, 11, 11, 11)
         self._cards.setSpacing(8)
+        if self._system2 is not None:
+            self.refresh_projection(self._store.projection_version())
 
     def sizeHint(self) -> QSize:
         # Measuring wrapped labels at the panel width avoids Qt's default
@@ -185,6 +199,7 @@ class RefineChat(QWidget):
         self._voice_timer.stop()
         self._composition = None
         self._history_end = None
+        self._supersedes_message_id = self._proposal_context = None
         if self._store is None:
             self._draft = ""
         self._render()
@@ -239,8 +254,16 @@ class RefineChat(QWidget):
         value = raw.strip()
         if not value or self._pending is not None:
             return
+        if self._system2 is not None:
+            snapshot = self._snapshot()
+            offline = snapshot.get("system2_route_status") != "verified"
+            if not (offline and not self._supersedes_message_id and not self._proposal_context
+                    and (turn := self._script.reply(value, snapshot)) is not None):
+                self._send_system2(value)
+                return
+        else:
+            turn = self._script.reply(value, self._snapshot())
         speaker = "你 · 模拟语音" if simulated else "你"
-        turn = self._script.reply(value, self._snapshot())
         if self._store is not None:
             try:
                 self._store.begin_turn(speaker, value, turn)
@@ -261,6 +284,47 @@ class RefineChat(QWidget):
         else:
             self._reply(turn.text, turn.follow_up)
         self._render()
+
+    def _send_system2(self, value):
+        message_id = uuid4().hex
+        try:
+            self._system2(message_id, value, proposal=self._proposal_context,
+                          supersedes_message_id=self._supersedes_message_id)
+        except (sqlite3.Error, RuntimeError):
+            self.storage_error.emit("暂时无法保存并提交消息。")
+            return
+        self._draft = ""
+        self._supersedes_message_id = self._proposal_context = None
+        self._history_end = None
+        self.refresh_projection(self._store.projection_version())
+        self._request_typing_focus()
+
+    def refresh_projection(self, version):
+        if self._system2 is None or version == self._projection_version:
+            return
+        had_focus = bool(self._editor and self._editor.hasFocus())
+        self._messages = [Message(*row) for row in self._store.projected_messages()]
+        self._projection_version = version
+        if self._messages:
+            self._follow_up = True
+        self._render()
+        if had_focus:
+            self._request_typing_focus()
+
+    def refresh_route(self, status):
+        if status != self._route_status:
+            self._route_status = status
+            self._render()
+
+    def _edit_message(self, message_id):
+        self._supersedes_message_id = message_id
+        self._proposal_context = None
+        self._compose("typing")
+
+    def reply_to_proposal(self, proposal):
+        self._proposal_context = (proposal["id"], proposal["version"])
+        self._supersedes_message_id = None
+        self._compose("typing")
 
     def _reply(self, text: str, follow_up: bool):
         self._messages.append(Message("Mochi", text))
@@ -340,7 +404,20 @@ class RefineChat(QWidget):
         layout.setContentsMargins(8, 7, 8, 7)
         layout.setSpacing(2)
         layout.addWidget(self._label(message.speaker, sender=True, speaker="mochi" if mochi else "you"))
+        if message.reply_to and message.reply_source:
+            quotation = message.reply_source[:44] + ("…" if len(message.reply_source) > 44 else "")
+            reply = self._label(f"回复「{quotation}」", sender=True)
+            reply.setProperty("replyToMessageId", message.reply_to)
+            layout.addWidget(reply)
         layout.addWidget(self._label(message.text))
+        if message.pending:
+            status = QHBoxLayout()
+            status.addWidget(self._label("等待回复", sender=True), 1)
+            edit = QPushButton("改口")
+            edit.setObjectName("refine-chat-supersede")
+            edit.clicked.connect(lambda: self._edit_message(message.id))
+            status.addWidget(edit)
+            layout.addLayout(status)
         return card
 
     def _composer(self) -> QFrame:
@@ -351,7 +428,16 @@ class RefineChat(QWidget):
         layout.setContentsMargins(9, 9, 9, 9)
         layout.setSpacing(4)
         header = QHBoxLayout()
-        header.addWidget(self._label("语音输入中" if voice else "打字输入中", sender=True), 1)
+        heading = "语音输入中" if voice else "打字输入中"
+        if self._proposal_context:
+            heading = "回复提议"
+        if self._supersedes_message_id:
+            heading = "更正这条消息"
+        header.addWidget(self._label(heading, sender=True), 1)
+        if self._proposal_context or self._supersedes_message_id:
+            cancel = QPushButton("取消")
+            cancel.clicked.connect(self._cancel_context)
+            header.addWidget(cancel)
         if self._voice_available:
             mode = _GestureButton("mic" if voice else "keyboard", "长按临时切换输入方式",
                                   accent=True, hold=True, width=30, height=26)
@@ -398,6 +484,10 @@ class RefineChat(QWidget):
             layout.addWidget(field)
         return card
 
+    def _cancel_context(self):
+        self._proposal_context = self._supersedes_message_id = None
+        self._compose("typing")
+
     def _save_draft(self, text: str):
         self._draft = text
         if self._store is not None:
@@ -412,7 +502,17 @@ class RefineChat(QWidget):
             item = self._cards.takeAt(0).widget()
             item.hide()
             item.setParent(None)
-            item.deleteLater()
+            if item is not self._proposal_card:
+                item.deleteLater()
+
+        if self._proposal_card is not None and self._proposal_card.has_proposals:
+            self._cards.addWidget(self._proposal_card)
+            self._proposal_card.show()
+        if self._configure_system2 and self._route_status in {"not_configured", "unverified"}:
+            configure = QPushButton("配置对话模型" if self._route_status == "not_configured" else "验证对话模型")
+            configure.setObjectName("refine-chat-configure-system2")
+            configure.clicked.connect(self._configure_system2)
+            self._cards.addWidget(configure)
 
         browsing = self._history_end is not None
         virtual = self._composition is not None or self._pending is not None
@@ -444,3 +544,6 @@ class RefineChat(QWidget):
             button.held.connect(lambda: self._compose(self._other(self._preferred)))
             self._cards.addWidget(button, 0, Qt.AlignmentFlag.AlignHCenter)
         self.updateGeometry()
+
+    def refresh_proposals(self):
+        self._render()

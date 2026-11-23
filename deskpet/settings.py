@@ -179,32 +179,44 @@ class SettingsStore:
     def update(
         self, *, expected_version: int,
         before_commit: Callable[[sqlite3.Connection, Settings, Settings], None] | None = None,
+        db: sqlite3.Connection | None = None,
         **changes,
     ) -> Settings:
         if {"version", "observation_generation"}.intersection(changes):
             raise ValueError("The service assigns settings versions")
+        if db is not None:
+            if not db.in_transaction:
+                raise ValueError("a write transaction is required to update settings")
+            if _OBSERVATION_PRIVACY_FIELDS.intersection(changes):
+                raise ValueError("Observation privacy updates require the settings privacy gate")
+            return self._update(db, expected_version, before_commit, changes)
         guard = nullcontext()
         if _OBSERVATION_PRIVACY_FIELDS.intersection(changes):
             from deskpet.observation_v2.routes import observation_privacy_gate
 
             guard = observation_privacy_gate(self.path)
         with guard, self._write() as db:
-            current = self.read(db=db)
-            if current.version != expected_version:
-                raise SettingsConflict("Settings have changed")
-            updated = Settings.model_validate({**current.model_dump(), **changes, "version": current.version + 1})
-            if any(getattr(updated, name) != getattr(current, name) for name in _OBSERVATION_PRIVACY_FIELDS):
-                updated = updated.model_copy(update={"observation_generation": current.observation_generation + 1})
-            db.execute("UPDATE pet_settings SET settings = ? WHERE user_scope = ?",
-                       (updated.model_dump_json(), self.user_scope))
-            if before_commit is not None:
-                before_commit(db, current, updated)
-            return updated
+            return self._update(db, expected_version, before_commit, changes)
 
-    def list_habits(self) -> tuple[Habit, ...]:
-        with closing(sqlite3.connect(self.path)) as db:
-            rows = db.execute("SELECT habit FROM pet_habits WHERE user_scope = ?", (self.user_scope,))
-            habits = [Habit.model_validate_json(row[0]) for row in rows]
+    def _update(self, db, expected_version, before_commit, changes):
+        current = self.read(db=db)
+        if current.version != expected_version:
+            raise SettingsConflict("Settings have changed")
+        updated = Settings.model_validate({**current.model_dump(), **changes, "version": current.version + 1})
+        if any(getattr(updated, name) != getattr(current, name) for name in _OBSERVATION_PRIVACY_FIELDS):
+            updated = updated.model_copy(update={"observation_generation": current.observation_generation + 1})
+        db.execute("UPDATE pet_settings SET settings = ? WHERE user_scope = ?",
+                   (updated.model_dump_json(), self.user_scope))
+        if before_commit is not None:
+            before_commit(db, current, updated)
+        return updated
+
+    def list_habits(self, *, db: sqlite3.Connection | None = None) -> tuple[Habit, ...]:
+        if db is None:
+            with closing(sqlite3.connect(self.path)) as connection:
+                return self.list_habits(db=connection)
+        rows = db.execute("SELECT habit FROM pet_habits WHERE user_scope = ?", (self.user_scope,))
+        habits = [Habit.model_validate_json(row[0]) for row in rows]
         return tuple(sorted(habits, key=lambda habit: (habit.title.casefold(), habit.id)))
 
     def get_habit(self, habit_id: str, *, db: sqlite3.Connection | None = None) -> Habit | None:
@@ -216,25 +228,31 @@ class SettingsStore:
         return Habit.model_validate_json(row[0]) if row else None
 
     def save_habit(self, *, title: str, behavior: HabitBehavior, expected_version: int,
-                   habit_id: str | None = None, status: str = "enabled") -> Habit:
-        with self._write() as db:
-            current = self.get_habit(habit_id, db=db) if habit_id else None
-            if (habit_id and current is None) or (current.version if current else 0) != expected_version:
-                raise SettingsConflict("Habit has changed")
-            if current and current.status == "archived":
-                raise SettingsConflict("Habit is archived")
-            now = datetime.now(UTC)
-            habit = Habit(
-                id=current.id if current else uuid4().hex,
-                version=expected_version + 1,
-                title=title,
-                behavior=behavior,
-                status=status,
-                created_at=current.created_at if current else now,
-                updated_at=now,
-            )
-            db.execute("""
-                INSERT INTO pet_habits VALUES (?, ?, ?)
-                ON CONFLICT (user_scope, habit_id) DO UPDATE SET habit = excluded.habit
-            """, (self.user_scope, habit.id, habit.model_dump_json()))
-            return habit
+                   habit_id: str | None = None, status: str = "enabled",
+                   db: sqlite3.Connection | None = None, now: datetime | None = None) -> Habit:
+        if db is None:
+            with self._write() as connection:
+                return self.save_habit(title=title, behavior=behavior, expected_version=expected_version,
+                                       habit_id=habit_id, status=status, db=connection, now=now)
+        if not db.in_transaction:
+            raise ValueError("a write transaction is required to save a habit")
+        current = self.get_habit(habit_id, db=db) if habit_id else None
+        if (habit_id and current is None) or (current.version if current else 0) != expected_version:
+            raise SettingsConflict("Habit has changed")
+        if current and current.status == "archived":
+            raise SettingsConflict("Habit is archived")
+        now = now or datetime.now(UTC)
+        habit = Habit(
+            id=current.id if current else uuid4().hex,
+            version=expected_version + 1,
+            title=title,
+            behavior=behavior,
+            status=status,
+            created_at=current.created_at if current else now,
+            updated_at=now,
+        )
+        db.execute("""
+            INSERT INTO pet_habits VALUES (?, ?, ?)
+            ON CONFLICT (user_scope, habit_id) DO UPDATE SET habit = excluded.habit
+        """, (self.user_scope, habit.id, habit.model_dump_json()))
+        return habit
