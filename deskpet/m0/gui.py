@@ -6,6 +6,7 @@ Widgets only exchange immutable views/actions/receipts through queued signals.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,6 +60,8 @@ class ServiceWorker(QObject):
         self._realtime_scenario_elapsed = 0
         self._saved_envelope = None
         self._observation = None
+        self._settings_store = None
+        self._settings = None
         self._qt_source = "offscreen" if QGuiApplication.platformName() in ("offscreen", "minimal") else "native"
 
     @pyqtSlot()
@@ -72,11 +75,20 @@ class ServiceWorker(QObject):
             ):
                 from deskpet.mocks.clock import FakeClock
                 scenario_clock = FakeClock(getattr(self.args, "scenario_initial_time", None))
+            business_db = getattr(self.args, "business_database", None)
             self.env = build_environment(
                 profile=self.args.profile, scenario_id=self.args.scenario,
                 output=self.args.output, delivery=self.delivery, adapters=getattr(self.args, "adapters", None),
                 external_sampling=self.args.profile == "live-smoke", clock=scenario_clock,
+                task_database=business_db, phase_database=business_db,
+                observation_database=getattr(self.args, "observation_database", None),
             )
+            if business_db is not None:
+                from deskpet.settings import SettingsStore
+
+                self._settings_store = SettingsStore(business_db, initial_input_mode="typing")
+                self.env.sessions.attach_settings(self._settings_store)
+                self._reload_settings()
             self._observation = self.env.observations.snapshot().observation
             if self.args.profile == "scenario" and getattr(self.args, "realtime_scenario", False):
                 self._realtime_scenario_timer = QElapsedTimer()
@@ -103,17 +115,34 @@ class ServiceWorker(QObject):
                     view["duration_s"] = duration
         frame = self.env.observations.snapshot()
         self._observation = frame.observation
-        self.snapshot_ready.emit({
+        pending_deliveries = getattr(self.env.tasks, "pending_deliveries", dict)
+        snapshot = {
             "now": self.env.clock.wall_now().isoformat(),
             "clock": getattr(self.env.clock, "kind", "wall"),
             "tasks": [v.model_dump(mode="json") for v in self.env.tasks.list_tasks()],
+            "pending_deliveries": pending_deliveries(),
             "sessions": sessions,
             "observation": frame.observation.model_dump(mode="json"),
             "observation_frame": frame.model_dump(mode="json"),
             "sampling_editable": self.args.profile == "scenario" and hasattr(self.env.sampling, "set_signals"),
             "estimator_editable": hasattr(self.env.estimator, "set_estimate"),
             "event_count": len(self.env.trace.events),
-        })
+        }
+        if self._settings is not None:
+            snapshot["settings"] = self._settings.to_dict()
+            snapshot.update(self.env.sessions.snapshot_fields())
+        self.snapshot_ready.emit(snapshot)
+
+    def _reload_settings(self):
+        settings = self._settings_store.read()
+        if settings == self._settings:
+            return
+        self.env.sessions.configure_defaults(
+            default_focus_s=settings.default_focus_s,
+            default_break_s=settings.default_break_s,
+            link_issues=settings.link_issues,
+        )
+        self._settings = settings
 
     @pyqtSlot()
     def pump(self):
@@ -179,7 +208,12 @@ class ServiceWorker(QObject):
             if kind == "task":
                 cmd_kind = action["command"]
                 payload = dict(action.get("payload", {}))
-                if cmd_kind in ("create", "edit"):
+                if cmd_kind in ("create", "edit") and "draft" in payload:
+                    if set(payload) != {"draft"}:
+                        raise ValueError("事项表单包含多余字段")
+                    draft = TaskDraft.model_validate(payload["draft"])
+                    payload = {"draft": draft.model_dump(mode="json")}
+                elif cmd_kind in ("create", "edit"):
                     window = float(payload.pop("window_s", 20))
                     mode = payload.pop("mode", "soft")
                     absolute_start = payload.pop("earliest_at", None)
@@ -233,6 +267,32 @@ class ServiceWorker(QObject):
                 result = {"status": "sample_submitted"}
             elif kind == "refresh_observation":
                 result = {"status": "sample_refreshed"}
+            elif kind == "settings_update":
+                result = {"status": "applied", "event_id": action["event_id"]}
+                try:
+                    self._settings = self._settings_store.update(
+                        expected_version=action["expected_version"],
+                        before_commit=self.env.sessions.apply_settings_update, **action["changes"],
+                    )
+                except (ValueError, sqlite3.Error):
+                    self._settings = self._settings_store.read()
+                    result["status"] = "rejected"
+            elif kind == "recover_chat_result":
+                event_id = action["event_id"]
+                result = self.env.sessions.command_result(event_id)
+                if result is None:
+                    result = {"command_id": event_id, "status": "result_unavailable"}
+            elif kind == "system_sleep":
+                self.env.sessions.record_sleep()
+            elif kind == "system_wake":
+                self.env.sessions.record_wake()
+            elif kind == "start_habit":
+                from deskpet.work_sessions.models import PhaseCommand
+
+                result = self.env.sessions.apply_phase(PhaseCommand(
+                    command_id=action["event_id"], phase_id=f"habit-phase-{action['event_id']}", kind="start",
+                    payload={"habit_id": action["habit_id"], "expected_habit_version": action["expected_version"]},
+                ))
             elif kind == "set_estimate":
                 setter = getattr(self.env.estimator, "set_estimate", None)
                 if not callable(setter):
@@ -244,34 +304,53 @@ class ServiceWorker(QObject):
                 review = payload.pop("_review", None) if ui is not None else None
                 submitted_at = self.env.clock.wall_now().isoformat()
                 only_if_idle = action["command"] == "start" and payload.pop("only_if_idle", False)
-                command = SessionCommand(
-                    command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
-                    session_id=action["session_id"], expected_version=action.get("version", 0),
-                    payload=payload)
-                if only_if_idle and any(
-                    view.state != "ended" and view.session_id != command.session_id
-                    for view in self.env.sessions.list_sessions()
-                ):
-                    result = SessionResult(command_id=command.command_id, status="rejected",
-                                           error_code=ErrorCode.INVALID_TRANSITION)
-                    self.env.trace.emit(
-                        "session.rejected", session_id=command.session_id,
-                        payload={"command_id": command.command_id, "kind": command.kind,
-                                 "error_code": ErrorCode.INVALID_TRANSITION.value})
+                apply_phase = getattr(self.env.sessions, "apply_phase", None)
+                if callable(apply_phase):
+                    from deskpet.work_sessions import PhaseCommand
+
+                    source = payload.pop("_origin", "manual")
+                    if source not in ("manual", "chat"):
+                        raise ValueError("无效的计时操作来源")
+                    verb = action["command"]
+                    if verb == "start_break":
+                        payload.setdefault("kind", "short_break")
+                        if payload["kind"] not in ("short_break", "long_break"):
+                            raise ValueError("请选择休息类型")
+                        verb = "start"
+                    result = apply_phase(PhaseCommand(
+                        command_id=action.get("event_id") or _id("phase-command"),
+                        phase_id=action["session_id"], expected_version=action.get("version", 0),
+                        kind=verb, source=source, payload=self.env.sessions.phase_payload(verb, payload),
+                    ))
                 else:
-                    result = self.env.sessions.apply(command)
-                if ui is not None and action["command"] == "end" and result.status == "applied":
-                    from deskpet.c_ui.review_evidence import end_record
-                    applied = next((e.seq for e in reversed(self.env.trace.events)
-                        if e.kind == "session.applied" and e.session_id == action["session_id"]
-                        and e.payload.get("command_id") == result.command_id), None)
-                    origin = ("automation" if getattr(self.args, "auto_smoke", False)
-                              or self._qt_source != "native" else "user")
-                    self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
-                        source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
-                        payload=end_record(result=result.model_dump(mode="json"), review=review,
-                            submitted_at=submitted_at, origin=origin,
-                            action_seq=ui_action_seq, applied_seq=applied))
+                    command = SessionCommand(
+                        command_id=action.get("event_id") or _id("session-command"), kind=action["command"],
+                        session_id=action["session_id"], expected_version=action.get("version", 0),
+                        payload=payload)
+                    if only_if_idle and any(
+                        view.state != "ended" and view.session_id != command.session_id
+                        for view in self.env.sessions.list_sessions()
+                    ):
+                        result = SessionResult(command_id=command.command_id, status="rejected",
+                                               error_code=ErrorCode.INVALID_TRANSITION)
+                        self.env.trace.emit(
+                            "session.rejected", session_id=command.session_id,
+                            payload={"command_id": command.command_id, "kind": command.kind,
+                                     "error_code": ErrorCode.INVALID_TRANSITION.value})
+                    else:
+                        result = self.env.sessions.apply(command)
+                    if ui is not None and action["command"] == "end" and result.status == "applied":
+                        from deskpet.c_ui.review_evidence import end_record
+                        applied = next((e.seq for e in reversed(self.env.trace.events)
+                            if e.kind == "session.applied" and e.session_id == action["session_id"]
+                            and e.payload.get("command_id") == result.command_id), None)
+                        origin = ("automation" if getattr(self.args, "auto_smoke", False)
+                                  or self._qt_source != "native" else "user")
+                        self.env.trace.emit("session.end_accepted", session_id=action["session_id"],
+                            source=self._qt_source, simulated=origin != "user" or self.env.clock.kind != "wall",
+                            payload=end_record(result=result.model_dump(mode="json"), review=review,
+                                submitted_at=submitted_at, origin=origin,
+                                action_seq=ui_action_seq, applied_seq=applied))
             elif kind == "save-decision":
                 task = self.env.tasks.get(action["task_id"])
                 if task is None:
@@ -531,7 +610,8 @@ class Workbench(QMainWindow):
         if external:
             return bool(
                 self._external_surface is not None and not self._external_surface_failed
-                and QGuiApplication.platformName() not in ("offscreen", "minimal")
+                and (QGuiApplication.platformName() not in ("offscreen", "minimal")
+                     or getattr(self._external_surface, "_synthetic_delivery", False))
                 and self._external_surface.can_report_display()
             )
         return bool(self._external_surface is None and self.ui_surface is not None
@@ -1055,7 +1135,7 @@ class Workbench(QMainWindow):
             if self._surface_failed:
                 self._receipt(command, "failed", ErrorCode.FAILED)
                 return
-            if command.delivery_id not in self._surface_commands:
+            if self._surface_commands.get(command.delivery_id) != command:
                 self._surface_commands[command.delivery_id] = command
                 self.tabs.setCurrentWidget(self.ui_surface)
                 try:
@@ -1087,10 +1167,9 @@ class Workbench(QMainWindow):
             self._external_surface.show_reminder(command.model_copy(deep=True))
         except Exception as exc:
             self._fail_external_surface(exc)
-        if self.ui_surface is not None and not self._surface_failed:
+        if (self.ui_surface is not None and not self._surface_failed
+                and not getattr(self._external_surface, "production", False)):
             try:
-                if previous is not None:
-                    self.ui_surface.dismiss_reminder(command.task_id)
                 self.ui_surface.show_reminder(command.model_copy(deep=True))
             except Exception as exc:
                 self._fail_surface(exc)

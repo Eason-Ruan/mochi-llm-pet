@@ -171,7 +171,7 @@ def _latest_input_recovery(
 
 def _window(
     segments: Iterable[object], screens: Iterable[object], *, as_of: datetime, window_seconds: float,
-    ttl_seconds: float,
+    ttl_seconds: float, live: bool = False,
 ) -> _Window:
     as_of = _time(as_of)
     if not _seconds(window_seconds) or not _seconds(ttl_seconds):
@@ -259,8 +259,12 @@ def _window(
         screen_locked = latest_lock[1]
 
     screen_rows = _screen_context(screens, start, as_of)
+    foreground_screens = (
+        [entry for entry in screen_rows if current_foreground is not None and entry[1] == prior_id]
+        if live else screen_rows
+    )
     last_screen = next((
-        (at, data) for at, activity_id, data in reversed(screen_rows)
+        (at, data) for at, activity_id, data in reversed(foreground_screens)
         if screen_locked is not True and data["status"] == "ready"
         and (current_foreground is None or (at >= foreground_started_at and (prior_id is None or activity_id == prior_id)))
     ), None)
@@ -297,7 +301,7 @@ def _window(
         "screen_scene_switches": len(screen_switches), "recently_switched_screen_scene": recent_screen_switch,
         "idle_s": idle_age, "recent_os_input": input_until is not None,
         "screen_locked": screen_locked, "sustained_activity": sustained_activity,
-        "recent_screen_results": [data for _, _, data in screen_rows[-8:]],
+        "recent_screen_results": [data for _, _, data in foreground_screens[-3:]],
         "current_screen": screen,
     }
     semantics = [current_foreground, prior_id if current_foreground else None, screen and (screen["screen_kind"], screen["screen_summary"], screen["visible_text_redacted"]),
@@ -312,18 +316,20 @@ def _window(
 
 def aggregate_window(
     segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
-    window_seconds: float = WINDOW_SECONDS, ttl_seconds: float = TTL_SECONDS,
+    window_seconds: float = WINDOW_SECONDS, ttl_seconds: float = TTL_SECONDS, live: bool = False,
 ) -> dict:
     """Calculate temporal features without extending measured durations into gaps."""
-    return _window(segments, screen_results, as_of=as_of, window_seconds=window_seconds, ttl_seconds=ttl_seconds).data
+    return _window(segments, screen_results, as_of=as_of, window_seconds=window_seconds,
+                   ttl_seconds=ttl_seconds, live=live).data
 
 
 def context_revision(
     segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
-    window_seconds: float = WINDOW_SECONDS, ttl_seconds: float = TTL_SECONDS,
+    window_seconds: float = WINDOW_SECONDS, ttl_seconds: float = TTL_SECONDS, live: bool = False,
 ) -> str:
     """Return a semantic fingerprint suitable for a snapshot comparison."""
-    return _window(segments, screen_results, as_of=as_of, window_seconds=window_seconds, ttl_seconds=ttl_seconds).context
+    return _window(segments, screen_results, as_of=as_of, window_seconds=window_seconds,
+                   ttl_seconds=ttl_seconds, live=live).context
 
 
 class StateObserver:
@@ -340,8 +346,9 @@ class StateObserver:
         self._revision = 0
         self._estimate: tuple[str, str] | None = None
 
-    def _window(self, segments: Iterable[object], screens: Iterable[object], as_of: datetime) -> _Window:
-        return _window(segments, screens, as_of=as_of, window_seconds=self.window_seconds, ttl_seconds=self.ttl_seconds)
+    def _window(self, segments: Iterable[object], screens: Iterable[object], as_of: datetime, live: bool = False) -> _Window:
+        return _window(segments, screens, as_of=as_of, window_seconds=self.window_seconds,
+                       ttl_seconds=self.ttl_seconds, live=live)
 
     def features(self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime) -> dict:
         return self._window(segments, screen_results, as_of).data
@@ -357,6 +364,12 @@ class StateObserver:
             self._context_at = as_of
             return self._revision
 
+    def reset_live_context(self) -> None:
+        """Start a new clock interval without reusing a prior estimator revision."""
+        with self._guard:
+            self._revision += 1
+            self._context = self._context_at = self._published_at = self._estimate = None
+
     def refresh_context(self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime) -> int | None:
         """Register current evidence so that in-flight estimates of old evidence can be dropped."""
         at = _time(as_of)
@@ -365,11 +378,15 @@ class StateObserver:
     def observe(
         self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
         current_context_revision: Callable[[], int | str | None] | None = None,
-        now: Callable[[], datetime] | None = None,
+        now: Callable[[], datetime] | None = None, live: bool = False,
     ) -> Observation | None:
         at = _time(as_of)
         started = time.monotonic()
-        window = self._window(segments, screen_results, at)
+        window = self._window(segments, screen_results, at, live)
+        if current_context_revision is not None:
+            current = current_context_revision()
+            if current is None or isinstance(current, str) and current != window.context:
+                return None
         revision = self._advance(window.context, at)
         if revision is None:
             return None
@@ -401,11 +418,11 @@ class StateObserver:
         return self._publish(kind, state, summary, reasons, at, deadline, revision)
 
     def fallback(
-        self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
+        self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime, live: bool = False,
     ) -> Observation | None:
         """Publish current uncertainty using only current evidence and the program clock."""
         at = _time(as_of)
-        window = self._window(segments, screen_results, at)
+        window = self._window(segments, screen_results, at, live)
         revision = self._advance(window.context, at)
         if revision is None:
             return None

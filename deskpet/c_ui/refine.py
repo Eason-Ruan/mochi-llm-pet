@@ -1,25 +1,28 @@
 """Native desktop UI backed by the same services as the C workbench."""
 from __future__ import annotations
 
-from collections import deque
 import copy
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+import logging
+from pathlib import Path
+import sys
+from types import SimpleNamespace
 from uuid import uuid4
 
-from PyQt6.QtCore import QSettings, QTimer
+from PyQt6.QtCore import QLockFile, QPoint, QSettings, QStandardPaths, QTimer
 from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from deskpet.contracts import DisplayCommand
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
 
 from .desktop import DesktopWorkbench
+from .desktop_power import DesktopPower
 from .refine_chat import RefineChat
+from .refine_conversation_store import ConversationStore
+from .refine_delivery import Prompt, RefineDeliveryMixin
 from .refine_panels import RefineReminders, RefineSettings, RefineWork, active_reminders, current_work
-from .refine_window import RefinePet
+from .refine_window import RefinePet, RefineScroll
 from .time_format import ZONE
 
 DEMO_GOAL = "完成论文的方法部分"
@@ -29,74 +32,138 @@ DEMO_REMINDERS = (
     ("demo-milk", "买牛奶", "soft", 0, 17, 0, 20),
     ("demo-meeting", "预约组会", "hard", 1, 10, 0, 0),
 )
+log = logging.getLogger(__name__)
 
 
-@dataclass
-class Prompt:
-    kind: str
-    text: str
-    on_answer: Callable[[bool], None] | None = None
-    command: DisplayCommand | None = None
-    painted: bool = False
+class RefineSession(RefineDeliveryMixin):
+    """Compose the native pet and its shared service host in one Qt process."""
 
-
-class RefineSession:
-    """Compose the pet, demo controls, and diagnostic window in one Qt process."""
-
-    def __init__(self, app, args, *, settings=None):
-        if args.profile != "scenario":
-            raise ValueError("Mochi 桌面演示需要 scenario 配置")
+    def __init__(self, app, args, *, settings=None, conversation=None):
+        self.production = args.profile == "realtime"
+        if not self.production and args.profile != "scenario":
+            raise ValueError("Mochi 需要实时或演示配置")
         self.app = app
         self.context = None
         self.snapshot = {}
         self.section = None
-        self.prompt: Prompt | None = None
-        self.waiting_prompts: deque[Prompt] = deque()
-        self.seen_deliveries: dict[str, DisplayCommand] = {}
         self._pending_seed = {}
         self._pending_invite = None
+        self._pending_habit = None
+        self._pending_settings = None
         self._invite_waiting = False
         self._closing = False
-        self.settings = QSettings("Mochi", "Desktop Pet") if settings is None else settings
-        self.input_mode = self.settings.value("defaultInput", "voice", type=str)
+        self._last_service_error = None
+        self._synthetic_delivery = getattr(args, "synthetic_delivery", False)
+        self.data_dir = Path(args.data_dir).expanduser().resolve() if self.production else None
+        if self.data_dir is not None:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.business_db = self.data_dir / "business.sqlite3" if self.production else None
+        if settings is None:
+            settings = (QSettings(str(self.data_dir / "window.ini"), QSettings.Format.IniFormat)
+                        if self.production else QSettings("Mochi", "Desktop Pet"))
+        self.settings = settings
+        self.observer = None
+        self._observer_timer = None
+        self._power = None
+        self.input_mode = "typing" if self.production else self.settings.value("defaultInput", "voice", type=str)
         if self.input_mode not in {"voice", "typing"}:
             self.input_mode = "voice"
 
-        self.pet = RefinePet()
-        self.reminders = RefineReminders()
-        self.work = RefineWork()
-        self.settings_panel = RefineSettings()
-        self.settings_panel.set_input_mode(self.input_mode)
-        self.settings_panel.input_mode_changed.connect(self.set_input_mode)
-        self.chat = RefineChat(self.submit, lambda: self.snapshot)
+        home = None
+        if self.production and self.settings.contains("homeAnchor"):
+            home = self.settings.value("homeAnchor", type=QPoint)
+        self.pet = RefinePet(
+            diagnostics=not self.production, voice_available=not self.production,
+            home=home,
+        )
+        if self.production:
+            self.pet.home_moved.connect(lambda position: self.settings.setValue("homeAnchor", position))
+
+        if self.production:
+            from .reminder import ReminderPanel
+            from .work_panel import PhasePanel
+
+            self.reminders = ReminderPanel(submit=self._action, advanced=True)
+            self.work = PhasePanel(submit=self._action)
+        else:
+            self.reminders = RefineReminders()
+            self.work = RefineWork()
+        self._init_reminder_delivery()
+        if self.production:
+            from deskpet.settings import SettingsStore
+            from .settings import SettingsPanel
+
+            self.settings_store = SettingsStore(self.business_db, initial_input_mode="typing")
+            self._settings_changed(self.settings_store.read())
+            self.settings_panel = SettingsPanel(
+                self.settings_store, submit=self._settings_submit,
+                save_preferences=self._save_preferences,
+                sound_preview=self.presentation.preview_sound,
+                notification_status=self.presentation.notification_status,
+                refresh_notification_permission=self.presentation.refresh_notification_permission,
+            )
+            self.settings_panel.settings_changed.connect(self._settings_changed)
+        else:
+            self.settings_panel = RefineSettings()
+            self.settings_panel.set_input_mode(self.input_mode)
+            self.settings_panel.input_mode_changed.connect(self.set_input_mode)
+
+        chat_store = ConversationStore(self.business_db) if self.production else None
+        self.chat = RefineChat(self.submit, lambda: self.snapshot, store=chat_store, conversation=conversation)
         self.chat.set_preference(self.input_mode)
         self.chat.toolbar_mode_changed.connect(self.pet.set_chat_toolbar)
         self.chat.typing_requested.connect(self.pet.activate_for_input)
+        self.chat.storage_error.connect(self._service_error)
         self.panels = {
-            "reminders": self.reminders,
-            "work": self.work,
+            "reminders": RefineScroll(self.reminders) if self.production else self.reminders,
+            "work": RefineScroll(self.work) if self.production else self.work,
             "settings": self.settings_panel,
             "input": self.chat,
         }
 
         options = copy.copy(args)
-        configured = load_adapters(getattr(args, "adapters", None))
-        configured.pop("gui", None)
-        configured.setdefault("ui_surface", "deskpet.c_ui.surface:create_surface")
-        configured.setdefault("work_sessions", "deskpet.work_sessions.service:factory")
-        options.adapters = configured
-        options.realtime_scenario = getattr(args, "realtime_scenario", True)
-        options.scenario_initial_time = getattr(args, "scenario_initial_time", None) or datetime.now(ZONE).replace(
-            hour=16, minute=30, second=0, microsecond=0
-        )
+        if self.production:
+            from deskpet.observation_v2.desktop import DesktopObserver
+
+            self.observer = DesktopObserver(self.data_dir)
+            options.business_database = self.business_db
+            options.observation_database = self.observer.database
+            if QGuiApplication.platformName() not in {"offscreen", "minimal"}:
+                self.observer.start()
+                self._observer_timer = QTimer(self.pet)
+                self._observer_timer.timeout.connect(self.observer.refresh)
+                self._observer_timer.start(2000)
+        else:
+            configured = load_adapters(getattr(args, "adapters", None))
+            configured.pop("gui", None)
+            configured.setdefault("ui_surface", "deskpet.c_ui.surface:create_surface")
+            configured.setdefault("work_sessions", "deskpet.work_sessions.service:factory")
+            options.adapters = configured
+            options.realtime_scenario = getattr(args, "realtime_scenario", True)
+            options.scenario_initial_time = getattr(args, "scenario_initial_time", None) or datetime.now(ZONE).replace(
+                hour=16, minute=30, second=0, microsecond=0
+            )
+            self.demo_day = options.scenario_initial_time.astimezone(ZONE)
+
         options.auto_smoke = False
-        self.demo_day = options.scenario_initial_time.astimezone(ZONE)
-        self.window = DesktopWorkbench(options, external_surface=self)
+        try:
+            self.window = DesktopWorkbench(options, external_surface=self)
+        except BaseException:
+            if self.observer is not None:
+                self.observer.stop()
+            raise
         self.window.setWindowTitle("Mochi · 协作联调台")
-        self.window.worker.ready.connect(self.seed_tasks)
-        self.window.worker.error.connect(self._service_error)
+        self.window.service_error.connect(self._service_error)
         self.window.finished.connect(self._finished)
-        self._install_demo_controls()
+        if self.production:
+            self.window.services_ready.connect(self._service_ready)
+            try:
+                self._power = DesktopPower(app, self.pet, self.window.action.emit)
+            except (AttributeError, ImportError, OSError) as error:
+                log.warning("Native power events are unavailable (%s)", type(error).__name__)
+        else:
+            self.window.services_ready.connect(self.seed_tasks)
+            self._install_demo_controls()
 
         self.pet.section_requested.connect(self.open_section)
         self.pet.input_held.connect(self._input_held)
@@ -105,6 +172,30 @@ class RefineSession:
         self.pet.quit_requested.connect(self.quit)
         self._render_toolbar()
         self.pet.show()
+
+    def _service_ready(self):
+        if self.chat.recovered_event:
+            self.window.action.emit({"kind": "recover_chat_result", "event_id": self.chat.recovered_event})
+
+    def _settings_changed(self, settings):
+        self.pet.set_reduce_motion(settings.reduce_motion)
+        self.pet.set_proactive_movement(settings.allow_proactive_movement)
+
+    def _save_preferences(self, expected_version, changes):
+        if not self.window.ready_for_actions:
+            self.settings_panel.finish_preference_save(False)
+            return
+        self._pending_settings = uuid4().hex
+        self.window.action.emit({
+            "kind": "settings_update", "event_id": self._pending_settings,
+            "expected_version": expected_version, "changes": changes,
+        })
+
+    def _settings_submit(self, action):
+        if not self.window.ready_for_actions or self._pending_habit:
+            return
+        self._pending_habit = uuid4().hex
+        self.window.action.emit({**action, "event_id": self._pending_habit})
 
     def _install_demo_controls(self):
         demo = self.window.menuBar().addMenu("小猫演示")
@@ -151,6 +242,19 @@ class RefineSession:
     def _receive_result(self, result):
         self.chat.receive_result(result)
         event = result.get("command_id") or result.get("event_id")
+        if self.production:
+            self.reminders.receive_result(result)
+            self.work.receive_result(result)
+            if event and event == self._pending_settings:
+                self._pending_settings = None
+                self.settings_panel.finish_preference_save(result.get("status") == "applied")
+            if event and event == self._pending_habit:
+                self._pending_habit = None
+                if result.get("status") == "applied":
+                    self._show_section("work")
+                else:
+                    self.show_message("未能开始这项习惯。请查看当前专注状态。")
+            return
         task = self._pending_seed.pop(event, None)
         if task and result.get("status") == "applied":
             self._action("reminder.confirm", task_id=task, version=result["actual_version"])
@@ -162,30 +266,34 @@ class RefineSession:
                 self.show_message("这轮专注未能开始，请从联调台查看结果。")
 
     def _service_error(self, message):
-        if not self._closing:
+        if not self._closing and message != self._last_service_error:
+            self._last_service_error = message
             self.show_message(message)
 
     def render_snapshot(self, snapshot):
         self.snapshot = snapshot
-        self.reminders.render_snapshot(snapshot)
+        notes = self._render_reminder_delivery(snapshot)
+        if self.production:
+            self.reminders.render_snapshot({**snapshot, "presentation_pending": notes})
+        else:
+            self.reminders.render_snapshot(snapshot)
+            if not self._can_start_focus():
+                self._invite_waiting = False
         self.work.render_snapshot(snapshot)
+        if self.production:
+            settings = snapshot["settings"]
+            self.settings_panel.sync_settings_version(settings["version"])
+            self.pet.set_reduce_motion(settings["reduce_motion"])
+            self.pet.set_proactive_movement(settings["allow_proactive_movement"])
         self._render_toolbar()
-        tasks = {task["task_id"]: task for task in snapshot.get("tasks", [])}
-        for delivery, command in list(self.seen_deliveries.items()):
-            task = tasks.get(command.task_id, {})
-            if task.get("status") != "registered" or task.get("version") != command.task_version:
-                self.seen_deliveries.pop(delivery, None)
-        self.waiting_prompts = deque(item for item in self.waiting_prompts if self._valid_prompt(item))
-        if not any(item.kind == "pomodoro" for item in self.waiting_prompts) and not self._can_start_focus():
-            self._invite_waiting = False
-        if self.prompt and not self._valid_prompt(self.prompt):
-            self._clear_prompt()
-        self._show_next_prompt()
 
     def _render_toolbar(self):
         work = current_work(self.snapshot)
+        state = work["state"] if work else None
+        if (phase := self.snapshot.get("active_phase")) and phase["kind"] != "focus":
+            state = "paused" if phase["state"] == "paused" else "resting"
         self.pet.set_status(
-            len(active_reminders(self.snapshot)), work["state"] if work else None, self.input_mode
+            len(active_reminders(self.snapshot)), state, self.input_mode
         )
 
     def set_input_mode(self, mode):
@@ -216,101 +324,6 @@ class RefineSession:
 
     def show_message(self, message, on_answer=None):
         self.waiting_prompts.append(Prompt("message", message, on_answer))
-        self._show_next_prompt()
-
-    def can_report_display(self):
-        return bool(
-            self.prompt and self.prompt.command and not self._closing and self.pet.isVisible()
-            and QGuiApplication.platformName() not in {"offscreen", "minimal"}
-        )
-
-    def show_reminder(self, command):
-        previous = self.seen_deliveries.get(command.delivery_id)
-        if previous:
-            if command.expires_at == previous.expires_at:
-                return
-            prompts = list(self.waiting_prompts)
-            if self.prompt:
-                prompts.append(self.prompt)
-            for item in prompts:
-                if item.command and item.command.delivery_id == command.delivery_id:
-                    item.command = command
-                    self.seen_deliveries[command.delivery_id] = command
-                    return
-        self.seen_deliveries[command.delivery_id] = command
-        item = Prompt("reminder", f"现在该{command.content}了。要查看这条提醒吗？", command=command)
-        # A due reminder can interrupt a demo message. An already-visible reminder keeps its place.
-        if self.prompt and not self.prompt.command:
-            self.waiting_prompts.appendleft(self.prompt)
-            self._clear_prompt()
-        first_other = next((i for i, queued in enumerate(self.waiting_prompts) if not queued.command),
-                           len(self.waiting_prompts))
-        self.waiting_prompts.insert(first_other, item)
-        self._show_next_prompt()
-
-    def dismiss_reminder(self, task_id):
-        def keep(item):
-            return not item.command or item.command.task_id != task_id
-
-        self.waiting_prompts = deque(item for item in self.waiting_prompts if keep(item))
-        if self.prompt and not keep(self.prompt):
-            self._clear_prompt()
-        self._show_next_prompt()
-
-    def _valid_prompt(self, item):
-        if not item.command:
-            return item.kind != "pomodoro" or self._can_start_focus()
-        command = item.command
-        task = next((task for task in self.snapshot.get("tasks", [])
-                     if task["task_id"] == command.task_id), None)
-        return bool(task and task["version"] == command.task_version and task["status"] == "registered"
-                    and (item.painted or datetime.fromisoformat(self.snapshot["now"]) < command.expires_at))
-
-    def _clear_prompt(self):
-        if self.prompt and self.prompt.kind == "pomodoro" and not self._can_start_focus():
-            self._invite_waiting = False
-        self.prompt = None
-        self.pet.clear_bubble()
-
-    def _show_next_prompt(self):
-        if self.prompt or not self.waiting_prompts:
-            return
-        item = self.waiting_prompts[0]
-        if item.command:
-            now = self.snapshot.get("now")
-            if not now or datetime.fromisoformat(now) < item.command.requested_at:
-                return
-        self.waiting_prompts.popleft()
-        self.prompt = item
-
-        def answer(yes):
-            if self.prompt is item:
-                self.answer_prompt(yes)
-
-        interactive = bool(item.command or item.on_answer)
-        self.pet.show_bubble(
-            item.text,
-            on_answer=answer if interactive else None,
-            on_painted=(lambda: self._painted(item)) if item.command else None,
-            on_dismiss=(lambda: answer(False)) if not interactive else None,
-            animate=item.kind == "pomodoro",
-        )
-
-    def _painted(self, item):
-        if self.prompt is item and self._valid_prompt(item) and not item.painted:
-            item.painted = self.context.report_display(item.command.delivery_id)
-        return item.painted
-
-    def answer_prompt(self, yes):
-        item = self.prompt
-        if not item:
-            return
-        # The bubble's callback owns one decision even if the button is clicked again.
-        self._clear_prompt()
-        if yes and item.command:
-            self._show_section("reminders")
-        if item.on_answer:
-            item.on_answer(yes)
         self._show_next_prompt()
 
     def _can_start_focus(self):
@@ -365,6 +378,13 @@ class RefineSession:
             self._closing = False
 
     def _finished(self):
+        if self._power is not None:
+            self._power.close()
+        if self._observer_timer is not None:
+            self._observer_timer.stop()
+        if self.observer is not None:
+            self.observer.stop()
+        self.settings.sync()
         self.pet.close()
         self.app.quit()
 
@@ -378,3 +398,35 @@ def run_gui(args):
         return app.exec()
     finally:
         session.quit()
+
+
+def run_desktop(data_dir=None):
+    """Launch the daily desktop pet with a single writer for the local profile."""
+    set_dpi_awareness()
+    app = QApplication.instance() or QApplication(["Mochi"])
+    app.setOrganizationName("Mochi")
+    app.setApplicationName("Mochi")
+    app.setQuitOnLastWindowClosed(False)
+    if data_dir is None:
+        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+    data_dir = Path(data_dir).expanduser().resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(data_dir / "desktop.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock():
+        message = "Mochi 已在使用此本地数据目录。"
+        if QGuiApplication.platformName() in {"offscreen", "minimal"}:
+            print(message, file=sys.stderr)
+        else:
+            QMessageBox.information(None, "Mochi", message)
+        return 1
+    session = None
+    try:
+        session = RefineSession(app, SimpleNamespace(
+            profile="realtime", scenario="desktop", output=None, data_dir=data_dir,
+        ))
+        return app.exec()
+    finally:
+        if session is not None:
+            session.quit()
+        lock.unlock()

@@ -34,7 +34,7 @@ Start with [M0 setup and acceptance](docs/m0.md), [public contracts](docs/contra
 [architecture decisions](docs/adr/README.md), and the [B/C/D handoffs](docs/handoff/README.md).
 Windows agents can run [the acceptance script](scripts/smoke_windows.ps1).
 
-## What the cat does
+## What the original LLM pet does
 
 - **Sees your desktop** — a whole-screen screenshot **and** a distilled text scene
   go to the LLM each decision. It genuinely reacts to *what's on screen* (begs at
@@ -115,15 +115,53 @@ the screenshot is captured fresh per decision.
 
 ---
 
-## Quick start (Windows)
+## Quick start (Windows and macOS)
 
-```bat
-python -m pip install -r requirements.txt
-python run.py
+```sh
+uv sync --python 3.12 --locked
+uv run python -m deskpet
 ```
 
-That's it. With no art and no LLM configured it runs the placeholder cat with
-rule-based behaviour. To give it a real brain, point it at an LLM (below).
+After setup, double-click `start_mochi.bat` on Windows or
+`start_mochi.command` on macOS. Click the cat's toolbar to open reminders,
+focus, chat, or settings. The focus panel can start a timer with the supplied
+duration and an optional title. Text chat also accepts local commands such as
+「开始 25 分钟」 and 「暂停专注」.
+
+Mochi stores its reminders, focus history, settings, chat, and draft in the
+platform's local application data directory. Use `python -m deskpet --data-dir PATH`
+to select another profile directory. Screen capture is off by default and can
+be enabled in settings.
+
+Run `python -m deskpet --legacy` to open the original LLM pet, or
+`scripts/start_ui_refine.command` on macOS to open the scripted Refine demo.
+
+### System notification setup
+
+Run the quick-start dependency install first. Then choose the setup for your
+platform and enable system notifications in Mochi's settings.
+
+- **macOS 13 or later.** With the Xcode Command Line Tools installed, run
+  `uv run --locked python scripts/build_mochi_macos.py`. Open
+  `.mochi-native/Mochi.app` directly or run `start_mochi.command`. Grant the
+  notification permission when macOS asks. Adjust banners and sounds for Mochi
+  under System Settings → Notifications. The local ad-hoc signed app links to
+  this checkout and its Python environment. If either moves or Python changes,
+  remove the old bundle and rerun the builder. Distribution to other Macs requires packaging,
+  Developer ID signing, and notarization.
+- **Windows 10 or 11.** Run
+  `uv run --locked python -m deskpet.c_ui.windows_notification_identity install`
+  from the checkout. Open **Mochi** from Start. The installer creates a shortcut
+  for the current user with Mochi's application ID. Run the command again if
+  the checkout or environment moves, or use `remove` to delete the shortcut.
+  Windows can show toasts while Mochi is running. It may take a moment after
+  creating the shortcut for Windows to recognize the new identity. Adjust the
+  app's notification permissions and sound in Windows Settings.
+
+Notifications display generic text. macOS can register eligible hard deadlines
+in advance once authorized. The Windows desktop build submits at the deadline
+while running and checks overdue reminders when it resumes. The plain macOS
+Python command still runs Mochi with its desktop channels.
 
 ### Running multiple cats 🐱🐱🐱
 
@@ -174,7 +212,7 @@ Examples:
 :: cloud (Gemini)
 set DESKPET_LLM_PROVIDER=gemini
 set GEMINI_API_KEY=...your key...
-python run.py
+python run.py --legacy
 ```
 
 ### Using a remote Ollama (a GPU box on your network)
@@ -192,7 +230,7 @@ then point the pet at it:
 set DESKPET_LLM_PROVIDER=ollama
 set DESKPET_LLM_MODEL=gemma4:12b
 set DESKPET_LLM_BASE_URL=http://192.168.1.50:11434   :: <- the box's IP
-python run.py
+python run.py --legacy
 ```
 
 Only expose Ollama on a network you trust. If the pet can't reach the brain, it
@@ -295,10 +333,10 @@ the screenshot size, and recalled memories:
 
 ```bat
 :: PowerShell
-$env:DESKPET_LOG_LEVEL="DEBUG"; python .\run.py
+$env:DESKPET_LOG_LEVEL="DEBUG"; python .\run.py --legacy
 :: cmd
 set DESKPET_LOG_LEVEL=DEBUG
-python run.py
+python run.py --legacy
 ```
 
 ---

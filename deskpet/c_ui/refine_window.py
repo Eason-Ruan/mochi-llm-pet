@@ -173,10 +173,28 @@ class _Toolbar(QWidget):
         _surface(self, 13)
 
 
+class RefineScroll(QScrollArea):
+    """Keep editable panels within the desktop without clipping their controls."""
+
+    def __init__(self, panel):
+        super().__init__()
+        self.setObjectName("refine-scroll")
+        self.setWidgetResizable(True)
+        self.setWidget(panel)
+        self.setStyleSheet(
+            f"QScrollArea#refine-scroll {{background: {CREAM}; border: 2px solid {INK}; border-radius: 10px}}"
+        )
+        panel.setStyleSheet(f"QGroupBox {{background: {CREAM}; color: {TEXT}}}")
+
+    def sizeHint(self):
+        return QSize(WIDTH, min(430, self.widget().sizeHint().height() + 4))
+
+
 class _Bubble(QFrame):
     def __init__(
         self, pet, text: str, on_answer: Callable[[bool], None] | None,
         on_painted: Callable[[], bool | None] | None, on_dismiss: Callable[[], None] | None,
+        before_paint: Callable[[], bool] | None = None,
     ):
         super().__init__(pet)
         self.setObjectName("refine-bubble")
@@ -184,6 +202,7 @@ class _Bubble(QFrame):
         self._on_painted = on_painted
         self._on_answer = on_answer
         self._on_dismiss = on_dismiss
+        self._before_paint = before_paint
         self._paint_timer = QTimer(self)
         self._paint_timer.setSingleShot(True)
         self._paint_timer.timeout.connect(self._report)
@@ -271,6 +290,10 @@ class _Bubble(QFrame):
             super().keyPressEvent(event)
 
     def paintEvent(self, event):
+        if (self._pet._backing_store_paint and self._before_paint is not None
+                and not self._before_paint()):
+            self.hide()
+            return
         _surface(self, 13)
         if (self._on_painted is not None and self._pet._backing_store_paint
                 and not self._paint_timer.isActive()):
@@ -278,7 +301,8 @@ class _Bubble(QFrame):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if self._on_painted is not None and QGuiApplication.platformName() not in ("offscreen", "minimal"):
+        if self._on_painted is not None and (QGuiApplication.platformName() not in ("offscreen", "minimal")
+                                             or getattr(self._pet, "_synthetic_receipts", False)):
             self._retry_timer.start()
 
     def _report(self):
@@ -290,19 +314,30 @@ class _Bubble(QFrame):
 
 
 class RefinePet(DesktopPet):
-    """Anchored cat, native child controls, and an optional read-only panel."""
+    """Anchored cat with native child controls and one selected panel."""
 
     section_requested = pyqtSignal(str)
     input_held = pyqtSignal()
     diagnostics_requested = pyqtSignal()
     collapsed = pyqtSignal()
+    home_moved = pyqtSignal(QPoint)
 
-    def __init__(self):
+    def __init__(self, *, diagnostics=True, voice_available=True, home=None):
         super().__init__()
         self.setWindowTitle("Mochi")
         if sys.platform == "darwin":
             self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.setToolTip("")
+        self._diagnostics = diagnostics
+        self._voice_available = voice_available
+        self._reduce_motion = False
+        self._allow_proactive_movement = True
+        self._drag_origin = None
+        self._home_anchor = QPoint(home) if isinstance(home, QPoint) else None
+        self._temporary_anchor = None
+        self._motion_pose = QTimer(self)
+        self._motion_pose.setSingleShot(True)
+        self._motion_pose.timeout.connect(self._set_base_pose)
         self._expanded = True
         self._closing_toolbar = False
         self._desired_panel: QWidget | None = None
@@ -367,12 +402,65 @@ class RefinePet(DesktopPet):
         self._expand.clicked.connect(self._open_toolbar)
         self._expand.hide()
         self._update_buttons()
+        screen = self.screen()
+        if self._home_anchor is None or QGuiApplication.screenAt(self._home_anchor) is None:
+            area = screen.availableGeometry() if screen is not None else self.geometry()
+            bottom_margin = 245 if self._diagnostics else 32
+            self._home_anchor = QPoint(
+                max(area.left() + MARGIN, area.right() - WIDTH - MARGIN - 24),
+                max(area.top() + MARGIN, area.bottom() - CAT_HEIGHT - GAP - self.toolbar.height() - bottom_margin),
+            )
         self._layout_pet()
-        if self.screen() is not None:
-            area = self.screen().availableGeometry()
-            # Leave enough space below the cat for the taller Figma panels.
-            self.move(max(area.left(), area.right() - self.width() - 24),
-                      max(area.top(), area.bottom() - self.height() - 245))
+
+    def set_reduce_motion(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._reduce_motion:
+            return
+        self._reduce_motion = enabled
+        if enabled:
+            self.end_temporary_motion()
+            self.timer.stop()
+        else:
+            self.timer.start()
+        self.update()
+
+    def set_proactive_movement(self, enabled: bool) -> None:
+        if self._allow_proactive_movement != enabled:
+            self._allow_proactive_movement = enabled
+            if not enabled:
+                self.end_temporary_motion()
+
+    def apply_motion_intent(self, position_hint, animation):
+        if self._press is not None or self._reduce_motion:
+            return
+        if position_hint == "screen_edge" and self._allow_proactive_movement:
+            screen = QGuiApplication.screenAt(self._home_anchor) or self.screen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                at_left = self._home_anchor.x() + WIDTH // 2 <= area.center().x()
+                x = area.left() + MARGIN if at_left else area.right() - WIDTH - MARGIN + 1
+                self._temporary_anchor = QPoint(x, self._home_anchor.y())
+                self._layout_pet()
+        elif position_hint == "home":
+            self.end_temporary_motion()
+
+        pose = {"look_up": "stretch", "wave": "happy", "approach": "walk"}.get(animation)
+        if pose and pose in self.player.clips:
+            self.player.set_state(pose, force=True)
+            self._motion_pose.start(850)
+            self.update(self._cat_area)
+
+    def end_temporary_motion(self):
+        self._motion_pose.stop()
+        self._set_base_pose()
+        if self._temporary_anchor is not None:
+            self._temporary_anchor = None
+            self._layout_pet()
+
+    def _set_base_pose(self):
+        poses = {"focusing": "sit", "resting": "lie"}
+        self.player.set_state(poses.get(self._work_state, "idle"))
+        self.update(self._cat_area)
 
     def set_status(self, count: int, work_state: str | None, input_mode: str) -> None:
         status_changed = (self.pending_count, self._work_state, self._input_mode) != (count, work_state, input_mode)
@@ -381,7 +469,8 @@ class RefinePet(DesktopPet):
         self.pending_count = count
         self._work_state = work_state
         self._input_mode = input_mode
-        self.player.set_state("sit" if work_state == "focusing" else "idle")
+        if not self._motion_pose.isActive():
+            self._set_base_pose()
         self._badge.setText(str(count))
         self._update_buttons()
         self.update(self._cat_area)
@@ -410,11 +499,12 @@ class RefinePet(DesktopPet):
                     "typing": ("keyboard", "打字输入"),
                     None: ("back", "返回"),
                 }[mode]
-                button.hold_enabled = mode is not None
+                button.hold_enabled = self._voice_available and mode is not None
                 button.setIcon(icon(icon_name, color, 16))
             elif key == "work":
                 variants = {
                     "focusing": ("work-focusing", "专注中"),
+                    "resting": ("work-paused", "休息中"),
                     "paused": ("work-paused", "已暂停"),
                     "break_due": ("work-review", "待回顾"),
                     "ended": ("work-review", "已结束"),
@@ -437,6 +527,11 @@ class RefinePet(DesktopPet):
         self._sync_panel()
 
     def _start_fade(self, widget, opening, complete):
+        if self._reduce_motion:
+            widget.setGraphicsEffect(None)
+            complete()
+            return
+
         def finished():
             def clean():
                 if widget.graphicsEffect() is effect:
@@ -515,11 +610,12 @@ class RefinePet(DesktopPet):
         self, text: str, on_answer: Callable[[bool], None] | None = None,
         on_painted: Callable[[], bool | None] | None = None, *,
         on_dismiss: Callable[[], None] | None = None, animate: bool = False,
+        before_paint: Callable[[], bool] | None = None,
     ) -> None:
         self.clear_bubble()
-        self.bubble = _Bubble(self, text, on_answer, on_painted, on_dismiss)
+        self.bubble = _Bubble(self, text, on_answer, on_painted, on_dismiss, before_paint)
         self._layout_pet()
-        if animate:
+        if animate and not self._reduce_motion:
             self._animate_bubble(self.bubble)
         self.bubble.show()
         self.update(self.bubble.geometry())
@@ -551,7 +647,8 @@ class RefinePet(DesktopPet):
     def _bubble_exposed(self, bubble: _Bubble) -> bool:
         handle = self.windowHandle()
         return (
-            bubble is self.bubble and QGuiApplication.platformName() not in ("offscreen", "minimal")
+            bubble is self.bubble and (QGuiApplication.platformName() not in ("offscreen", "minimal")
+                                       or getattr(self, "_synthetic_receipts", False))
             and bool(handle and handle.isExposed()) and bubble.isVisible()
             and not self.isMinimized() and not bubble.visibleRegion().isEmpty()
         )
@@ -580,17 +677,43 @@ class RefinePet(DesktopPet):
             self._in_layout = False
 
     def _update_geometry(self):
-        anchor = self.y() + self._cat_area.top()
-        screen = self.screen()
+        anchor = self._temporary_anchor if self._temporary_anchor is not None else self._home_anchor
+        screen = QGuiApplication.screenAt(anchor + QPoint(WIDTH // 2, CAT_HEIGHT // 2)) or self.screen()
         available = screen.availableGeometry() if screen is not None else None
         y = MARGIN
         regions = QRegion()
 
+        bubble_height = (
+            max(self.bubble.sizeHint().height(), self.bubble.heightForWidth(WIDTH)) + GAP
+            if self.bubble is not None else 0
+        )
+        toolbar_height = self.toolbar.height() if self._expanded or self._closing_toolbar else self._expand.height()
+        panel_height = 0
+        panel_above = False
+        if self._panel is not None:
+            fixed_height = 2 * MARGIN + bubble_height + CAT_HEIGHT + GAP + toolbar_height + GAP
+            max_panel_height = max(1, available.height() - fixed_height) if available is not None else None
+            limiter = getattr(self._panel, "set_height_limit", None)
+            if limiter is not None and max_panel_height is not None:
+                limiter(max_panel_height)
+            panel_height = max(self._panel.minimumHeight(), self._panel.sizeHint().height(), 1)
+            if self._panel.hasHeightForWidth():
+                panel_height = max(panel_height, self._panel.heightForWidth(WIDTH))
+            if max_panel_height is not None and isinstance(self._panel, QScrollArea):
+                panel_height = min(panel_height, max_panel_height)
+            below = CAT_HEIGHT + GAP + toolbar_height + GAP + panel_height + MARGIN
+            above = MARGIN + panel_height + GAP + bubble_height
+            panel_above = bool(available is not None and anchor.y() + below > available.bottom() + 1
+                               and anchor.y() - above >= available.top())
+            if panel_above:
+                self._panel.setGeometry(MARGIN, y, WIDTH, panel_height)
+                regions += QRegion(self._panel.geometry())
+                y += panel_height + GAP
+
         if self.bubble is not None:
-            bubble_height = max(self.bubble.sizeHint().height(), self.bubble.heightForWidth(WIDTH))
-            self.bubble.setGeometry(MARGIN, y, WIDTH, bubble_height)
+            self.bubble.setGeometry(MARGIN, y, WIDTH, bubble_height - GAP)
             regions += QRegion(self.bubble.geometry())
-            y += bubble_height + GAP
+            y += bubble_height
 
         self._cat_area = QRect(MARGIN, y, WIDTH, CAT_HEIGHT)
         regions += QRegion(QRect((WIDTH + 2 * MARGIN - 88) // 2, y, 88, CAT_HEIGHT))
@@ -604,18 +727,15 @@ class RefinePet(DesktopPet):
             regions += QRegion(self._expand.geometry())
             y += self._expand.height()
 
-        if self._panel is not None:
+        if self._panel is not None and not panel_above:
             y += GAP
-            panel_height = max(self._panel.minimumHeight(), self._panel.sizeHint().height(), 1)
-            if self._panel.hasHeightForWidth():
-                panel_height = max(panel_height, self._panel.heightForWidth(WIDTH))
             self._panel.setGeometry(MARGIN, y, WIDTH, panel_height)
             regions += QRegion(self._panel.geometry())
             y += panel_height
 
         size = QSize(WIDTH + 2 * MARGIN, y + MARGIN)
-        x = self.x()
-        y = anchor - self._cat_area.top()
+        x = anchor.x() - MARGIN
+        y = anchor.y() - self._cat_area.top()
         if available is not None:
             x = max(available.left(), min(x, available.right() - size.width() + 1))
             y = max(available.top(), min(y, available.bottom() - size.height() + 1))
@@ -647,21 +767,53 @@ class RefinePet(DesktopPet):
         painter.drawPixmap(target, frame)
 
     def mousePressEvent(self, event):
-        if self._cat_area.contains(event.position().toPoint()):
-            super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self._cat_area.contains(event.position().toPoint()):
+            self._drag_origin = event.globalPosition().toPoint()
+            self._press = self._drag_origin - (self.pos() + self._cat_area.topLeft())
+            self._moved = False
+            event.accept()
         else:
             event.ignore()
 
+    def mouseMoveEvent(self, event):
+        if self._press is None or not event.buttons() & Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        pointer = event.globalPosition().toPoint()
+        if not self._moved and (pointer - self._drag_origin).manhattanLength() < 4:
+            return
+        self._moved = True
+        self.end_temporary_motion()
+        target = pointer - self._press
+        screen = QGuiApplication.screenAt(pointer) or self.screen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            compact_height = CAT_HEIGHT + GAP + self.toolbar.height() + MARGIN
+            target.setX(max(area.left() + MARGIN, min(target.x(), area.right() - WIDTH - MARGIN + 1)))
+            target.setY(max(area.top() + MARGIN, min(target.y(), area.bottom() - compact_height + 1)))
+        self._home_anchor = target
+        self._layout_pet()
+        event.accept()
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._press is not None:
-            self._press = None
+            self._press = self._drag_origin = None
+            if self._moved:
+                self.home_moved.emit(QPoint(self._home_anchor))
+            elif not self._expanded:
+                self._open_toolbar()
             event.accept()
         else:
             event.ignore()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.addAction("打开原联调界面", self.diagnostics_requested.emit)
+        if self._diagnostics:
+            menu.addAction("打开原联调界面", self.diagnostics_requested.emit)
+        else:
+            for key, label in (("work", "专注与回顾"), ("reminders", "提醒事项"),
+                               ("input", "聊天"), ("settings", "设置")):
+                menu.addAction(label, lambda checked=False, section=key: self.section_requested.emit(section))
         menu.addSeparator()
         menu.addAction("退出 Mochi", self.quit_requested.emit)
         menu.exec(event.globalPos())

@@ -1,6 +1,7 @@
 """Local activity accounting and optional desktop sampling for Observation v2."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import blake2b
@@ -93,6 +94,9 @@ class Activity:
 class CaptureRequest:
     activity: Activity
     reason: str
+
+
+SampleWrite = Callable[[ActivitySample, Activity | None, bool, bool], None]
 
 
 class ActivityStore:
@@ -251,7 +255,9 @@ class ActivityRecorder:
                  poll_interval_s: float | None = None,
                  capture_interval_s: float = CAPTURE_INTERVAL_S,
                  capture_enabled: bool = False, excluded_apps: tuple[str, ...] = (),
-                 excluded_domains: tuple[str, ...] = ()) -> None:
+                 excluded_domains: tuple[str, ...] = (),
+                 on_sample_write: SampleWrite | None = None,
+                 reset_wall_on_rollback: bool = False) -> None:
         self.store = store
         self.poll_interval_s = (POLL_INTERVAL_S.get(platform, 1.0)
                                 if poll_interval_s is None else poll_interval_s)
@@ -260,6 +266,8 @@ class ActivityRecorder:
                 raise ValueError("Activity and capture intervals must be positive and finite")
         self.capture_interval_s = capture_interval_s
         self.capture_enabled = capture_enabled
+        self._on_sample_write = on_sample_write
+        self._reset_wall_on_rollback = reset_wall_on_rollback
         self._excluded_apps = (*_DEFAULT_EXCLUDED_APPS, *(app.strip().casefold() for app in excluded_apps if app.strip()))
         self._excluded_domains = tuple(domain.strip().casefold().lstrip(".").rstrip(".")
                                        for domain in excluded_domains if domain.strip().strip("."))
@@ -339,22 +347,31 @@ class ActivityRecorder:
                       and previous.screen_locked is sanitized.screen_locked
                       and previous.session_id == sanitized.session_id)
         if self._wall_floor is not None and observed_at < self._wall_floor:
+            if not self._reset_wall_on_rollback:
+                self.close()
+                self.last_capture_reason = "clock_rollback"
+                return None
             self.close()
-            self.last_capture_reason = "clock_rollback"
-            return None
+            current, continuous = None, False
         same = not excluded and continuous and identity == self._identity and current is not None
+        boundary = not continuous or excluded or (self._identity is not None and self._identity.private != private)
         with self.store.connection:
             if continuous and current is not None:
-                self.store._extend(replace(
+                current = replace(
                     current, ended_at=observed_at, duration_s=current.duration_s + elapsed,
                     idle_s=idle_s if same else current.idle_s,
                     system_sampled_at=system_at if same else current.system_sampled_at,
-                ))
+                )
+                self.store._extend(current)
             if not same and not excluded:
                 current = self.store._insert(Activity(
                     0, observed_at, observed_at, 0.0, app, redacted_title,
                     domain, idle_s, sample.screen_locked, system_at,
                 ))
+            if self._on_sample_write is not None:
+                # Readers see both the new Activity and any realtime invalidation
+                # when this transaction commits.
+                self._on_sample_write(sanitized, None if excluded else current, boundary, not same)
 
         if excluded:
             self.close()
@@ -385,6 +402,8 @@ class ActivityRecorder:
             return "private_window"
         if identity.app is None:
             return "foreground_unavailable"
+        if self._excluded_domains and self.browser_url_status == "unavailable":
+            return "browser_url_unavailable"
         if self._last_capture_at is None:
             return "initial"
         since_capture = sample.monotonic_s - self._last_capture_at

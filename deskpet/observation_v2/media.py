@@ -9,10 +9,15 @@ import math
 from pathlib import Path
 import re
 import subprocess
+from threading import Event
 
 import mss
 from mss.exception import ScreenShotError
 from PIL import Image
+
+from .activity import (
+    _DEFAULT_EXCLUDED_APPS, _SENSITIVE_TITLE_WORDS, ActivitySample, _is_browser, _page_domain, _private_title,
+)
 
 _WIDTH, _HEIGHT = 960, 540
 _FRAME_BYTES = _WIDTH * _HEIGHT * 3
@@ -41,6 +46,180 @@ def capture_desktop() -> tuple[datetime, bytes]:
         return captured_at, _jpeg(Image.frombytes("RGB", raw.size, raw.rgb))
     except (ScreenShotError, IndexError) as exc:
         raise RuntimeError("Desktop capture failed") from exc
+
+
+def cloud_window_eligible(
+    sample: ActivitySample, *, browser_url_required: bool, platform: str,
+) -> bool:
+    """Require enough native metadata to establish a non-private foreground window."""
+    if (
+        platform not in {"darwin", "win32"} or sample.screen_locked is not False
+        or not sample.session_id or not sample.app_name or not sample.window_title
+        or type(sample.window_id) is not int or sample.window_id <= 0
+        or sample.private_window is True or _private_title(sample.window_title)
+    ):
+        return False
+    title = sample.window_title.casefold()
+    if any(word in title for word in _SENSITIVE_TITLE_WORDS):
+        return False
+    if any(app in sample.app_name.casefold() for app in _DEFAULT_EXCLUDED_APPS):
+        return False
+    if _is_browser(sample.app_name):
+        if sample.private_window is not False:
+            return False
+        if browser_url_required and _page_domain(sample.url) is None:
+            return False
+    return True
+
+
+def _mac_window(window_id: int) -> Image.Image:
+    import AppKit
+    import Quartz
+
+    if not Quartz.CGPreflightScreenCaptureAccess():
+        raise RuntimeError("Window capture is unavailable without screen recording permission")
+    app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    if app is None:
+        raise RuntimeError("No foreground window")
+    windows = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+        Quartz.kCGNullWindowID,
+    ) or []
+    window = next((window for window in windows if window.get("kCGWindowNumber") == window_id), None)
+    if (
+        window is None or window.get("kCGWindowOwnerPID") != app.processIdentifier()
+        or window.get("kCGWindowLayer") != 0
+    ):
+        raise RuntimeError("The foreground window could not be verified")
+    try:
+        from ScreenCaptureKit import SCScreenshotManager
+    except ImportError:
+        # Older macOS can still render exactly one WindowServer surface.
+        snapshot = Quartz.CGWindowListCreateImageFromArray(
+            Quartz.CGRectNull, [window_id], Quartz.kCGWindowImageBoundsIgnoreFraming,
+        )
+    else:
+        snapshot = _mac_single_window_image(SCScreenshotManager, window_id, app.processIdentifier())
+    if snapshot is None:
+        raise RuntimeError("Single-window capture failed")
+    representation = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(snapshot)
+    data = representation.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+    if data is None:
+        raise RuntimeError("Single-window capture could not be encoded")
+    with Image.open(BytesIO(bytes(data))) as captured:
+        rgba = captured.convert("RGBA")
+    background = Image.new("RGB", rgba.size)
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
+
+
+def _mac_single_window_image(manager, window_id: int, owner_pid: int):
+    from ScreenCaptureKit import SCContentFilter, SCShareableContent, SCStreamConfiguration
+
+    def result_from(call):
+        done = Event()
+        result = None
+
+        def complete(value, error):
+            nonlocal result
+            if error is None:
+                result = value
+            done.set()
+
+        call(complete)
+        if not done.wait(timeout=1.2) or result is None:
+            raise RuntimeError("Single-window capture did not complete")
+        return result
+
+    content = result_from(
+        lambda complete: SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+            True, True, complete,
+        ),
+    )
+    window = next((window for window in content.windows() if window.windowID() == window_id), None)
+    if window is None or window.owningApplication() is None or window.owningApplication().processID() != owner_pid:
+        raise RuntimeError("The foreground window changed before single-window capture")
+    filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(window)
+    config = SCStreamConfiguration.alloc().init()
+    size = window.frame().size
+    if min(size.width, size.height) <= 0:
+        raise RuntimeError("Invalid foreground window size")
+    scale = min(_WIDTH / size.width, _HEIGHT / size.height, 1.0)
+    config.setWidth_(max(1, round(size.width * scale)))
+    config.setHeight_(max(1, round(size.height * scale)))
+    config.setShowsCursor_(False)
+    config.setIgnoreShadowsSingleWindow_(True)
+    if hasattr(config, "setIncludeChildWindows_"):
+        config.setIncludeChildWindows_(False)
+    return result_from(
+        lambda complete: manager.captureImageWithFilter_configuration_completionHandler_(filter_, config, complete),
+    )
+
+
+def _win_window(window_id: int) -> Image.Image:
+    import ctypes
+    from ctypes import wintypes
+
+    import win32gui
+    import win32ui
+
+    if (
+        win32gui.GetForegroundWindow() != window_id or not win32gui.IsWindowVisible(window_id)
+        or win32gui.IsIconic(window_id)
+    ):
+        raise RuntimeError("The foreground window could not be verified")
+    left, top, right, bottom = win32gui.GetClientRect(window_id)
+    width, height = right - left, bottom - top
+    if min(width, height) <= 0 or width * height > 32_000_000:
+        raise RuntimeError("Invalid foreground window size")
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    send = user32.SendMessageTimeoutW
+    send.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    )
+    send.restype = wintypes.LPARAM
+    window_dc = win32gui.GetDC(window_id)
+    try:
+        source = win32ui.CreateDCFromHandle(window_dc)
+        target = source.CreateCompatibleDC()
+        try:
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(source, width, height)
+            old = target.SelectObject(bitmap)
+            try:
+                target.PatBlt((0, 0), (width, height), 0x00000042)  # BLACKNESS
+                result = ctypes.c_size_t()
+                # Ask the selected window to draw only its own client area into
+                # the private bitmap. Bound the wait if the app stops responding.
+                if not send(
+                    window_id, 0x0318, target.GetSafeHdc(), 0x00000004 | 0x00000010,
+                    0x0002 | 0x0020, 800, ctypes.byref(result),
+                ):  # WM_PRINTCLIENT, PRF_CLIENT | PRF_CHILDREN, ABORTIFHUNG | ERRORONEXIT
+                    raise RuntimeError("Single-window capture failed")
+                image = Image.frombytes("RGB", (width, height), bitmap.GetBitmapBits(True), "raw", "BGRX", 0, -1)
+                if image.getbbox() is None:
+                    raise RuntimeError("The foreground window did not render")
+                return image
+            finally:
+                target.SelectObject(old)
+                win32gui.DeleteObject(bitmap.GetHandle())
+        finally:
+            target.DeleteDC()
+    finally:
+        win32gui.ReleaseDC(window_id, window_dc)
+
+
+def capture_window(sample: ActivitySample, *, platform: str) -> tuple[datetime, bytes]:
+    """Capture one verified foreground window in memory, or fail without a desktop fallback."""
+    if not cloud_window_eligible(sample, browser_url_required=False, platform=platform):
+        raise RuntimeError("The foreground window cannot be captured safely")
+    try:
+        image = _mac_window(sample.window_id) if platform == "darwin" else _win_window(sample.window_id)
+        captured_at = datetime.now(UTC)
+        return captured_at, _jpeg(image)
+    except Exception:
+        raise RuntimeError("Verified single-window capture is unavailable") from None
 
 
 def recording_frames(recording: Path, *, interval_s: float, max_frames: int) -> tuple[Frame, ...]:

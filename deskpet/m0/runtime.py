@@ -18,6 +18,7 @@ from deskpet.contracts import (
 
 if TYPE_CHECKING:
     from deskpet.observation_v2.context import ObservationContext, ObservationContextReader
+    from .observation_input import DesktopObservationInput
 
 
 class _Args(BaseModel):
@@ -68,7 +69,7 @@ class _PlanArgs(_Args):
 
 class ToolRuntime:
     def __init__(self, tasks, sessions, clock, emit, *, max_steps=4, max_replans=1,
-                 observation_context_reader: ObservationContextReader | None = None):
+                 observation_context_reader: ObservationContextReader | DesktopObservationInput | None = None):
         if not 1 <= max_steps <= 4 or not 0 <= max_replans <= 1:
             raise ValueError("M0 supports 1..4 steps and at most one replan")
         self.tasks = tasks

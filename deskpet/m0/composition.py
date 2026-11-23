@@ -17,6 +17,7 @@ from .trace import JsonlMetricsSink, TraceRecorder
 
 if TYPE_CHECKING:
     from deskpet.observation_v2.context import ObservationContextReader
+    from .observation_input import DesktopObservationInput
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -148,7 +149,8 @@ class Environment:
     adapters: dict[str, str]
     sampling: Any
     estimator: Any
-    observation_context_reader: ObservationContextReader | None = None
+    observation_context_reader: ObservationContextReader | DesktopObservationInput | None = None
+    _live_revision: int = 1
 
     def refresh_observation(self):
         """Refresh TTL/override semantics without running due work or changing input order."""
@@ -158,10 +160,12 @@ class Environment:
         if self.observation_context_reader is not None:
             now = self.clock.wall_now()
             current, _ = self.observation_context_reader.read_current(now)
+            if self.profile != "scenario" and current is not None:
+                self._live_revision = current.context_revision
             observation = Observation(
                 observed_at=current.observed_at if current else now,
-                context_revision=observation.context_revision,
-                source=observation.source,
+                context_revision=observation.context_revision if self.profile == "scenario" else self._live_revision,
+                source=observation.source if self.profile == "scenario" else "live",
                 estimate=UserStateEstimate(
                     state=current.state if current else "unknown",
                     valid_until=current.valid_until if current else None,
@@ -179,7 +183,8 @@ class Environment:
 
 def build_environment(*, profile="scenario", scenario_id="manual", output=None,
                       clock=None, delivery=None, adapters=None, sampling_source=None,
-                      state_estimator=None, external_sampling=False, observation_database=None) -> Environment:
+                      state_estimator=None, external_sampling=False, observation_database=None,
+                      task_database=None, phase_database=None) -> Environment:
     """Factory contracts: task(clock, delivery, emit), session(clock, emit), sink(path).
 
     Call from the service's owner thread. Native observations are supplied by the
@@ -204,16 +209,33 @@ def build_environment(*, profile="scenario", scenario_id="manual", output=None,
         raise ValueError("a metrics adapter requires an output directory")
     trace = TraceRecorder(clock, run_id=f"m0-{scenario_id}", scenario_id=scenario_id, sink=sink)
     delivery = delivery if delivery is not None else FakeDeliveryPort(clock)
-    tasks = _factory(adapters, "task_service", MemoryTaskService)(clock=clock, delivery=delivery, emit=trace.emit)
-    sessions = _factory(adapters, "work_sessions", MemoryWorkSessionService)(clock=clock, emit=trace.emit)
+    if task_database is None:
+        tasks = _factory(adapters, "task_service", MemoryTaskService)(clock=clock, delivery=delivery, emit=trace.emit)
+    else:
+        from deskpet.task_service.sqlite import SQLiteTaskService
+        tasks = SQLiteTaskService(clock=clock, delivery=delivery, emit=trace.emit, path=task_database,
+                                 enforce_opportunities=True)
+    if phase_database is None:
+        sessions = _factory(adapters, "work_sessions", MemoryWorkSessionService)(clock=clock, emit=trace.emit)
+    else:
+        from deskpet.settings import SettingsStore
+        from deskpet.work_sessions import PersistentWorkSessionService
+        sessions = PersistentWorkSessionService(clock=clock, emit=trace.emit, path=phase_database,
+                                               settings_store=SettingsStore(phase_database))
+        if task_database is not None and Path(task_database).resolve() == Path(phase_database).resolve():
+            tasks.on_terminal_issue = sessions.unlink_completed_issue
     observation_env = build_observation_environment(
         profile=profile, clock=clock, adapters=adapters, sampling_source=sampling_source,
         state_estimator=state_estimator, external_sampling=external_sampling, trace=trace)
     observations = observation_env.observations
     context_reader = None
     if observation_database is not None:
-        from deskpet.observation_v2.context import ObservationContextReader
-        context_reader = ObservationContextReader(observation_database)
+        if profile == "scenario":
+            from deskpet.observation_v2.context import ObservationContextReader
+            context_reader = ObservationContextReader(observation_database)
+        else:
+            from .observation_input import DesktopObservationInput
+            context_reader = DesktopObservationInput(observation_database, settings_path=phase_database)
     runtime = ToolRuntime(tasks=tasks, sessions=sessions, clock=clock, emit=trace.emit,
                           observation_context_reader=context_reader)
     environment = Environment(clock, trace, tasks, sessions, observations, runtime, delivery, profile, adapters,

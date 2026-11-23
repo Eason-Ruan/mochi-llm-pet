@@ -17,8 +17,19 @@ class OllamaError(RuntimeError):
     """Model request failed without including request or response contents."""
 
 
+def validate_local_model(model: str) -> None:
+    if not model.strip():
+        raise ValueError("An Ollama model is required")
+    model_parts = model.casefold().split("/")[-1].split(":", 1)
+    if any(part == "cloud" or part.endswith("-cloud") for part in model_parts):
+        raise ValueError("Hosted Ollama models are unsupported")
+
+
 class OllamaClient:
-    def __init__(self, model: str, *, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 90.0):
+    def __init__(
+        self, model: str, *, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 90.0,
+        transport: httpx.BaseTransport | None = None,
+    ):
         parts = urlsplit(endpoint)
         host = parts.hostname
         allowed_host = host == "localhost"
@@ -37,14 +48,12 @@ class OllamaClient:
             or parts.fragment
         ):
             raise ValueError("Ollama endpoint must be a loopback HTTP or HTTPS origin")
-        if not model.strip() or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("A model and a positive finite timeout are required")
-        model_parts = model.casefold().split("/")[-1].split(":", 1)
-        if any(part == "cloud" or part.endswith("-cloud") for part in model_parts):
-            raise ValueError("Hosted Ollama models are unsupported")
+        validate_local_model(model)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("A positive finite model timeout is required")
         self.model = model
         self._http = httpx.Client(
-            base_url=endpoint, timeout=timeout, trust_env=False, follow_redirects=False,
+            base_url=endpoint, timeout=timeout, trust_env=False, follow_redirects=False, transport=transport,
         )
 
     def __enter__(self) -> OllamaClient:

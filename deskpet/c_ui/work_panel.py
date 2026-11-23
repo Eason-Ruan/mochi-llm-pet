@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QDateTime, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
+    QCheckBox, QComboBox, QDateTimeEdit, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
 )
 
 
@@ -285,3 +286,390 @@ class WorkPanel(QGroupBox):
             else:
                 self.review.setText("结束时可填写本轮成果与下一步，确认后在此展示。")
         self._refresh_controls()
+
+
+PHASE_STATES = {
+    "ready": "待开始", "running": "计时中", "paused": "已暂停",
+    "elapsed": "时间到", "ended": "已结束",
+}
+
+
+class PhasePanel(QGroupBox):
+    """The desktop timer, driven by acknowledged actions and the shared phase view."""
+
+    def __init__(self, *, submit, parent=None):
+        super().__init__("专注与回顾", parent)
+        self.setObjectName("phase-panel")
+        self.submit = submit
+        self.snapshot = {}
+        self.pending = None
+        self._duration_edited = False
+        self._task_rows = None
+        self._review_issue_rows = None
+        self._review_interval_rows = None
+        self._linked_phase = None
+        self._review_target = None
+        self._recovery_target = None
+        self._adjust_phase_id = None
+        self._editing_details = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 14, 9, 9)
+        layout.setSpacing(6)
+        self.summary = label("当前没有专注")
+        self.summary.setObjectName("phase-summary")
+        layout.addWidget(self.summary)
+
+        self.goal = QLineEdit()
+        self.goal.setObjectName("phase-title")
+        self.goal.setMaxLength(500)
+        self.goal.setPlaceholderText("专注标题（可留空）")
+        layout.addWidget(self.goal)
+        self.description = QLineEdit()
+        self.description.setMaxLength(4000)
+        self.description.setPlaceholderText("目标描述（可留空）")
+        layout.addWidget(self.description)
+        self.duration = self._minutes("专注时长")
+        self.duration.setObjectName("phase-duration")
+        self.duration.valueChanged.connect(self._edited_duration)
+        layout.addWidget(self.duration)
+        self.task = QComboBox()
+        self.task.addItem("不关联事项", None)
+        self.task.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.task.setAccessibleName("关联事项")
+        layout.addWidget(self.task)
+
+        self.buttons = {}
+        self._button(layout, "start", "开始专注")
+        self._button(layout, "continue_habit", "继续习惯")
+        timing = QHBoxLayout()
+        self._button(timing, "pause", "暂停")
+        self._button(timing, "resume", "继续")
+        self._button(timing, "end", "结束")
+        layout.addLayout(timing)
+        self.count_completed = QCheckBox("提前结束计为完成一轮")
+        layout.addWidget(self.count_completed)
+        details = QPushButton("编辑目标")
+        details.setObjectName("phase-edit-details")
+        details.clicked.connect(self._toggle_details)
+        self.edit_details = details
+        layout.addWidget(details)
+        self._button(layout, "set_details", "保存目标")
+        self._button(layout, "set_links", "保存关联")
+        self._button(layout, "start_break", "开始休息")
+        self._button(layout, "skip_break", "跳过休息")
+
+        adjust = QHBoxLayout()
+        self.adjust_mode = QComboBox()
+        self.adjust_mode.addItem("总时长", "total_s")
+        self.adjust_mode.addItem("额外增加", "add_s")
+        adjust.addWidget(self.adjust_mode)
+        self.adjust_minutes = self._minutes("调整时间")
+        self.adjust_minutes.setSuffix(" 分")
+        self.adjust_mode.currentIndexChanged.connect(self._set_adjust_initial)
+        adjust.addWidget(self.adjust_minutes)
+        self._button(adjust, "adjust", "调整")
+        layout.addLayout(adjust)
+
+        self.review_editor = QGroupBox("本轮回顾")
+        review_layout = QVBoxLayout(self.review_editor)
+        self.outcomes = QTextEdit()
+        self.outcomes.setAcceptRichText(False)
+        self.outcomes.setPlaceholderText("实际完成的内容，每行一项")
+        self.outcomes.setFixedHeight(55)
+        self.next_steps = QTextEdit()
+        self.next_steps.setAcceptRichText(False)
+        self.next_steps.setPlaceholderText("下一步，每行一项")
+        self.next_steps.setFixedHeight(55)
+        review_layout.addWidget(self.outcomes)
+        review_layout.addWidget(self.next_steps)
+        self._button(review_layout, "review", "保存回顾")
+        self.interval_editor = QGroupBox("修改工时归属")
+        interval_layout = QVBoxLayout(self.interval_editor)
+        self.review_intervals = QComboBox()
+        self.review_intervals.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.review_intervals.setAccessibleName("工时区间")
+        self.review_intervals.currentIndexChanged.connect(self._select_review_interval)
+        self.review_issue = QComboBox()
+        self.review_issue.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.review_issue.setAccessibleName("新的工时归属")
+        interval_layout.addWidget(self.review_intervals)
+        interval_layout.addWidget(self.review_issue)
+        self._button(interval_layout, "reassign_interval", "保存工时归属")
+        review_layout.addWidget(self.interval_editor)
+        layout.addWidget(self.review_editor)
+
+        self.recovery_editor = QGroupBox("补记中断时间")
+        recovery_layout = QVBoxLayout(self.recovery_editor)
+        recovery_layout.addWidget(label("请选择你实际专注的起止时刻。"))
+        self.credit_start = QDateTimeEdit(QDateTime.currentDateTime())
+        self.credit_end = QDateTimeEdit(QDateTime.currentDateTime())
+        for text, editor in (("开始", self.credit_start), ("结束", self.credit_end)):
+            editor.setDisplayFormat("MM-dd HH:mm:ss")
+            editor.setAccessibleName(text)
+            row = QHBoxLayout()
+            row.addWidget(label(text))
+            row.addWidget(editor, 1)
+            recovery_layout.addLayout(row)
+        self._button(recovery_layout, "credit_recovery", "确认补记")
+        layout.addWidget(self.recovery_editor)
+
+        self.result = label("")
+        self.result.setObjectName("phase-result")
+        layout.addWidget(self.result)
+        self.render_snapshot({})
+
+    @staticmethod
+    def _minutes(accessible_name):
+        editor = QDoubleSpinBox()
+        editor.setDecimals(2)
+        editor.setRange(0.02, 1440)
+        editor.setValue(25)
+        editor.setSuffix(" 分钟")
+        editor.setAccessibleName(accessible_name)
+        return editor
+
+    def _button(self, layout, action, text):
+        button = QPushButton(text)
+        button.setObjectName(f"phase-{action}")
+        button.clicked.connect(lambda checked=False: self._command(action))
+        layout.addWidget(button)
+        self.buttons[action] = button
+
+    def _edited_duration(self):
+        self._duration_edited = True
+
+    def _set_adjust_initial(self):
+        phase = self.snapshot.get("active_phase")
+        if phase:
+            minutes = phase["planned_duration_s"] / 60 if self.adjust_mode.currentData() == "total_s" else 5
+            self.adjust_minutes.setValue(minutes)
+
+    def _toggle_details(self):
+        self._editing_details = not self._editing_details
+        self.render_snapshot(self.snapshot)
+
+    def render_snapshot(self, snapshot):
+        self.snapshot = snapshot
+        active = snapshot.get("active_phase")
+        is_focus = bool(active and active["kind"] == "focus")
+        state = active["state"] if active else None
+        self.summary.setText(
+            f"{active['title']} · {PHASE_STATES[state]}\n"
+            f"剩余 {duration_text(active['remaining_s'])} / {duration_text(active['planned_duration_s'])}"
+            if active else "当前没有专注"
+        )
+        phase_key = (active["id"], active.get("primary_issue_id")) if is_focus else None
+        self._render_tasks(snapshot, phase_key)
+        if not self._duration_edited:
+            seconds = snapshot.get("phase_defaults", {}).get("default_focus_s", 1500)
+            blocked = self.duration.blockSignals(True)
+            self.duration.setValue(seconds / 60)
+            self.duration.blockSignals(blocked)
+        link_enabled = snapshot.get("phase_defaults", {}).get("link_issues", False)
+        self.task.setVisible(link_enabled and (is_focus or not active))
+        self.adjust_mode.setVisible(bool(active))
+        self.adjust_minutes.setVisible(bool(active))
+        active_id = active["id"] if active else None
+        if active_id != self._adjust_phase_id:
+            self._adjust_phase_id = active_id
+            self._editing_details = False
+            self.goal.setText(active["title"] if is_focus else "")
+            self.description.setText((active.get("description") or "") if is_focus else "")
+            self.count_completed.setChecked(False)
+            self._set_adjust_initial()
+        self.goal.setVisible(not active or self._editing_details)
+        self.description.setVisible(not active or self._editing_details)
+        self.duration.setVisible(not active)
+        self.edit_details.setVisible(is_focus)
+        self.edit_details.setText("收起目标" if self._editing_details else "编辑目标")
+        self.count_completed.setVisible(bool(is_focus and active.get("habit_id") and state != "elapsed"))
+
+        continuation = snapshot.get("phase_habit_continuation")
+        if continuation:
+            self.buttons["continue_habit"].setText(
+                f"继续习惯 · {continuation['title'][:20]} · {duration_text(continuation['duration_s'])}")
+        suggested = snapshot.get("phase_suggested_break")
+        if suggested:
+            title = "长休息" if suggested["kind"] == "long_break" else "短休息"
+            self.buttons["start_break"].setText(f"开始{title} · {duration_text(suggested['duration_s'])}")
+        else:
+            self.buttons["start_break"].setText("开始休息")
+        visible = {
+            "start": active is None, "continue_habit": bool(continuation and active is None),
+            "pause": state == "running", "resume": state == "paused",
+            "end": is_focus, "start_break": bool(suggested or not active),
+            "skip_break": bool(active and not is_focus), "adjust": bool(active),
+            "set_links": is_focus and link_enabled,
+            "set_details": is_focus and self._editing_details,
+        }
+        for action, shown in visible.items():
+            self.buttons[action].setVisible(shown)
+            self.buttons[action].setEnabled(shown and self._ready())
+        self._render_review(active)
+        self._render_recovery(active)
+
+    def _ready(self):
+        return "phase_defaults" in self.snapshot and self.pending is None
+
+    @staticmethod
+    def _issues(snapshot, *, include_terminal=False):
+        if "items" in snapshot:
+            return [(item["id"], item["title"]) for item in snapshot["items"]
+                    if item["type"] == "issue" and (include_terminal or item["status"] not in ("completed", "cancelled"))]
+        return [(task["task_id"], task["draft"]["content"]) for task in snapshot.get("tasks", [])
+                if task["draft"].get("item_type") == "issue"
+                and (include_terminal or task["status"] not in ("completed", "cancelled"))]
+
+    def _render_tasks(self, snapshot, phase_key):
+        rows = self._issues(snapshot)
+        selected = phase_key[1] if phase_key and phase_key != self._linked_phase else self.task.currentData()
+        if rows != self._task_rows:
+            self.task.clear()
+            self.task.addItem("不关联事项", None)
+            for task_id, title in rows:
+                self.task.addItem(title, task_id)
+            self._task_rows = rows
+        if phase_key != self._linked_phase or selected != self.task.currentData():
+            self.task.setCurrentIndex(max(0, self.task.findData(selected)))
+        self._linked_phase = phase_key
+
+    def _review_phase(self, active):
+        if active and active["kind"] == "focus":
+            return active if active["state"] == "elapsed" else None
+        return next((phase for phase in reversed(self.snapshot.get("phases", []))
+                     if phase["kind"] == "focus" and phase["state"] in ("elapsed", "ended")), None)
+
+    def _render_review(self, active):
+        phase = self._review_phase(active)
+        self.review_editor.setVisible(phase is not None)
+        self.buttons["review"].setEnabled(phase is not None and self._ready())
+        target = (phase["id"], phase["version"]) if phase else None
+        if target != self._review_target and phase:
+            self.outcomes.setPlainText("\n".join(phase["confirmed_outcomes"]))
+            self.next_steps.setPlainText("\n".join(phase["next_steps"]))
+        self._review_target = target
+        self._render_review_intervals(phase)
+
+    def _render_review_intervals(self, phase):
+        intervals = [interval for interval in self.snapshot.get("phase_review_intervals", [])
+                     if phase and interval["phase_id"] == phase["id"]]
+        self.interval_editor.setVisible(bool(intervals))
+        self.buttons["reassign_interval"].setEnabled(bool(intervals) and self._ready())
+        issues = self._issues(self.snapshot, include_terminal=True)
+        changed = False
+        if issues != self._review_issue_rows:
+            self.review_issue.clear()
+            self.review_issue.addItem("不归属事项", None)
+            for issue_id, title in issues:
+                self.review_issue.addItem(title, issue_id)
+            self._review_issue_rows = issues
+            changed = True
+        if intervals != self._review_interval_rows:
+            selected = self.review_intervals.currentData()
+            blocked = self.review_intervals.blockSignals(True)
+            self.review_intervals.clear()
+            for interval in intervals:
+                started = datetime.fromisoformat(interval["started_at"]).astimezone()
+                self.review_intervals.addItem(
+                    f"{started:%m-%d %H:%M:%S} · {duration_text(interval['seconds'])}", interval)
+                if selected and selected["id"] == interval["id"]:
+                    self.review_intervals.setCurrentIndex(self.review_intervals.count() - 1)
+            self.review_intervals.blockSignals(blocked)
+            self._review_interval_rows = intervals
+            changed = True
+        if changed:
+            self._select_review_interval()
+
+    def _select_review_interval(self):
+        interval = self.review_intervals.currentData() or {}
+        self.review_issue.setCurrentIndex(max(0, self.review_issue.findData(interval.get("primary_issue_id"))))
+
+    def _recovery(self, active):
+        phase = active if active and active["kind"] == "focus" else self._review_phase(active)
+        if phase is None or phase["state"] not in ("paused", "ended") or phase["remaining_s"] <= 0:
+            return phase, None
+        return phase, next((item for item in reversed(self.snapshot.get("phase_recovery", []))
+                            if item["phase_id"] == phase["id"] and item["credited_seconds"] is None
+                            and item["observed_until_at"]
+                            and datetime.fromisoformat(item["observed_until_at"]) > datetime.fromisoformat(item["started_at"])), None)
+
+    def _render_recovery(self, active):
+        phase, item = self._recovery(active)
+        self.recovery_editor.setVisible(item is not None)
+        self.buttons["credit_recovery"].setEnabled(item is not None and self._ready())
+        key = (item["id"], item["version"]) if item else None
+        if key != self._recovery_target and item:
+            start = datetime.fromisoformat(item["started_at"])
+            end = min(datetime.fromisoformat(item["observed_until_at"]),
+                      start + timedelta(seconds=phase["remaining_s"]))
+            self.credit_start.setDateTime(QDateTime.fromMSecsSinceEpoch(math.ceil(start.timestamp() * 1000)))
+            self.credit_end.setDateTime(QDateTime.fromMSecsSinceEpoch(math.floor(end.timestamp() * 1000)))
+        self._recovery_target = key
+
+    def _command(self, action):
+        if not self._ready() or not self.buttons[action].isEnabled():
+            return
+        active = self.snapshot.get("active_phase")
+        if action in ("start", "start_break", "continue_habit"):
+            payload = {"session_id": f"phase-{uuid4().hex}", "expected_session_version": 0}
+            if action == "start":
+                payload["title"] = self.goal.text().strip()
+                payload["description"] = self.description.text().strip()
+                if self._duration_edited:
+                    payload["duration_s"] = round(self.duration.value() * 60)
+                if not self.task.isHidden():
+                    payload["task_id"] = self.task.currentData()
+            elif action == "start_break":
+                suggestion = self.snapshot.get("phase_suggested_break")
+                if suggestion:
+                    payload.update({k: v for k, v in suggestion.items() if k != "duration_s"})
+            else:
+                continuation = self.snapshot["phase_habit_continuation"]
+                payload.update({k: v for k, v in continuation.items() if k not in ("duration_s", "title")})
+                action = "start"
+        else:
+            phase = self._review_phase(active) if action in ("review", "reassign_interval") else active
+            recovery = None
+            if action == "credit_recovery":
+                phase, recovery = self._recovery(active)
+            payload = {"session_id": phase["id"], "expected_session_version": phase["version"]}
+            if action == "adjust":
+                payload[self.adjust_mode.currentData()] = round(self.adjust_minutes.value() * 60)
+            if action == "end":
+                payload["count_as_completed"] = self.count_completed.isChecked()
+            if action == "set_details":
+                payload.update(title=self.goal.text().strip(), description=self.description.text().strip())
+            if action == "set_links":
+                primary = self.task.currentData()
+                payload.update(issue_links=[primary] if primary else [], primary_issue_id=primary)
+            if action == "review":
+                payload.update(confirmed_outcomes=WorkPanel._lines(self.outcomes),
+                               next_steps=WorkPanel._lines(self.next_steps))
+            if action == "reassign_interval":
+                interval = self.review_intervals.currentData()
+                payload.update(interval_id=interval["id"], expected_interval_version=interval["version"],
+                               target_issue_id=self.review_issue.currentData())
+            if recovery:
+                payload.update(recovery_interval_id=recovery["id"], expected_recovery_version=recovery["version"],
+                    started_at=datetime.fromtimestamp(self.credit_start.dateTime().toMSecsSinceEpoch() / 1000,
+                                                      tz=timezone.utc).isoformat(),
+                    ended_at=datetime.fromtimestamp(self.credit_end.dateTime().toMSecsSinceEpoch() / 1000,
+                                                    tz=timezone.utc).isoformat())
+        try:
+            self.pending = self.submit(f"session.{action}", payload=payload)
+        except (RuntimeError, ValueError) as exc:
+            self.result.setText(str(exc))
+            return
+        self.result.setText("正在保存…")
+        self.render_snapshot(self.snapshot)
+
+    def receive_result(self, result):
+        if self.pending is None or (result.get("command_id") or result.get("event_id")) != self.pending:
+            return
+        self.pending = None
+        if result.get("status") == "applied" or result.get("original_status") == "applied":
+            self.result.setText("已保存")
+        else:
+            self.result.setText(ERRORS.get(result.get("error_code"), "未能保存此操作"))
+        self.render_snapshot(self.snapshot)

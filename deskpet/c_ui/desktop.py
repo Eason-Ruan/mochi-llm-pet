@@ -88,7 +88,17 @@ class DesktopPet(QWidget):
 
 class DesktopWorkbench(Workbench):
     finished=pyqtSignal()
+    services_ready = pyqtSignal()
+    service_error = pyqtSignal(str)
     exit_requested=False
+
+    def _ready(self):
+        super()._ready()
+        self.services_ready.emit()
+
+    def _error(self, message):
+        super()._error(message)
+        self.service_error.emit(message)
 
     def closeEvent(self,event):
         if not self.exit_requested and not self._finishing:

@@ -126,15 +126,51 @@ class TaskDraft(Model):
     content: str = Field(min_length=1, max_length=500)
     mode: Literal["hard", "soft"] = "soft"
     timezone: str = "UTC"
-    earliest_at: datetime
-    latest_first_delivery_at: datetime
+    earliest_at: datetime | None = None
+    latest_first_delivery_at: datetime | None = None
+    item_type: Literal["reminder", "issue"] = "reminder"
+    reminder_enabled: bool = True
+    remind_after: datetime | None = None
+    target_at: datetime | None = None
+    remind_by: datetime | None = None
+    expires_at: datetime | None = None
+    due_at: datetime | None = None
+    window_open_at: datetime | None = None
+    window_close_at: datetime | None = None
+    window_computed_at: datetime | None = None
+
+    @property
+    def opens_at(self) -> datetime | None:
+        planned_start = self.window_open_at or self.earliest_at or self.target_at
+        edges = [value for value in (planned_start, self.remind_after) if value is not None]
+        return max(edges, default=None)
+
+    @property
+    def hard_deadline(self) -> datetime | None:
+        return self.remind_by or self.latest_first_delivery_at
 
     @model_validator(mode="after")
     def window_valid(self):
-        if self.latest_first_delivery_at < self.earliest_at:
-            raise ValueError("latest_first_delivery_at precedes earliest_at")
-        if self.mode == "hard" and self.latest_first_delivery_at != self.earliest_at:
-            raise ValueError("hard reminders have a single confirmed due time")
+        start, deadline = self.opens_at, self.hard_deadline
+        if not self.model_fields_set.intersection({"mode", "earliest_at", "latest_first_delivery_at", "item_type",
+                                                   "reminder_enabled", "remind_after", "target_at", "remind_by",
+                                                   "expires_at", "due_at"}):
+            raise ValueError("specify reminder timing or an untimed item type")
+        if start is not None and deadline is not None and deadline < start:
+            raise ValueError("remind_by precedes the opening time")
+        if self.reminder_enabled and self.mode == "hard" and (deadline is None or deadline != start):
+            raise ValueError("exact reminders require one confirmed time")
+        if self.window_close_at is not None and start is not None and self.window_close_at < start:
+            raise ValueError("window_close_at precedes the opening time")
+        if self.target_at is not None and ((start and self.target_at < start)
+                                           or (deadline and self.target_at > deadline)):
+            raise ValueError("target_at is outside the reminder window")
+        if self.expires_at is not None and any(
+            value is not None and value >= self.expires_at for value in (start, self.target_at, deadline)
+        ):
+            raise ValueError("expires_at must follow the other reminder times")
+        if self.item_type == "reminder" and (self.due_at is not None or not self.reminder_enabled):
+            raise ValueError("only issues have work deadlines or can omit reminders")
         return self
 
 
@@ -146,11 +182,12 @@ class TaskView(Model):
     occurrence: int = Field(default=1, ge=1)
     confirmed_at: datetime | None = None
     displayed_at: datetime | None = None
+    acknowledged_at: datetime | None = None
 
 
 class TaskCommand(Model):
     command_id: str
-    kind: Literal["create", "confirm", "edit", "snooze", "cancel", "complete"]
+    kind: Literal["create", "confirm", "edit", "snooze", "ack", "cancel", "complete"]
     task_id: str
     expected_version: int = Field(default=0, ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -217,6 +254,11 @@ class DisplayCommand(Model):
     requested_at: datetime
     expires_at: datetime
     reason: Literal["hard_due", "opportunity", "deadline_fallback", "tool", "retry"]
+    sound: Literal["reminder", "phase_end"] | None = None
+    context_revision: int | None = None
+    context_valid_until: datetime | None = None
+    position_hint: Literal["stay", "home", "screen_edge"] | None = None
+    animation: Literal["idle", "look_up", "wave", "approach"] | None = None
 
 
 class DisplayReceipt(Model):
@@ -252,7 +294,11 @@ class UiAction(Model):
     event_id: str
     action_id: Literal["reminder.create", "reminder.confirm", "reminder.done", "reminder.snooze",
                        "reminder.edit", "reminder.cancel", "state.override", "session.start",
-                       "session.pause", "session.resume", "session.end", "state.clear_override"]
+                       "session.pause", "session.resume", "session.end", "session.adjust",
+                       "session.start_break", "session.skip_break", "session.set_links", "session.set_details",
+                       "session.review",
+                       "session.credit_recovery", "session.credit_sleep", "session.reassign_interval",
+                       "state.clear_override"]
     task_id: str | None = None
     expected_task_version: int | None = None
     surface_revision: int = Field(ge=1)

@@ -92,7 +92,12 @@ QWidget#c-workspace QPushButton { min-height: 28px; padding: 3px 8px; }
         self.task_summary.setText(f"事项 {len(snapshot['tasks'])} 项 · 工作段 {len(snapshot['sessions'])} 段 · 到期提醒 {len(self.cards)} 条")
 
     def show_reminder(self,command):
-        if command.delivery_id in self.cards: return
+        old_card = self.cards.get(command.delivery_id)
+        if old_card is not None:
+            if not old_card._reported and old_card.command != command:
+                old_card.command = command
+                old_card.refresh()
+            return
         view=self.reminder_panel.view(command.task_id)
         if view and (view['version']>command.task_version or view['status'] in ('completed','cancelled')): return
         if self.snapshot and command.expires_at<=datetime.fromisoformat(self.snapshot['now']): return

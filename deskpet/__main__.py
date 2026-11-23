@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
-import sys
+import argparse
+from pathlib import Path
 
 
-def main() -> int:
-    from .app import Application
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Mochi desktop pet")
+    parser.add_argument("--data-dir", type=Path, help="directory for the desktop pet's local data")
+    parser.add_argument("--legacy", action="store_true", help="launch the original LLM pet")
+    parser.add_argument("--config", help="configuration file for the original LLM pet")
+    args = parser.parse_args(argv)
+    if args.legacy or args.config is not None:
+        if args.data_dir is not None:
+            parser.error("--data-dir is only available for the Mochi desktop pet")
+        from .app import Application
 
-    config = None
-    args = sys.argv[1:]
-    if "--config" in args:
-        i = args.index("--config")
-        if i + 1 < len(args):
-            config = args[i + 1]
-    return Application(config_path=config).main()
+        return Application(config_path=args.config).main()
+
+    from .c_ui.refine import run_desktop
+
+    return run_desktop(args.data_dir)
 
 
 if __name__ == "__main__":

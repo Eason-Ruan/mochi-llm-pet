@@ -1,8 +1,13 @@
 """Chinese display times; domain UTC timestamps remain unchanged."""
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-ZONE = ZoneInfo('Asia/Shanghai')
+ZONE_NAME = 'Asia/Shanghai'
+
+try:
+    ZONE = ZoneInfo(ZONE_NAME)
+except ZoneInfoNotFoundError:
+    ZONE = timezone(timedelta(hours=8), ZONE_NAME)
 
 
 def local_time(value):

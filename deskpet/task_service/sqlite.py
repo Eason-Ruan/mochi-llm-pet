@@ -23,13 +23,37 @@ from deskpet.contracts import (
     Observation, ProposedPlan, TaskCommand, TaskView,
 )
 from deskpet.mocks.task_service import MemoryTaskService, _Attempt
+from .presentation import PRESENTATION_TABLE, running_focus
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def claim_opportunity_in_transaction(db, claim_id, now, *, context_revision=None):
+    """Claim the current available window within a caller-owned business write transaction."""
+    if not claim_id or not db.in_transaction:
+        raise ValueError("an opportunity claim requires a stable ID and write transaction")
+    if running_focus(db):
+        return None
+    values = dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('observation','opportunity')"))
+    if "observation" not in values or "opportunity" not in values:
+        return None
+    observed = Observation.model_validate_json(values["observation"])
+    until = observed.estimate.valid_until
+    if (observed.estimate.state != "available" or observed.observed_at > now
+            or until is None or now >= until
+            or (context_revision is not None and observed.context_revision != context_revision)):
+        return None
+    opportunity = json.loads(values["opportunity"])
+    if not opportunity or opportunity["claim"] not in (None, claim_id):
+        return None
+    opportunity["claim"] = claim_id
+    db.execute("UPDATE metadata SET value=? WHERE key='opportunity'", (_json(opportunity),))
+    return opportunity["id"]
 
 
 class _Effects:
@@ -61,7 +85,8 @@ class _Domain(MemoryTaskService):
 
 class SQLiteTaskService:
     def __init__(self, clock, delivery, emit, *, path,
-                 receipt_timeout_s=5.0, retry_interval_s=1.0, busy_timeout_s=5.0):
+                 receipt_timeout_s=5.0, retry_interval_s=1.0, busy_timeout_s=5.0,
+                 enforce_opportunities=False, auto_opportunity=True):
         # Let the reference validate timer settings before opening a database.
         MemoryTaskService(clock, delivery, emit, receipt_timeout_s=receipt_timeout_s,
                           retry_interval_s=retry_interval_s)
@@ -69,6 +94,9 @@ class SQLiteTaskService:
             raise ValueError("busy_timeout_s must be positive")
         self.clock, self.delivery, self.emit = clock, delivery, emit
         self.receipt_timeout_s, self.retry_interval_s = receipt_timeout_s, retry_interval_s
+        self.enforce_opportunities = enforce_opportunities
+        self.auto_opportunity = auto_opportunity
+        self.on_terminal_issue = None
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._session = uuid.uuid4().hex
@@ -81,7 +109,7 @@ class SQLiteTaskService:
         try:
             with self._transaction():
                 version = self._db.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, SCHEMA_VERSION):
+                if version not in (0, 1, SCHEMA_VERSION):
                     raise ValueError(f"unsupported task database schema {version}")
                 # execute one statement at a time: executescript would implicitly COMMIT.
                 for statement in (
@@ -95,6 +123,7 @@ class SQLiteTaskService:
                     "CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, task_id TEXT NOT NULL, task_version INTEGER NOT NULL, delivery_id TEXT, not_before TEXT NOT NULL)",
                     "CREATE UNIQUE INDEX IF NOT EXISTS one_queued_show ON outbox(delivery_id) WHERE kind='show'",
                     "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL, kind TEXT NOT NULL, fields TEXT NOT NULL, emitted INTEGER NOT NULL DEFAULT 0)",
+                    PRESENTATION_TABLE,
                 ):
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -122,7 +151,9 @@ class SQLiteTaskService:
         core = _Domain(self.clock, effects,
                                  lambda kind, **fields: events.append((kind, fields)),
                                  receipt_timeout_s=self.receipt_timeout_s,
-                                 retry_interval_s=self.retry_interval_s)
+                                 retry_interval_s=self.retry_interval_s,
+                                 enforce_opportunities=self.enforce_opportunities)
+        core.auto_opportunity = self.auto_opportunity
         core.restart_floor = self._opened_at if self._recovering else None
         core._tasks = {r["task_id"]: TaskView.model_validate_json(r["view"])
                        for r in self._db.execute("SELECT * FROM tasks")}
@@ -138,6 +169,12 @@ class SQLiteTaskService:
         if "observation" in metadata and metadata.get("observation_owner") == self._session:
             core._observation = Observation.model_validate_json(metadata["observation"])
         core._last_deferred = {k: tuple(v) for k, v in json.loads(metadata.get("deferred", "{}")).items()}
+        core._opportunity = json.loads(metadata.get("opportunity", "{}"))
+        core._focus_running = running_focus(self._db) if self.enforce_opportunities else False
+        core._external_owner = {(row['task_id'], row['occurrence']) for row in self._db.execute(
+            "SELECT task_id,occurrence FROM presentations WHERE channel='os_notification' "
+            "AND state NOT IN ('cancelled','failed','released','unavailable')"
+        )}
         now, mono = self.clock.wall_now(), self.clock.monotonic_now()
         for row in self._db.execute("SELECT * FROM deliveries"):
             # Raw monotonic values are meaningful only in this service session.
@@ -169,6 +206,7 @@ class SQLiteTaskService:
             db.execute("INSERT OR REPLACE INTO metadata VALUES ('observation',?)", (core._observation.model_dump_json(),))
             db.execute("INSERT OR REPLACE INTO metadata VALUES ('observation_owner',?)", (self._session,))
         db.execute("INSERT OR REPLACE INTO metadata VALUES ('deferred',?)", (_json(core._last_deferred),))
+        db.execute("INSERT OR REPLACE INTO metadata VALUES ('opportunity',?)", (_json(core._opportunity),))
         db.execute("UPDATE deliveries SET active=0 WHERE active=1")
         now, mono = self.clock.wall_now(), self.clock.monotonic_now()
         for key, attempt in core._attempts.items():
@@ -192,6 +230,9 @@ class SQLiteTaskService:
             core, effects, events = self._load()
             result = getattr(core, method)(*args)
             self._save(core, effects, events)
+            if (method == "apply" and self.on_terminal_issue is not None and result.status == "applied"
+                    and result.view.draft.item_type == "issue" and result.view.status in {"completed", "cancelled"}):
+                self.on_terminal_issue(result.view.task_id, db=self._db)
         self._flush_events()
         self._drain()
         return result
@@ -202,6 +243,11 @@ class SQLiteTaskService:
 
     def list_tasks(self):
         return [TaskView.model_validate_json(row[0]) for row in self._db.execute("SELECT view FROM tasks ORDER BY task_id")]
+
+    def pending_deliveries(self) -> dict[str, int]:
+        return {row["task_id"]: row["task_version"] for row in self._db.execute(
+            "SELECT task_id,task_version FROM deliveries WHERE active=1 AND status<>'displayed'"
+        )}
 
     def apply(self, command: TaskCommand):
         return self._change("apply", command)
@@ -218,6 +264,9 @@ class SQLiteTaskService:
 
     def schedule_recheck(self, envelope: DecisionEnvelope, run_at: datetime):
         return self._change("schedule_recheck", envelope, run_at)
+
+    def claim_opportunity(self, claim_id: str) -> str | None:
+        return self._change("claim_opportunity", claim_id)
 
     def request_delivery(self, envelope: DecisionEnvelope):
         original = self._change("request_delivery", envelope)
@@ -291,11 +340,13 @@ class SQLiteTaskService:
                     valid = (valid and view.status == "registered" and attempt is not None
                              and core._active_delivery.get(view.task_id) == row["delivery_id"]
                              and view.occurrence == attempt.command.occurrence
-                             and view.displayed_at is None)
+                             and view.displayed_at is None and view.acknowledged_at is None
+                             and view.draft.reminder_enabled
+                             and (view.draft.expires_at is None or self.clock.wall_now() < view.draft.expires_at))
                     if valid:
                         if self.clock.wall_now() >= attempt.command.expires_at:
                             attempt.command = attempt.command.model_copy(update={
-                                "expires_at": self.clock.wall_now()+timedelta(seconds=max(30.0,self.receipt_timeout_s*2))})
+                                "expires_at": core._lease_end(view, self.clock.wall_now())})
                             self._save(core, effects, events)
                             continue  # Commit the renewed lease BEFORE calling show.
                         attempt.last_attempt_mono = self.clock.monotonic_now()
@@ -353,7 +404,7 @@ def factory(*, clock, delivery, emit):
     path = os.environ.get("MOCHI_TASK_DB")
     if not path:
         raise ValueError("set MOCHI_TASK_DB to a persistent SQLite path, or use isolated_factory for tests/replay")
-    return SQLiteTaskService(clock, delivery, emit, path=path)
+    return SQLiteTaskService(clock, delivery, emit, path=path, enforce_opportunities=True)
 
 
 def isolated_factory(*, clock, delivery, emit):

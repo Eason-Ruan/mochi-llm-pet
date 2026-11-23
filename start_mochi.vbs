@@ -1,3 +1,4 @@
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "C:\Users\\mochi-llm-pet"
-WshShell.Run """C:\Users\AppData\Local\miniconda3\envs\mochipet\python.exe"" run.py", 7, False
+Set fs = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+launcher = fs.BuildPath(fs.GetParentFolderName(WScript.ScriptFullName), "start_mochi.bat")
+shell.Run Chr(34) & launcher & Chr(34), 7, False

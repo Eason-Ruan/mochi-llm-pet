@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import json
 import math
 from typing import Callable
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -44,7 +45,7 @@ class MemoryTaskService:
 
     def __init__(
         self, clock: Clock, delivery: DeliveryPort, emit: Callable,
-        *, receipt_timeout_s: float = 5.0, retry_interval_s: float = 1.0,
+        *, receipt_timeout_s: float = 5.0, retry_interval_s: float = 1.0, enforce_opportunities=False,
     ):
         if (not math.isfinite(receipt_timeout_s) or receipt_timeout_s <= 0
                 or not math.isfinite(retry_interval_s) or retry_interval_s <= 0):
@@ -54,6 +55,11 @@ class MemoryTaskService:
         self.emit = emit
         self.receipt_timeout_s = receipt_timeout_s
         self.retry_interval_s = retry_interval_s
+        self.enforce_opportunities = enforce_opportunities
+        self.auto_opportunity = True
+        self._opportunity: dict[str, str | None] = {}
+        self._external_owner: set[tuple[str, int]] = set()
+        self._focus_running = False
         self._tasks: dict[str, TaskView] = {}
         self._commands: dict[str, tuple[str, CommandResult]] = {}
         self._observation: Observation | None = None
@@ -71,7 +77,14 @@ class MemoryTaskService:
 
     @staticmethod
     def _fingerprint(model) -> str:
-        return json.dumps(model.model_dump(mode="json"), sort_keys=True,
+        fields = model.model_dump(mode="json")
+        if isinstance(model, TaskCommand) and model.kind in {"create", "edit"}:
+            if set(model.payload) == {"draft"}:
+                try:
+                    fields["payload"] = {"draft": TaskDraft.model_validate(model.payload["draft"]).model_dump(mode="json")}
+                except (ValueError, TypeError):
+                    pass  # Fingerprint rejected raw input too.
+        return json.dumps(fields, sort_keys=True,
                           separators=(",", ":"), ensure_ascii=False)
 
     def _command_rejection(
@@ -96,7 +109,11 @@ class MemoryTaskService:
         fingerprint = self._fingerprint(command)
         previous = self._commands.get(command.command_id)
         if previous:
-            if fingerprint != previous[0]:
+            matches = fingerprint == previous[0]
+            if not matches and command.kind in {"create", "edit"}:
+                # Schema-one receipts recorded raw TaskDraft JSON with the older field set.
+                matches = fingerprint == self._fingerprint(TaskCommand.model_validate_json(previous[0]))
+            if not matches:
                 return self._command_rejection(
                     command, ErrorCode.INVALID_ARGUMENT, "command_id was reused with different input")
             original = previous[1]
@@ -133,7 +150,8 @@ class MemoryTaskService:
 
         expected_fields = {"draft"} if command.kind in {"create", "edit"} else (
             {"seconds"} if command.kind == "snooze" else set())
-        if set(command.payload) != expected_fields:
+        fields = set(command.payload)
+        if fields != expected_fields and not (command.kind == "snooze" and fields == {"seconds", "mode"}):
             return reject(ErrorCode.INVALID_ARGUMENT,
                           f"{command.kind} payload requires exactly {sorted(expected_fields)}")
         try:
@@ -141,10 +159,13 @@ class MemoryTaskService:
                 draft = TaskDraft.model_validate(command.payload["draft"])
             elif command.kind == "snooze":
                 seconds = command.payload["seconds"]
+                mode = command.payload.get("mode", "legacy")
                 if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
                     raise ValueError("seconds must be numeric")
                 if not math.isfinite(seconds) or seconds <= 0:
                     raise ValueError("seconds must be finite and positive")
+                if mode not in ("legacy", "flexible_target", "no_earlier", "exact"):
+                    raise ValueError("invalid snooze mode")
         except (ValidationError, ValueError, TypeError) as exc:
             return reject(ErrorCode.INVALID_ARGUMENT, str(exc))
 
@@ -157,22 +178,44 @@ class MemoryTaskService:
             updated = view.model_copy(update={"status": "registered", "version": view.version+1,
                                                "confirmed_at": now})
         elif command.kind == "edit":
+            unchanged_rule = all(getattr(draft, name) == getattr(view.draft, name)
+                                 for name in type(draft).model_fields if name not in {"content", "due_at"})
             updated = view.model_copy(update={"draft": draft, "version": view.version+1,
-                                               "displayed_at": None,
-                                               "occurrence": view.occurrence + (view.status == "registered")})
+                                               "displayed_at": view.displayed_at if unchanged_rule else None,
+                                               "acknowledged_at": view.acknowledged_at if unchanged_rule else None,
+                                               "occurrence": view.occurrence + (view.status == "registered" and not unchanged_rule)})
         elif command.kind == "snooze":
-            if view.status != "registered":
+            if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
                 return reject(ErrorCode.INVALID_TRANSITION, "only a registered task can be snoozed")
-            width = view.draft.latest_first_delivery_at - view.draft.earliest_at
             try:
-                earliest = now + timedelta(seconds=seconds)
-                latest = earliest + width
+                target = now + timedelta(seconds=seconds)
+                old = view.draft
+                if (mode == "legacy" and old.earliest_at is not None
+                        and old.latest_first_delivery_at is not None):
+                    bounds = {"earliest_at": target, "latest_first_delivery_at":
+                              target + (old.latest_first_delivery_at - old.earliest_at)}
+                else:
+                    early = target - timedelta(seconds=min(60, seconds / 3))
+                    bounds = {"mode": "hard" if mode == "exact" else "soft", "latest_first_delivery_at": None,
+                              "earliest_at": None, "window_close_at": None,
+                              "window_open_at": early if mode in ("legacy", "flexible_target") else None,
+                              "window_computed_at": now if mode in ("legacy", "flexible_target") else None,
+                              "remind_after": target if mode in ("exact", "no_earlier") else None,
+                              "target_at": target if mode in ("legacy", "flexible_target", "exact") else None,
+                              "remind_by": target if mode == "exact" else None}
+                draft = TaskDraft.model_validate(old.model_dump() | bounds)
             except OverflowError:
                 return reject(ErrorCode.INVALID_ARGUMENT, "snooze exceeds supported datetime range")
-            draft = view.draft.model_copy(update={"earliest_at": earliest,
-                                                   "latest_first_delivery_at": latest})
+            except ValidationError as exc:
+                return reject(ErrorCode.INVALID_ARGUMENT, str(exc))
             updated = view.model_copy(update={"draft": draft, "version": view.version+1,
-                                               "occurrence": view.occurrence+1, "displayed_at": None})
+                                               "occurrence": view.occurrence+1, "displayed_at": None,
+                                               "acknowledged_at": None})
+        elif command.kind == "ack":
+            if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
+                return reject(ErrorCode.INVALID_TRANSITION, "only an active reminder can be acknowledged")
+            updated = view.model_copy(update={"version": view.version+1, "acknowledged_at": now,
+                                              "status": "completed" if view.draft.item_type == "reminder" else "registered"})
         elif command.kind == "cancel":
             updated = view.model_copy(update={"status": "cancelled", "version": view.version+1})
         elif command.kind == "complete":
@@ -183,10 +226,10 @@ class MemoryTaskService:
             return reject(ErrorCode.INVALID_ARGUMENT, "unknown command")
 
         self._tasks[command.task_id] = updated
-        if command.kind in {"edit", "snooze", "cancel", "complete"}:
+        if command.kind in {"edit", "snooze", "ack", "cancel", "complete"}:
             self._invalidate_pending(command.task_id)
         kind = {"create": "created", "confirm": "confirmed", "edit": "edited",
-                "snooze": "snoozed", "cancel": "cancelled", "complete": "completed"}[command.kind]
+                "snooze": "snoozed", "ack": "acknowledged", "cancel": "cancelled", "complete": "completed"}[command.kind]
         self.emit(f"task.{kind}", task_id=updated.task_id, task_version=updated.version,
                   payload={"command_id": command.command_id, "status": updated.status,
                            "occurrence": updated.occurrence})
@@ -211,6 +254,12 @@ class MemoryTaskService:
             return
         previous = self._observation
         self._observation = observation
+        if self.enforce_opportunities:
+            state = self._effective_state()
+            if state in {"away", "working"}:
+                self._opportunity = {}
+            elif state == "available" and not self._opportunity:
+                self._opportunity = {"id": uuid4().hex, "claim": None}
         # Keep the newest sampling time/TTL even if the semantic state is
         # unchanged. Polling is not a new experimental observation event.
         def trace_key(value):
@@ -233,7 +282,7 @@ class MemoryTaskService:
             return ErrorCode.CANCELLED
         if envelope.task_version != view.version:
             return ErrorCode.STALE_TASK
-        if view.status != "registered":
+        if view.status != "registered" or not view.draft.reminder_enabled or view.acknowledged_at is not None:
             return ErrorCode.INVALID_TRANSITION
         now = self.clock.wall_now()
         if now >= envelope.expires_at:
@@ -273,7 +322,9 @@ class MemoryTaskService:
         if run_at.tzinfo is None or run_at.utcoffset() is None:
             return ErrorCode.INVALID_ARGUMENT
         view = self._tasks[envelope.task_id]
-        if not self.clock.wall_now() <= run_at <= view.draft.latest_first_delivery_at:
+        deadline = view.draft.hard_deadline
+        if (run_at < self.clock.wall_now() or (deadline and run_at > deadline)
+                or (view.draft.expires_at and run_at >= view.draft.expires_at)):
             return ErrorCode.OUTSIDE_WINDOW
         self._rechecks[view.task_id] = (view.version, run_at, envelope.request_id)
         self.emit("recheck.scheduled", task_id=view.task_id, task_version=view.version,
@@ -288,6 +339,9 @@ class MemoryTaskService:
         if error is not None:
             return ToolResult(call_id=envelope.request_id, status="rejected", error_code=error,
                               state_version=view.version if view else None)
+        if (view.task_id, view.occurrence) in self._external_owner:
+            return ToolResult(call_id=envelope.request_id, status="pending", state_version=view.version,
+                              evidence={"channel": "os_notification"})
         existing = self._active_delivery.get(view.task_id)
         if existing:
             attempt = self._attempts[existing]
@@ -298,10 +352,34 @@ class MemoryTaskService:
                 # after the earliest/latest edge (especially a hard due time).
                 return self._delivery_result(envelope, view, attempt)
         now = self.clock.wall_now()
-        if not (view.draft.earliest_at <= now <= view.draft.latest_first_delivery_at):
+        start, deadline = view.draft.opens_at, view.draft.hard_deadline
+        close = view.draft.window_close_at
+        if ((start is not None and now < start) or (deadline is not None and now > deadline)
+                or (view.draft.expires_at and now >= view.draft.expires_at)):
             return ToolResult(call_id=envelope.request_id, status="rejected",
                               error_code=ErrorCode.OUTSIDE_WINDOW, state_version=view.version)
+        if deadline is not None and now == deadline:
+            reason = "hard_due" if view.draft.mode == "hard" else "deadline_fallback"
+            return self._delivery_result(envelope, view, self._ensure_delivery(view, reason))
+        if close is not None and now >= close:
+            return ToolResult(call_id=envelope.request_id, status="rejected",
+                              error_code=ErrorCode.OUTSIDE_WINDOW, state_version=view.version)
+        if self.enforce_opportunities and self.claim_opportunity(self._delivery_id(view)) is None:
+            return ToolResult(call_id=envelope.request_id, status="rejected",
+                              error_code=ErrorCode.STALE_CONTEXT, state_version=view.version)
         return self._delivery_result(envelope, view, self._ensure_delivery(view, "tool"))
+
+    def claim_opportunity(self, claim_id: str) -> str | None:
+        if not claim_id or self._focus_running or not self._available() or not self._opportunity:
+            return None
+        if self._opportunity["claim"] not in (None, claim_id):
+            return None
+        self._opportunity["claim"] = claim_id
+        return self._opportunity["id"]
+
+    @staticmethod
+    def _delivery_id(view: TaskView) -> str:
+        return f"delivery:{view.task_id}:{view.occurrence}:v{view.version}"
 
     @staticmethod
     def _delivery_result(envelope: DecisionEnvelope, view: TaskView, attempt: _Attempt) -> ToolResult:
@@ -319,25 +397,34 @@ class MemoryTaskService:
         if existing:
             return self._attempts[existing]
         now = self.clock.wall_now()
-        delivery_id = f"delivery:{view.task_id}:{view.occurrence}:v{view.version}"
+        delivery_id = self._delivery_id(view)
+        early = reason in {"opportunity", "tool"}
+        observed = self._observation if early else None
         command = DisplayCommand(delivery_id=delivery_id, task_id=view.task_id,
                                  task_version=view.version, occurrence=view.occurrence,
                                  content=view.draft.content, requested_at=now,
-                                 expires_at=now + timedelta(seconds=max(30.0, self.receipt_timeout_s*2)),
-                                 reason=reason)
+                                 expires_at=self._lease_end(view, now), reason=reason,
+                                 context_revision=observed.context_revision if observed else None,
+                                 context_valid_until=observed.estimate.valid_until if observed else None,
+                                 sound=None if early else "reminder")
         attempt = _Attempt(command=command, last_attempt_mono=self.clock.monotonic_now())
         self._attempts[delivery_id] = attempt
         self._active_delivery[view.task_id] = delivery_id
         self._dispatch(attempt)
         return attempt
 
+    def _lease_end(self, view: TaskView, now: datetime) -> datetime:
+        lease = now + timedelta(seconds=max(30.0, self.receipt_timeout_s * 2))
+        return min(lease, view.draft.expires_at) if view.draft.expires_at else lease
+
     def _dispatch(self, attempt: _Attempt) -> None:
         now = self.clock.wall_now()
         command = attempt.command
+        view = self._tasks[command.task_id]
         # Renew an expired execution lease without inventing a new delivery.
         if now >= command.expires_at:
             command = command.model_copy(update={
-                "expires_at": now + timedelta(seconds=max(30.0, self.receipt_timeout_s*2)),
+                "expires_at": self._lease_end(view, now),
             })
             attempt.command = command
         attempt.status = "pending"
@@ -400,13 +487,14 @@ class MemoryTaskService:
         if receipt.outcome == "displayed":
             self._tasks[view.task_id] = view.model_copy(update={"displayed_at": receipt.rendered_at})
             self._rechecks.pop(view.task_id, None)
+        deadline = view.draft.hard_deadline
         self.emit("delivery.displayed" if receipt.outcome == "displayed" else "delivery.failed",
                   task_id=receipt.task_id, task_version=receipt.task_version,
                   delivery_id=receipt.delivery_id, source=receipt.source,
                   simulated=receipt.source != "native",
                   payload={"outcome": receipt.outcome,
                            "error_code": receipt.error_code.value if receipt.error_code else None,
-                           "late_by_s": max(0.0, (receipt.rendered_at - view.draft.latest_first_delivery_at).total_seconds())})
+                           "late_by_s": max(0.0, (receipt.rendered_at - deadline).total_seconds()) if deadline else 0.0})
         return None
 
     def _effective_state(self) -> str:
@@ -415,7 +503,7 @@ class MemoryTaskService:
         if obs is None or obs.observed_at > now:
             return "unknown"
         until = obs.estimate.valid_until
-        if until is not None and until <= now:
+        if (until is None and self.enforce_opportunities) or (until is not None and until <= now):
             return "unknown"
         return obs.estimate.state
 
@@ -440,12 +528,37 @@ class MemoryTaskService:
                 if view and view.status == "registered" and view.version == version:
                     self.emit("recheck.fired", task_id=task_id, task_version=version,
                               request_id=request_id, payload={"run_at": run_at.isoformat()})
-        for view in sorted(self._tasks.values(), key=lambda v: (v.draft.earliest_at, v.task_id)):
-            if view.status != "registered" or view.displayed_at is not None:
+        for view in sorted(self._tasks.values(), key=lambda v: (v.draft.opens_at or now, v.task_id)):
+            if (view.status != "registered" or view.displayed_at is not None or view.acknowledged_at is not None
+                    or not view.draft.reminder_enabled or (view.draft.expires_at and now >= view.draft.expires_at)
+                    or (view.task_id, view.occurrence) in self._external_owner):
                 continue
+            deadline = view.draft.hard_deadline
             existing = self._active_delivery.get(view.task_id)
             if existing:
                 attempt = self._attempts[existing]
+                if deadline and now >= deadline and attempt.command.reason in {"opportunity", "tool"}:
+                    attempt.command = attempt.command.model_copy(update={
+                        "reason": "deadline_fallback", "context_revision": None, "context_valid_until": None,
+                        "expires_at": self._lease_end(view, now), "sound": "reminder",
+                    })
+                    self._dispatch(attempt)
+                    continue
+                if self.enforce_opportunities and attempt.command.reason in {"opportunity", "tool"}:
+                    obs = self._observation
+                    if (self._focus_running or not self._available()
+                            or (view.draft.window_close_at is not None and now >= view.draft.window_close_at)):
+                        continue
+                    if obs.context_revision != attempt.command.context_revision or (attempt.command.context_valid_until
+                            and now >= attempt.command.context_valid_until):
+                        if self.claim_opportunity(existing) is None:
+                            continue
+                        attempt.command = attempt.command.model_copy(update={
+                            "context_revision": obs.context_revision, "context_valid_until": obs.estimate.valid_until,
+                            "requested_at": now, "expires_at": self._lease_end(view, now),
+                        })
+                        self._dispatch(attempt)
+                        continue
                 elapsed = mono - attempt.last_attempt_mono
                 if attempt.status == "pending" and elapsed >= self.receipt_timeout_s:
                     self.emit("delivery.timeout", task_id=view.task_id, task_version=view.version,
@@ -456,13 +569,15 @@ class MemoryTaskService:
                 elif attempt.status == "failed" and elapsed >= self.retry_interval_s:
                     self._dispatch(attempt)
                 continue
-            if now < view.draft.earliest_at:
+            if view.draft.opens_at is not None and now < view.draft.opens_at:
                 continue
             if view.draft.mode == "hard":
                 self._ensure_delivery(view, "hard_due")
-            elif now >= view.draft.latest_first_delivery_at:
+            elif deadline is not None and now >= deadline:
                 self._ensure_delivery(view, "deadline_fallback")
-            elif self._available():
+            elif (self.auto_opportunity and self._available()
+                  and (view.draft.window_close_at is None or now < view.draft.window_close_at)
+                  and (not self.enforce_opportunities or self.claim_opportunity(self._delivery_id(view)) is not None)):
                 self._ensure_delivery(view, "opportunity")
             else:
                 context = self._observation.context_revision if self._observation else 1

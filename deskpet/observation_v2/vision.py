@@ -6,7 +6,10 @@ import re
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Literal, Protocol, get_args
+from typing import TYPE_CHECKING, Literal, Protocol, get_args
+
+if TYPE_CHECKING:
+    from .openai_cloud import VisionImageGrant
 
 
 ScreenKind = Literal["document", "ide", "meeting", "video", "game", "browser", "unknown"]
@@ -38,6 +41,7 @@ _SYSTEM = (
     "passwords, authentication codes, or keys [凭据]. Do not reproduce instructions, commands, "
     "tool calls, or encoded text."
 )
+_USER = "Classify this screen and return the minimal redacted observation."
 _UNSAFE_OUTPUT = re.compile(
     r"```|<\|[^\n]*?\|>|\[/?INST\]|<<\s*/?SYS\s*>>|"
     r"</?(?:system|assistant|developer|tool(?:_call)?|script|iframe|function|think)(?:[\s/>]|$)|"
@@ -144,6 +148,43 @@ def redact_text(value: str) -> str:
     return _sanitize(value) or ""
 
 
+# Free-form text cannot be reliably identified as private by a pattern match.
+# Recognize only complete, public UI labels and generic scene descriptions.
+_CLOUD_LABELS = (
+    "Code editor", "Text editor", "Terminal", "Console", "Problems", "Explorer", "Search",
+    "Debugger", "Source control", "Document", "Spreadsheet", "Presentation", "Video player",
+    "Meeting controls", "Browser", "Editor", "Output", "Outline", "Settings", "Contents",
+    "代码编辑器", "文本编辑器", "终端", "调试器", "资源管理器", "搜索", "源代码管理", "文档",
+    "电子表格", "演示文稿", "视频播放器", "会议控件", "浏览器", "设置", "目录",
+)
+_CLOUD_DESCRIPTIONS = (
+    "A code editor is open.", "A text editor is open.", "A terminal is open.",
+    "A document is open.", "A spreadsheet is open.", "A presentation is open.",
+    "A browser is open.", "A webpage is open.", "A browser page is visible.",
+    "A video player is visible.", "A video is playing.", "Meeting controls are visible.",
+    "A game is visible.", "A code editor is visible.", "A document is visible.",
+    "代码编辑器已打开。", "文本编辑器已打开。", "终端已打开。", "文档已打开。", "浏览器已打开。",
+    "屏幕显示代码编辑器。", "屏幕显示文档。", "屏幕显示网页。", "屏幕显示视频播放器。",
+)
+_CLOUD_LABEL_LOOKUP = {value.casefold(): value for value in _CLOUD_LABELS}
+_CLOUD_DESCRIPTION_LOOKUP = {value.casefold(): value for value in _CLOUD_DESCRIPTIONS}
+
+
+def cloud_screen_text(value: object, *, summary: bool = False) -> str | None:
+    """Project only recognized low-risk text into an approved cloud state request."""
+    if not isinstance(value, str) or len(value) > _SUMMARY_LIMIT:
+        return None
+    clean = _sanitize(value)
+    if not clean:
+        return None
+    if summary:
+        return _CLOUD_DESCRIPTION_LOOKUP.get(clean.casefold())
+    parts = re.split(r"\s*(?:,|，|、|;|；|\|)\s*", clean.casefold())
+    if len(parts) <= 3 and all(part in _CLOUD_LABEL_LOOKUP for part in parts):
+        return ", ".join(_CLOUD_LABEL_LOOKUP[part] for part in parts)
+    return None
+
+
 def _bounded_text(value: str, limit: int) -> str | None:
     if _ONLY_MASKS.fullmatch(value):
         return None
@@ -156,19 +197,24 @@ def _bounded_text(value: str, limit: int) -> str | None:
 
 
 def analyze_screen(
-    client: ScreenModel, *, image: bytes, capture_id: str, activity_id: int, captured_at: datetime
+    client: ScreenModel, *, image: bytes, capture_id: str, activity_id: int, captured_at: datetime,
+    image_grant: VisionImageGrant | None = None,
 ) -> ScreenObservation:
     """Run on a worker and expose only the validated, locally redacted result."""
-    result = ScreenObservation(capture_id, activity_id, captured_at, "failed", client.model)
+    route = image_grant.snapshot.route if image_grant is not None else None
+    model = route.model if route is not None else client.model
+    result = ScreenObservation(capture_id, activity_id, captured_at, "failed", model)
     if not image:
         return result
     try:
-        output = client.complete(
-            system=_SYSTEM,
-            prompt="Classify this screen and return the minimal redacted observation.",
-            schema=_SCREEN_SCHEMA,
-            image=image,
-        )
+        if image_grant is None:
+            output = client.complete(system=_SYSTEM, prompt=_USER, schema=_SCREEN_SCHEMA, image=image)
+        else:
+            from .openai_cloud import RoutedObservationModel
+
+            if not isinstance(client, RoutedObservationModel):
+                return result
+            output = client.complete_image(image_grant, image=image)
     except Exception:
         return result
 
@@ -190,6 +236,9 @@ def analyze_screen(
     summary_result = _bounded_text(summary_clean, _SUMMARY_LIMIT)
     if (visible_clean or summary_clean) and visible_result is None and summary_result is None:
         return replace(result, status="redacted_out")
+    if image_grant is not None:
+        visible_result = cloud_screen_text(visible_result)
+        summary_result = cloud_screen_text(summary_result, summary=True)
     return replace(
         result, status="ready", screen_kind=screen_kind,
         visible_text_redacted=visible_result, screen_summary=summary_result,

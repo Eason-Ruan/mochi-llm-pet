@@ -1,9 +1,10 @@
-"""Mochi's two-message input panel and the local Figma conversation demo."""
+"""Mochi's input panel and its visible conversation history."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil, sin
+import sqlite3
 
 from PyQt6.QtCore import QElapsedTimer, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontDatabase, QPainter
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
-from .refine_dialogue import DemoConversation, DemoTurn, MILK_CONFIRM, MILK_REQUEST
+from .refine_dialogue import DemoConversation, DemoTurn, LocalConversation, MILK_CONFIRM, MILK_REQUEST
 from .refine_icons import icon
 
 INK = "#433426"
@@ -113,8 +114,10 @@ class RefineChat(QWidget):
 
     toolbar_mode_changed = pyqtSignal(object)
     typing_requested = pyqtSignal()
+    storage_error = pyqtSignal(str)
 
-    def __init__(self, submit: Callable[[dict], str], snapshot: Callable[[], dict], parent=None):
+    def __init__(self, submit: Callable[[dict], str], snapshot: Callable[[], dict], parent=None, *,
+                 store=None, conversation=None):
         super().__init__(parent)
         self.setObjectName("refine-chat")
         font = self.font()
@@ -127,13 +130,17 @@ class RefineChat(QWidget):
         self.setStyleSheet(STYLE)
         self._submit = submit
         self._snapshot = snapshot
-        self._script = DemoConversation()
-        self._messages: list[Message] = []
-        self._pending: tuple[str, DemoTurn] | None = None
-        self._preferred = "voice"
+        self._store = store
+        self._voice_available = store is None
+        self._script = conversation or (DemoConversation() if store is None else LocalConversation())
+        messages, draft, pending = store.load() if store is not None else ([], "", None)
+        self._messages = [Message(*item) for item in messages]
+        self._pending = (pending[0], DemoTurn(**pending[1])) if pending else None
+        self.recovered_event = self._pending[0] if pending else None
+        self._preferred = "voice" if self._voice_available else "typing"
         self._composition: str | None = None
         self._history_end: int | None = None
-        self._draft = ""
+        self._draft = draft
         self._follow_up = False
         self._voice_started = QElapsedTimer()
         self._voice_timer = QTimer(self)
@@ -165,20 +172,21 @@ class RefineChat(QWidget):
         return QSize(PANEL_WIDTH, height)
 
     def set_preference(self, mode: str):
-        self._preferred = mode
+        self._preferred = mode if self._voice_available else "typing"
 
     def open(self, preferred_mode: str, *, alternate: bool = False):
         self.set_preference(preferred_mode)
         if self._pending:
             self._render()
             return
-        self._compose(self._other(preferred_mode) if alternate else preferred_mode)
+        self._compose(self._other(self._preferred) if alternate and self._voice_available else self._preferred)
 
     def reset_input(self):
         self._voice_timer.stop()
         self._composition = None
         self._history_end = None
-        self._draft = ""
+        if self._store is None:
+            self._draft = ""
         self._render()
 
     @staticmethod
@@ -186,7 +194,7 @@ class RefineChat(QWidget):
         return "voice" if mode == "typing" else "typing"
 
     def toggle_input(self):
-        if self._composition is not None:
+        if self._composition is not None and self._voice_available:
             self._compose(self._other(self._composition))
 
     def _compose(self, mode: str):
@@ -232,17 +240,24 @@ class RefineChat(QWidget):
         if not value or self._pending is not None:
             return
         speaker = "你 · 模拟语音" if simulated else "你"
+        turn = self._script.reply(value, self._snapshot())
+        if self._store is not None:
+            try:
+                self._store.begin_turn(speaker, value, turn)
+            except sqlite3.Error:
+                self.storage_error.emit("暂时无法保存对话。")
+                return
         self._messages.append(Message(speaker, value))
         self._composition = self._history_end = None
         self._voice_timer.stop()
         self._draft = ""
         self._follow_up = False
-        turn = self._script.reply(value, self._snapshot())
         if turn.action is not None:
             try:
                 self._pending = (self._submit(turn.action), turn)
             except (ValueError, RuntimeError):
-                self._reply("暂时无法提交。请检查服务连接后重试。", True)
+                self._pending = (turn.action["event_id"], turn)
+                self._finish_turn("暂时无法提交。请稍后重试。", True)
         else:
             self._reply(turn.text, turn.follow_up)
         self._render()
@@ -251,19 +266,38 @@ class RefineChat(QWidget):
         self._messages.append(Message("Mochi", text))
         self._follow_up = follow_up
 
+    def append_message(self, text: str):
+        if self._store is not None:
+            self._store.append_message("Mochi", text)
+        self._reply(text, True)
+        self._render()
+
+    def _finish_turn(self, text: str, follow_up: bool):
+        if self._store is not None:
+            try:
+                self._store.finish_turn(self._pending[0], text)
+            except sqlite3.Error:
+                self.storage_error.emit("暂时无法保存对话结果。")
+                return
+        self._pending = None
+        self.recovered_event = None
+        self._reply(text, follow_up)
+
     def receive_result(self, result: dict):
         if self._pending is None or (result.get("command_id") or result.get("event_id")) != self._pending[0]:
             return
         _, turn = self._pending
-        self._pending = None
-        if result.get("status") == "applied":
+        if result.get("status") == "applied" or (result.get("status") == "duplicate"
+                                                  and result.get("original_status") == "applied"):
             text = turn.text
-            if turn.action["action_id"] == "session.pause" and result.get("view"):
+            if self._store is None and turn.action["action_id"] == "session.pause" and result.get("view"):
                 minutes, seconds = divmod(ceil(result["view"]["remaining_s"]), 60)
                 text = f"{text[:-1]}，还剩 {minutes} 分 {seconds:02d} 秒。"
-            self._reply(text, turn.follow_up)
+            self._finish_turn(text, turn.follow_up)
+        elif result.get("status") == "result_unavailable":
+            self._finish_turn("上次操作没有已保存的结果。请查看当前计时后继续。", True)
         else:
-            self._reply("未能更新。请查看最新状态后重试。", True)
+            self._finish_turn("未能更新。请查看最新状态后重试。", True)
         self._render()
 
     def _history_count(self) -> int:
@@ -318,11 +352,12 @@ class RefineChat(QWidget):
         layout.setSpacing(4)
         header = QHBoxLayout()
         header.addWidget(self._label("语音输入中" if voice else "打字输入中", sender=True), 1)
-        mode = _GestureButton("mic" if voice else "keyboard", "长按临时切换输入方式",
-                              accent=True, hold=True, width=30, height=26)
-        mode.setObjectName("refine-chat-mode")
-        mode.held.connect(self.toggle_input)
-        header.addWidget(mode)
+        if self._voice_available:
+            mode = _GestureButton("mic" if voice else "keyboard", "长按临时切换输入方式",
+                                  accent=True, hold=True, width=30, height=26)
+            mode.setObjectName("refine-chat-mode")
+            mode.held.connect(self.toggle_input)
+            header.addWidget(mode)
         layout.addLayout(header)
         if voice:
             row = QHBoxLayout()
@@ -346,7 +381,9 @@ class RefineChat(QWidget):
             self._editor = QLineEdit(self._draft)
             self._editor.setObjectName("refine-chat-editor")
             self._editor.setAccessibleName("打字输入")
-            hint = "确认，明晚六点提醒我。" if self._script.confirmation else "把买牛奶延后到明晚六点"
+            hint = "例如：开始 25 分钟"
+            if self._voice_available:
+                hint = "确认，明晚六点提醒我。" if self._script.confirmation else "把买牛奶延后到明晚六点"
             self._editor.setPlaceholderText(hint)
             self._editor.setMaxLength(240)
             send = _GestureButton("send", "发送", accent=True)
@@ -363,6 +400,11 @@ class RefineChat(QWidget):
 
     def _save_draft(self, text: str):
         self._draft = text
+        if self._store is not None:
+            try:
+                self._store.save_draft(text)
+            except sqlite3.Error:
+                self.storage_error.emit("暂时无法保存草稿。")
 
     def _render(self):
         self._editor = self._elapsed = self._waveform = None
@@ -396,7 +438,7 @@ class RefineChat(QWidget):
             self._cards.addWidget(down, 0, Qt.AlignmentFlag.AlignHCenter)
         elif self._follow_up:
             mode = "keyboard" if self._preferred == "typing" else "mic"
-            button = _GestureButton(mode, "继续输入", accent=True, hold=True, width=34)
+            button = _GestureButton(mode, "继续输入", accent=True, hold=self._voice_available, width=34)
             button.setObjectName("refine-chat-continue")
             button.tapped.connect(lambda: self._compose(self._preferred))
             button.held.connect(lambda: self._compose(self._other(self._preferred)))

@@ -44,8 +44,8 @@ class ScriptedSlowPlanner:
         else:
             delay = 5 if results else 30
             base_time = self.clock.wall_now() if self.clock is not None else max(observed_at, envelope.created_at)
-            when = min(base_time + timedelta(seconds=delay),
-                       task.draft.latest_first_delivery_at)
+            when = min(value for value in (base_time + timedelta(seconds=delay),
+                                           task.draft.hard_deadline) if value is not None)
             name, args = "schedule_recheck", {"run_at": when.isoformat()}
         suffix = len(results)
         call = ToolCall(call_id=f"{envelope.request_id}:{suffix}:{name}", tool_name=name,
