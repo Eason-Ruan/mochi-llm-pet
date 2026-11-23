@@ -14,6 +14,7 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+from threading import Lock
 import time
 from urllib.parse import urlsplit
 
@@ -42,6 +43,7 @@ _MAC_CHROMIUM_APPS = {
     "vivaldi": "com.vivaldi.Vivaldi",
 }
 
+_MAC_SESSION_LOOKUP = Lock()
 
 @dataclass(frozen=True, slots=True)
 class ActivitySample:
@@ -554,7 +556,14 @@ end tell'''
 def _mac_session() -> tuple[bool | None, str | None]:
     import Quartz
 
-    session = Quartz.CGSessionCopyCurrentDictionary()
+    # PyObjC resolves this symbol lazily. The UI, scheduler and sampler can
+    # reach it together on startup, while the bridge consumes its metadata.
+    with _MAC_SESSION_LOOKUP:
+        try:
+            copy_session = Quartz.CGSessionCopyCurrentDictionary
+        except (AttributeError, KeyError):
+            return None, None
+    session = copy_session()
     if session is None:
         return None, None
     console = session.get("kCGSSessionOnConsoleKey")

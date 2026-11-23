@@ -157,6 +157,17 @@ def test_input_agnostic_recording_interval_has_no_system_evidence():
             recorder.add_recording_interval(ended_at, started_at)
 
 
+def test_mac_session_keeps_unknown_state_when_quartz_symbol_lookup_fails(monkeypatch):
+    import sys
+
+    class Quartz:
+        def __getattr__(self, name):
+            raise KeyError(name)
+
+    monkeypatch.setitem(sys.modules, "Quartz", Quartz())
+    assert module._mac_session() == (None, None)
+
+
 def test_native_sampler_isolated_failures_and_locked_foreground(monkeypatch):
     monkeypatch.setattr(module, "_mac_session", lambda: (True, "session"))
 
