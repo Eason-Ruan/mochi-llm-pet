@@ -8,10 +8,11 @@ from uuid import uuid4
 from PyQt6.QtCore import QDateTime, Qt, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDateTimeEdit, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from deskpet.timezones import resolve_timezone
+from .refine_style import MUTED, MenuField, _card, _text, stepper
 
 
 STATES = {"focusing": "专注中", "paused": "已暂停", "break_due": "本轮时间到", "ended": "已结束"}
@@ -296,6 +297,11 @@ PHASE_STATES = {
 }
 
 
+class MinutesSpinBox(QDoubleSpinBox):
+    def textFromValue(self, value):
+        return self.locale().toString(value, "f", 0 if value.is_integer() else self.decimals())
+
+
 class PhasePanel(QGroupBox):
     """The desktop timer, driven by acknowledged actions and the shared phase view."""
 
@@ -317,33 +323,57 @@ class PhasePanel(QGroupBox):
         self._editing_details = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 14, 9, 9)
-        layout.setSpacing(6)
-        self.summary = label("当前没有专注")
+        layout.setContentsMargins(0, 0, 2, 0)
+        layout.setSpacing(8)
+        self.summary = _text("当前没有专注", size=12, color=MUTED, wrap=True)
         self.summary.setObjectName("phase-summary")
         layout.addWidget(self.summary)
 
+        self.goal_card, goal_layout = _card(spacing=5)
+        goal_layout.addWidget(_text("专注目标", bold=True))
+        goal_layout.addWidget(_text("标题", size=11, color=MUTED, bold=True))
         self.goal = QLineEdit()
         self.goal.setObjectName("phase-title")
+        self.goal.setAccessibleName("专注标题")
         self.goal.setMaxLength(500)
         self.goal.setPlaceholderText("专注标题（可留空）")
-        layout.addWidget(self.goal)
+        goal_layout.addWidget(self.goal)
+        goal_layout.addWidget(_text("描述", size=11, color=MUTED, bold=True))
         self.description = QLineEdit()
+        self.description.setAccessibleName("目标描述")
         self.description.setMaxLength(4000)
         self.description.setPlaceholderText("目标描述（可留空）")
-        layout.addWidget(self.description)
+        goal_layout.addWidget(self.description)
+        layout.addWidget(self.goal_card)
+
+        self.timing_card, setup = _card(spacing=8)
         self.duration = self._minutes("专注时长")
         self.duration.setObjectName("phase-duration")
         self.duration.valueChanged.connect(self._edited_duration)
-        layout.addWidget(self.duration)
-        self.task = QComboBox()
+        self.duration_row = QWidget()
+        duration = QHBoxLayout(self.duration_row)
+        duration.setContentsMargins(0, 0, 0, 0)
+        duration.addWidget(_text("专注时长", size=12, bold=True), 1)
+        duration.addWidget(stepper(self.duration))
+        setup.addWidget(self.duration_row)
+
+        self.task = MenuField()
         self.task.addItem("不关联事项", None)
         self.task.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.task.setAccessibleName("关联事项")
-        layout.addWidget(self.task)
+        self.task.setMinimumContentsLength(5)
+        self.task.setFixedWidth(130)
+        self.task_row = QWidget()
+        linked = QHBoxLayout(self.task_row)
+        linked.setContentsMargins(0, 0, 0, 0)
+        linked.addWidget(_text("关联事项", size=12), 1)
+        linked.addWidget(self.task)
+        setup.addWidget(self.task_row)
+        layout.addWidget(self.timing_card)
 
         self.buttons = {}
         self._button(layout, "start", "开始专注")
+        self.buttons["start"].setProperty("primary", True)
         self._button(layout, "continue_habit", "继续习惯")
         timing = QHBoxLayout()
         self._button(timing, "pause", "暂停")
@@ -363,7 +393,7 @@ class PhasePanel(QGroupBox):
         self._button(layout, "skip_break", "跳过休息")
 
         adjust = QHBoxLayout()
-        self.adjust_mode = QComboBox()
+        self.adjust_mode = MenuField()
         self.adjust_mode.addItem("总时长", "total_s")
         self.adjust_mode.addItem("额外增加", "add_s")
         adjust.addWidget(self.adjust_mode)
@@ -389,11 +419,11 @@ class PhasePanel(QGroupBox):
         self._button(review_layout, "review", "保存回顾")
         self.interval_editor = QGroupBox("修改工时归属")
         interval_layout = QVBoxLayout(self.interval_editor)
-        self.review_intervals = QComboBox()
+        self.review_intervals = MenuField()
         self.review_intervals.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.review_intervals.setAccessibleName("工时区间")
         self.review_intervals.currentIndexChanged.connect(self._select_review_interval)
-        self.review_issue = QComboBox()
+        self.review_issue = MenuField()
         self.review_issue.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.review_issue.setAccessibleName("新的工时归属")
         interval_layout.addWidget(self.review_intervals)
@@ -421,12 +451,13 @@ class PhasePanel(QGroupBox):
 
         self.result = label("")
         self.result.setObjectName("phase-result")
+        self.result.hide()
         layout.addWidget(self.result)
         self.render_snapshot({})
 
     @staticmethod
     def _minutes(accessible_name):
-        editor = QDoubleSpinBox()
+        editor = MinutesSpinBox()
         editor.setDecimals(2)
         editor.setRange(0.02, 1440)
         editor.setValue(25)
@@ -472,7 +503,10 @@ class PhasePanel(QGroupBox):
             self.duration.setValue(seconds / 60)
             self.duration.blockSignals(blocked)
         link_enabled = snapshot.get("phase_defaults", {}).get("link_issues", False)
-        self.task.setVisible(link_enabled and (is_focus or not active))
+        show_task = not active or (is_focus and link_enabled)
+        self.task_row.setVisible(show_task)
+        self.task.setEnabled(link_enabled)
+        self.timing_card.setVisible(show_task)
         self.adjust_mode.setVisible(bool(active))
         self.adjust_minutes.setVisible(bool(active))
         active_id = active["id"] if active else None
@@ -483,9 +517,8 @@ class PhasePanel(QGroupBox):
             self.description.setText((active.get("description") or "") if is_focus else "")
             self.count_completed.setChecked(False)
             self._set_adjust_initial()
-        self.goal.setVisible(not active or self._editing_details)
-        self.description.setVisible(not active or self._editing_details)
-        self.duration.setVisible(not active)
+        self.goal_card.setVisible(not active or self._editing_details)
+        self.duration_row.setVisible(not active)
         self.edit_details.setVisible(is_focus)
         self.edit_details.setText("收起目标" if self._editing_details else "编辑目标")
         self.count_completed.setVisible(bool(is_focus and active.get("habit_id") and state != "elapsed"))
@@ -668,17 +701,21 @@ class PhasePanel(QGroupBox):
         try:
             self.pending = self.submit(f"session.{action}", payload=payload)
         except (RuntimeError, ValueError) as exc:
-            self.result.setText(str(exc))
+            self._report(str(exc))
             return
-        self.result.setText("正在保存…")
+        self._report("正在保存…")
         self.render_snapshot(self.snapshot)
+
+    def _report(self, message):
+        self.result.setText(message)
+        self.result.show()
 
     def receive_result(self, result):
         if self.pending is None or (result.get("command_id") or result.get("event_id")) != self.pending:
             return
         self.pending = None
         if result.get("status") == "applied" or result.get("original_status") == "applied":
-            self.result.setText("已保存")
+            self._report("已保存")
         else:
-            self.result.setText(ERRORS.get(result.get("error_code"), "未能保存此操作"))
+            self._report(ERRORS.get(result.get("error_code"), "未能保存此操作"))
         self.render_snapshot(self.snapshot)

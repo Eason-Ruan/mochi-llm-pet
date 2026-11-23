@@ -11,7 +11,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPen, QRegion
 from PyQt6.QtWidgets import (
-    QFrame, QGroupBox, QGraphicsEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu,
+    QFrame, QGraphicsEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu,
     QPushButton, QScrollArea,
     QVBoxLayout, QWidget,
 )
@@ -181,17 +181,10 @@ class RefineScroll(QScrollArea):
         self.setObjectName("refine-scroll")
         self.setWidgetResizable(True)
         self.setWidget(panel)
-        self.setStyleSheet(
-            f"QScrollArea#refine-scroll {{background: {CREAM}; border: 2px solid {INK}; border-radius: 10px}}"
-        )
-        if not isinstance(panel, QGroupBox):
-            self.setFrameShape(QFrame.Shape.NoFrame)
-            self.setStyleSheet("QScrollArea#refine-scroll {background: transparent; border: 0}")
-            self.viewport().setAutoFillBackground(False)
-            panel.setAutoFillBackground(False)
-        else:
-            from .settings import _CONTROL_STYLE
-            panel.setStyleSheet(_CONTROL_STYLE + f"QGroupBox {{background: {CREAM}; color: {TEXT}}}")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet("QScrollArea#refine-scroll {background: transparent; border: 0}")
+        self.viewport().setAutoFillBackground(False)
+        panel.setAutoFillBackground(False)
 
     def sizeHint(self):
         return QSize(WIDTH, min(430, self.widget().sizeHint().height() + 4))

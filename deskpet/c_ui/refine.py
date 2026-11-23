@@ -25,6 +25,7 @@ from .refine_conversation_store import ConversationStore
 from .refine_delivery import Prompt, RefineDeliveryMixin
 from .refine_panels import RefineReminders, RefineSettings, RefineWork, active_reminders, current_work
 from .refine_proposals import ProposalCard
+from .refine_style import DetailPanel
 from .refine_window import RefinePet, RefineScroll
 from .time_format import ZONE
 
@@ -131,8 +132,10 @@ class RefineSession(RefineDeliveryMixin):
         self.chat.typing_requested.connect(self.pet.activate_for_input)
         self.chat.storage_error.connect(self._service_error)
         self.panels = {
-            "reminders": RefineScroll(self.reminders) if self.production else self.reminders,
-            "work": RefineScroll(self.work) if self.production else self.work,
+            "reminders": (DetailPanel("提醒事项", self.reminders, lambda: self._panel_details("reminders", False))
+                          if self.production else self.reminders),
+            "work": (DetailPanel("专注与回顾", self.work, lambda: self._panel_details("work", False))
+                     if self.production else self.work),
             "settings": self.settings_panel,
             "input": RefineScroll(self.chat) if self.production else self.chat,
         }
@@ -146,14 +149,10 @@ class RefineSession(RefineDeliveryMixin):
             }
             for key, label in (("reminders", "管理提醒"), ("work", "管理计时"), ("settings", "更多设置")):
                 self.overviews[key].add_manage_action(label, lambda checked=False, name=key: self._panel_details(name, True))
-                back = QPushButton("返回摘要")
-                back.setObjectName("refine-back-to-summary")
-                back.clicked.connect(lambda checked=False, name=key: self._panel_details(name, False))
-                editor = {"work": self.work, "reminders": self.reminders, "settings": self.settings_panel}[key]
-                if key == "settings":
-                    editor.body.itemAt(0).layout().addWidget(back)
-                else:
-                    editor.layout().insertWidget(0, back)
+            back = QPushButton("返回摘要")
+            back.setObjectName("refine-back-to-summary")
+            back.clicked.connect(lambda: self._panel_details("settings", False))
+            self.settings_panel.body.itemAt(0).layout().addWidget(back)
             self.panels.update(self.overviews)
 
         options = copy.copy(args)

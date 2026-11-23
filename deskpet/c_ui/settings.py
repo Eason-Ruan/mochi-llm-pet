@@ -8,16 +8,18 @@ import sqlite3
 
 from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QFrame, QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
 from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL
 from deskpet.settings import Habit, HabitBehavior, SettingsConflict
 
-from .refine_panels import (
-    CARD_OUTLINE, GREEN, INK, MUTED, PAPER, SAND, _Panel, _card, _text, _title,
+from .work_panel import MinutesSpinBox
+
+from .refine_style import (
+    DETAIL_CONTROL_STYLE, MUTED, MenuField, Toggle, _CONTROL_STYLE, _Panel, _card, _scroll_area, _text, _title, stepper,
 )
 
 
@@ -47,26 +49,6 @@ _CHECKBOXES = (
     ("observation_paused", "暂停活动采集"),
 )
 
-_CONTROL_STYLE = f"""
-QLabel, QCheckBox {{ color: {INK}; }}
-QPushButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
-    color: {INK}; background: {PAPER}; border: 1px solid {CARD_OUTLINE};
-    border-radius: 6px; padding: 4px 6px; min-height: 18px;
-}}
-QPushButton:hover {{ background: {SAND}; }}
-QPushButton:disabled {{ color: {MUTED}; background: {SAND}; }}
-QPushButton:focus, QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
-    border-color: {GREEN};
-}}
-"""
-
-
-class _DurationSpinBox(QDoubleSpinBox):
-    def textFromValue(self, value: float) -> str:
-        digits = 0 if value.is_integer() else self.decimals()
-        return self.locale().toString(value, "f", digits)
-
-
 def _choice(choices):
     box = QComboBox()
     for label, value in choices:
@@ -75,7 +57,7 @@ def _choice(choices):
 
 
 def _duration():
-    field = _DurationSpinBox()
+    field = MinutesSpinBox()
     field.setDecimals(2)
     field.setRange(1 / 60, 1440)
     field.setSingleStep(1)
@@ -127,7 +109,7 @@ class SettingsPanel(_Panel):
     ):
         super().__init__(parent)
         self.setObjectName("refine-settings")
-        self.setStyleSheet(_CONTROL_STYLE)
+        self.setStyleSheet(DETAIL_CONTROL_STYLE)
         self.store = store
         self.submit = submit
         self.sound_preview = sound_preview
@@ -144,21 +126,15 @@ class SettingsPanel(_Panel):
         self._verification_finished.connect(self._finish_verification)
 
         self.body.addLayout(_title("设置"))
-        self._scroll = QScrollArea()
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFixedHeight(355)
-        self._scroll.setStyleSheet("QScrollArea { background: transparent; }")
-        self.body.addWidget(self._scroll)
         contents = QWidget()
-        contents.setStyleSheet("QWidget#settings-sections { background: transparent; }")
-        contents.setObjectName("settings-sections")
+        self._scroll = _scroll_area(contents)
+        self._scroll.setFixedHeight(480)
+        self.body.addWidget(self._scroll)
         self._sections = QVBoxLayout(contents)
-        self._sections.setContentsMargins(0, 0, 4, 0)
+        self._sections.setContentsMargins(1, 0, 2, 0)
         self._sections.setSpacing(8)
-        self._scroll.setWidget(contents)
 
-        self._checkboxes = {key: QCheckBox(label) for key, label in _CHECKBOXES}
+        self._checkboxes = {key: Toggle(label) for key, label in _CHECKBOXES}
         for key, checkbox in self._checkboxes.items():
             checkbox.setObjectName(f"settings-{key}")
             checkbox.toggled.connect(lambda enabled, name=key: self._save(**{name: enabled}))
@@ -181,18 +157,21 @@ class SettingsPanel(_Panel):
 
     def _build_focus(self):
         section = self._section("专注与休息")
-        form = QFormLayout()
         self._durations = {}
         for key, title in (("default_focus_s", "默认专注"), ("default_break_s", "默认休息")):
             field = _duration()
             field.setObjectName(f"settings-{key}")
+            field.setAccessibleName(title)
             field.editingFinished.connect(lambda name=key: self._save_duration(name))
             self._durations[key] = field
-            form.addRow(title, field)
-        section.addLayout(form)
+            row = QHBoxLayout()
+            row.addWidget(_text(title, size=12), 1)
+            row.addWidget(stepper(field, on_step=lambda name=key: self._save_duration(name)))
+            section.addLayout(row)
         for key in ("link_issues", "auto_adjust", "habits_enabled"):
             section.addWidget(self._checkboxes[key])
-        self._habit_selector = QComboBox()
+        section = self._section("习惯")
+        self._habit_selector = MenuField()
         self._habit_selector.setAccessibleName("命名习惯")
         self._habit_selector.currentIndexChanged.connect(self._render_habit_actions)
         section.addWidget(self._habit_selector)
@@ -216,13 +195,18 @@ class SettingsPanel(_Panel):
             section.addWidget(self._checkboxes[key])
         for key, kind in (("reminder_sound", "reminder"), ("phase_end_sound", "phase_end")):
             row = QHBoxLayout()
-            row.addWidget(self._checkboxes[key])
-            row.addStretch()
+            checkbox = self._checkboxes[key]
+            text = checkbox.text()
+            checkbox.setAccessibleName(text)
+            checkbox.setText("")
+            checkbox.setFixedWidth(31)
+            row.addWidget(_text(text, size=12), 1)
             preview = QPushButton("试听")
-            preview.setAccessibleName(f"试听{self._checkboxes[key].text()}")
+            preview.setAccessibleName(f"试听{text}")
             preview.setEnabled(self.sound_preview is not None)
             preview.clicked.connect(lambda _, sound=kind: self._report(self.sound_preview(sound)))
             row.addWidget(preview)
+            row.addWidget(checkbox)
             section.addLayout(row)
         for key in ("allow_system_notifications", "lock_screen_detail"):
             section.addWidget(self._checkboxes[key])
@@ -295,7 +279,7 @@ class SettingsPanel(_Panel):
     def set_height_limit(self, max_height: int):
         self._height_limit = max_height
         status_height = 0 if self.status.isHidden() else self.status.heightForWidth(266) + 8
-        self._scroll.setFixedHeight(min(355, max(42, max_height - 55 - status_height)))
+        self._scroll.setFixedHeight(min(480, max(1, max_height - 68 - status_height)))
 
     def _report(self, message):
         self.status.setText(message or "")

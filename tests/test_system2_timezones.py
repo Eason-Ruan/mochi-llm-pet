@@ -87,8 +87,10 @@ def test_qt_reminder_preserves_the_second_hour_when_dst_ends(monkeypatch):
         panel.render_snapshot({"now": reference})
         panel.times["exact"].load(later, reference, required=True)
         panel.content.setText("提交报告")
-        assert panel.times["exact"].editor.text().endswith("01:30:00 -05:00")
-        assert panel.preview.text().endswith("明天 01:30（America/New_York UTC-05:00）")
+        assert panel.times["exact"].date.text() == "2026-11-01"
+        assert panel.times["exact"].time.text() == "01:30:00"
+        assert panel.preview.text() == "明天 01:30 · 准点提醒"
+        assert panel.preview_timezone.text() == "America/New_York · UTC-05:00"
         assert display_time(earlier, reference, zone=zone).endswith("UTC-04:00）")
         assert display_time(later, reference).endswith("北京时间 UTC+08:00）")
 

@@ -2,38 +2,25 @@
 from __future__ import annotations
 
 import math
-from functools import cache
 
-from PyQt6.QtCore import QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from .refine_icons import icon
+from .refine_style import (
+    GREEN, GREEN_TINT, INK, MUTED, OUTLINE, PANEL_WIDTH, PAPER, SAND,
+    _Panel, _card, _font, _scroll_area, _text, _title,
+)
 from .time_format import local_time
 from .work_panel import STATES, duration_text
-
-PANEL_WIDTH = 292
-CREAM = "#fff7e9"
-PAPER = "#fffcf6"
-OUTLINE = "#49382a"
-CARD_OUTLINE = "#dfceb6"
-INK = "#312921"
-MUTED = "#67594c"
-GREEN = "#35533c"
-GREEN_TINT = "#e0ebd8"
-SAND = "#f6ead6"
-SHADOW = "#c9b79f"
-
 
 def active_reminders(snapshot: dict) -> list[dict]:
     return sorted(
@@ -56,30 +43,6 @@ def current_work(snapshot: dict) -> dict | None:
     )
 
 
-@cache
-def _font(size: int, *, bold: bool = False) -> QFont:
-    font = QFont()
-    installed = QFontDatabase.families()
-    for family in ("Noto Sans SC", "PingFang SC", "Microsoft YaHei"):
-        if family in installed:
-            font.setFamily(family)
-            break
-    font.setPixelSize(size)
-    font.setBold(bold)
-    return font
-
-
-def _text(text="", *, size=13, color=INK, bold=False, wrap=False, height=None):
-    label = QLabel(text)
-    label.setTextFormat(Qt.TextFormat.PlainText)
-    label.setFont(_font(size, bold=bold))
-    label.setStyleSheet(f"color: {color}")
-    label.setWordWrap(wrap)
-    if height is not None:
-        label.setFixedHeight(height)
-    return label
-
-
 def _badge(text="", *, positive=True):
     badge = _text(text, size=11, color=GREEN if positive else MUTED, bold=True)
     _style_badge(badge, positive)
@@ -91,60 +54,6 @@ def _badge(text="", *, positive=True):
 def _style_badge(badge, positive):
     color, background = (GREEN, GREEN_TINT) if positive else (MUTED, SAND)
     badge.setStyleSheet(f"color: {color}; background: {background}; border-radius: 6px; padding: 0 7px")
-
-
-def _title(text, badge=None):
-    row = QHBoxLayout()
-    row.setSpacing(8)
-    row.addWidget(_text(text, size=15, bold=True, height=18), 1)
-    if badge is not None:
-        row.addWidget(badge, alignment=Qt.AlignmentFlag.AlignVCenter)
-    return row
-
-
-class _Panel(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedWidth(PANEL_WIDTH)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(13, 13, 13, 16)
-        self.body.setSpacing(8)
-
-    def add_manage_action(self, label, callback):
-        button = QPushButton(label)
-        button.setObjectName("refine-manage")
-        button.setFont(_font(11, bold=True))
-        button.setFixedHeight(22)
-        button.setStyleSheet(
-            f"QPushButton {{color: {GREEN}; background: {PAPER}; border: 1px solid {CARD_OUTLINE};"
-            "border-radius: 5px; padding: 0 6px}"
-            f"QPushButton:hover, QPushButton:focus {{background: {GREEN_TINT}}}"
-        )
-        button.clicked.connect(callback)
-        row = self.body.itemAt(0).layout()
-        row.insertWidget(1, button)
-        return button
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(SHADOW))
-        painter.drawRoundedRect(QRectF(0, 3, self.width(), self.height() - 3), 13, 13)
-        painter.setPen(QPen(QColor(OUTLINE), 2))
-        painter.setBrush(QColor(CREAM))
-        painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 5), 12, 12)
-
-
-def _card(*, spacing: int):
-    frame = QFrame()
-    frame.setObjectName("refine-card")
-    frame.setStyleSheet(f"QFrame#refine-card {{background: {PAPER}; border: 1px solid {CARD_OUTLINE}; border-radius: 7px}}")
-    layout = QVBoxLayout(frame)
-    layout.setContentsMargins(8, 8, 8, 8)
-    layout.setSpacing(spacing)
-    return frame, layout
 
 
 def _schedule(draft, reference, zone=None):
@@ -181,24 +90,6 @@ def _size_wrapped_label(label, line_height, line_width):
     else:
         label.setMinimumHeight(line_height)
         label.setMaximumHeight(16777215)
-
-
-def _scroll_area(widget: QWidget) -> QScrollArea:
-    area = QScrollArea()
-    area.setFrameShape(QFrame.Shape.NoFrame)
-    area.setWidgetResizable(True)
-    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    area.setStyleSheet(
-        "QScrollArea { background: transparent; border: 0 }"
-        "QScrollBar:vertical { width: 6px; padding-left: 2px; background: transparent }"
-        f"QScrollBar::handle:vertical {{ background: {SHADOW}; border-radius: 2px; min-height: 18px }}"
-        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0 }"
-        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent }"
-    )
-    area.setWidget(widget)
-    widget.setAutoFillBackground(False)
-    area.viewport().setAutoFillBackground(False)
-    return area
 
 
 class RefineReminders(_Panel):
