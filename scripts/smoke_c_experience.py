@@ -12,6 +12,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',default='output/m0/c-p4/native')
     parser.add_argument('--offscreen',action='store_true')
+    parser.add_argument('--adapters',default='examples/m0/c-desktop.adapters.json')
     args=parser.parse_args()
     if args.offscreen: os.environ['QT_QPA_PLATFORM']='offscreen'
     from PyQt6.QtCore import QPoint, QTimer, Qt
@@ -22,7 +23,7 @@ def main():
     from deskpet.m0.composition import provenance
     output=Path(args.output); output.mkdir(parents=True,exist_ok=True)
     app=QApplication.instance() or QApplication([]); app.setQuitOnLastWindowClosed(False)
-    options=SimpleNamespace(profile='scenario',scenario='c-experience',output=str(output),auto_smoke=False,adapters='examples/m0/c-desktop.adapters.json')
+    options=SimpleNamespace(profile='scenario',scenario='c-experience',output=str(output),auto_smoke=False,adapters=args.adapters)
     desktop=DesktopSession(app,options); w=desktop.window; p=w.ui_surface; panel=p.reminder_panel
     source='offscreen' if QGuiApplication.platformName() in ('offscreen','minimal') else 'native'
     timer=QTimer(); checks={}; report={}; state=dict(index=0,sent=False,waits=0)

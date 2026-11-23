@@ -88,7 +88,7 @@ QWidget#c-workspace QPushButton { min-height: 28px; padding: 3px 8px; }
         self.reminder_panel.render_snapshot(snapshot)
         self.work_panel.render_snapshot(snapshot)
         if not snapshot: return
-        self.connection.setText('演示模式 · 使用「任务与工作段」页的快进按钮推进模拟时间' if snapshot.get('clock')=='virtual' else '已连接 · 按实际时间计时')
+        self.connection.setText('演示模式 · 使用「任务与工作段」页的快进按钮推进模拟时间' if snapshot.get('clock')=='virtual' else '真实时间模式 · 随系统时间自动计时，无需快进')
         self.task_summary.setText(f"事项 {len(snapshot['tasks'])} 项 · 工作段 {len(snapshot['sessions'])} 段 · 到期提醒 {len(self.cards)} 条")
 
     def show_reminder(self,command):

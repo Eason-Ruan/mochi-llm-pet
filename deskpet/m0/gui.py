@@ -977,8 +977,9 @@ class Workbench(QMainWindow):
     @pyqtSlot()
     def _ready(self):
         self.ready_for_actions = True
-        if self.args.profile == "live-smoke":
+        if self.args.profile != "scenario":
             self.advance_button.setEnabled(False)
+        if self.args.profile == "live-smoke":
             self._start_live_sampling()
         if getattr(self.args, "auto_smoke", False):
             self._await_smoke_window()

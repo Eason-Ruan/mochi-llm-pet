@@ -95,7 +95,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Mochi M0: deterministic, offline collaboration workbench")
     commands = root.add_subparsers(dest="command", required=True)
     gui = commands.add_parser("gui", help="native Qt workbench; uses scripted policies")
-    gui.add_argument("--profile", choices=("scenario", "live-smoke"), default="scenario")
+    gui.add_argument("--profile", choices=("scenario", "live-smoke", "realtime"), default="scenario")
     gui.add_argument("--scenario", default="reminder-flow")
     gui.add_argument("--output", default="output/m0/gui")
     gui.add_argument("--auto-smoke", action="store_true")
