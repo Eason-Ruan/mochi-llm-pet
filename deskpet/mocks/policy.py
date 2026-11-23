@@ -26,16 +26,24 @@ class ScriptedSlowPlanner:
         self.clock = clock
 
     def plan(self, observation, task, envelope, results=()):
+        return self._plan(observation.estimate.state, observation.observed_at, task, envelope, results)
+
+    def plan_with_context(self, context, task, envelope, results=()):
+        current = context.current if context.current_status == "fresh" else None
+        state = current.state if current is not None else "unknown"
+        return self._plan(state, context.as_of, task, envelope, results)
+
+    def _plan(self, state, observed_at, task, envelope, results):
         if task.status != "registered":
             return ProposedPlan(envelope=envelope)
         if results and any(r.status in ("succeeded", "pending")
                            or (r.status == "duplicate" and r.error_code is None) for r in results):
             return ProposedPlan(envelope=envelope)
-        if not results and observation.estimate.state == "available":
+        if not results and state == "available":
             name, args = "show_reminder", {}
         else:
             delay = 5 if results else 30
-            base_time = self.clock.wall_now() if self.clock is not None else max(observation.observed_at, envelope.created_at)
+            base_time = self.clock.wall_now() if self.clock is not None else max(observed_at, envelope.created_at)
             when = min(base_time + timedelta(seconds=delay),
                        task.draft.latest_first_delivery_at)
             name, args = "schedule_recheck", {"run_at": when.isoformat()}

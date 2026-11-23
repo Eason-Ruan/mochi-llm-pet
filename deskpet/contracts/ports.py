@@ -1,12 +1,16 @@
 """Synchronous domain ports; Qt clients use the queued gateway, never direct calls."""
 from __future__ import annotations
 from datetime import datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from .models import (
     CommandResult, DecisionEnvelope, DisplayCommand, DisplayReceipt, ErrorCode,
     Observation, RawSignals, UserStateEstimate, ProposedPlan, SessionCommand, SessionResult, TaskCommand,
     TaskView, ToolCall, ToolResult, TraceEvent, WorkSession,
 )
+
+
+if TYPE_CHECKING:
+    from deskpet.observation_v2.context import ObservationContext
 
 
 class Clock(Protocol):
@@ -37,6 +41,11 @@ class FastPolicy(Protocol):
 class SlowPlanner(Protocol):
     def plan(self, observation: Observation, task: TaskView, envelope: DecisionEnvelope,
              results: tuple[ToolResult, ...] = ()) -> ProposedPlan: ...
+
+
+class ObservationContextPlanner(Protocol):
+    def plan_with_context(self, context: ObservationContext, task: TaskView, envelope: DecisionEnvelope,
+                          results: tuple[ToolResult, ...] = ()) -> ProposedPlan: ...
 
 
 class DeliveryPort(Protocol):

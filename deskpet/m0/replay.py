@@ -62,7 +62,7 @@ def _check(expected: dict, actual: dict) -> list[str]:
     return failures
 
 
-def run_scenario(scenario: Scenario, *, output=None, adapters=None) -> dict:
+def run_scenario(scenario: Scenario, *, output=None, adapters=None, observation_database=None) -> dict:
     if not scenario.expected_outcomes:
         raise ValueError("a replay scenario needs expected_outcomes")
     output = Path(output) if output is not None else None
@@ -72,7 +72,7 @@ def run_scenario(scenario: Scenario, *, output=None, adapters=None) -> dict:
         (output / "trace.jsonl").write_text("", encoding="utf-8")
     clock = FakeClock(scenario.initial_time)
     env = build_environment(clock=clock, scenario_id=scenario.scenario_id,
-                            output=output, adapters=adapters)
+                            output=output, adapters=adapters, observation_database=observation_database)
     commands, tools, sessions, errors = [], [], [], []
     observation_states = []
     for event in scenario.events:
@@ -96,7 +96,7 @@ def run_scenario(scenario: Scenario, *, output=None, adapters=None) -> dict:
         elif event.kind == "observation":
             state = data.pop("state", "unknown")
             observation = env.observations.set(state, **data)
-            env.tasks.observe(observation)
+            env.observe_for_tasks(observation)
             error = None
         elif event.kind == "raw_sample":
             if "sample_id" in data:
@@ -150,6 +150,8 @@ def run_scenario(scenario: Scenario, *, output=None, adapters=None) -> dict:
                 if task is None:
                     raise ValueError("scripted decision requires an existing task")
                 observation = env.observations.read()
+                if env.observation_context_reader is not None:
+                    observation = env.observe_for_tasks(observation)
                 env.trace.emit("policy.fast", task_id=task.task_id, task_version=task.version,
                                request_id=envelope.request_id,
                                payload={"decision": ScriptedFastPolicy().decide(observation, task)})
@@ -202,7 +204,7 @@ def run_scenario(scenario: Scenario, *, output=None, adapters=None) -> dict:
     return report
 
 
-def run_suite(*, scenario=None, output=None, adapters=None) -> dict:
+def run_suite(*, scenario=None, output=None, adapters=None, observation_database=None) -> dict:
     paths = fixture_paths(scenario)
     if not paths:
         raise ValueError("M0 suite has no scenarios")
@@ -210,7 +212,8 @@ def run_suite(*, scenario=None, output=None, adapters=None) -> dict:
     cases = []
     for path in paths:
         model = load_scenario(path)
-        cases.append(run_scenario(model, output=output / model.scenario_id if output else None, adapters=adapters))
+        cases.append(run_scenario(model, output=output / model.scenario_id if output else None,
+                                  adapters=adapters, observation_database=observation_database))
     report = {"status": "passed" if all(c["status"] == "passed" for c in cases) else "failed",
               "profile": "scenario", "cases": cases, "provenance": provenance(),
               "platform_acceptance": {"headless": "passed" if all(c["status"] == "passed" for c in cases) else "failed",
