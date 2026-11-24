@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
+from deskpet.perception.macos import screen_recording_access
 from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.timezones import resolve_timezone
 
@@ -888,7 +889,7 @@ def configure_system2(data_dir=None):
     return 0
 
 
-def run_desktop(data_dir=None):
+def run_desktop(data_dir=None, *, request_screen_recording=False):
     """Launch the daily desktop pet with a single writer for the local profile."""
     app, data_dir = _desktop_profile(data_dir)
     lock = QLockFile(str(data_dir / "desktop.lock"))
@@ -904,7 +905,10 @@ def run_desktop(data_dir=None):
     try:
         # Register the macOS delegate before constructing the service host. The
         # platform can launch Mochi to deliver a notification response.
-        notifications = platform_notifications(native=True) if app.platformName() == "cocoa" else None
+        native_macos = app.platformName() == "cocoa"
+        notifications = platform_notifications(native=True) if native_macos else None
+        if request_screen_recording and native_macos:
+            screen_recording_access(request=True)
         session = RefineSession(app, SimpleNamespace(
             profile="realtime", scenario="desktop", output=None, data_dir=data_dir, native_notifications=notifications,
         ))

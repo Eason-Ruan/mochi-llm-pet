@@ -13,6 +13,19 @@ from ..types import PetState, Rect, Vec2, WindowInfo, WorldSnapshot
 from .title_parser import content_guess
 
 
+def screen_recording_access(*, request: bool = False) -> bool | None:
+    """Check the current process's macOS permission and request it only on demand."""
+    try:
+        import Quartz
+
+        if Quartz.CGPreflightScreenCaptureAccess():
+            return True
+        return bool(Quartz.CGRequestScreenCaptureAccess()) if request else False
+    except Exception:
+        # PyObjC may raise its own exception type for a platform failure.
+        return None
+
+
 def cursor_pos() -> Vec2:
     from PyQt6.QtGui import QCursor
 

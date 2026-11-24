@@ -315,6 +315,33 @@ def test_settings_widget_applies_capture_scope_and_app_blacklist(tmp_path, monke
         panel.close()
 
 
+def test_settings_widget_requests_macos_screen_recording_only_when_clicked(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication, QPushButton
+
+    from deskpet.c_ui import settings as settings_ui
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_ui.QGuiApplication, "platformName", lambda: "cocoa")
+    requests = []
+
+    def permission(*, request):
+        requests.append(request)
+        return request
+
+    monkeypatch.setattr(settings_ui, "screen_recording_access", permission)
+    panel = settings_ui.SettingsPanel(SettingsStore(tmp_path / "business.sqlite3"))
+    try:
+        assert requests == [False]
+        assert "尚未授权" in panel._screen_recording_status.text()
+        panel.findChild(QPushButton, "settings-request-screen-recording").click()
+        assert requests == [False, True]
+        assert "已授权" in panel._screen_recording_status.text()
+    finally:
+        panel.close()
+
+
 def test_route_editor_never_reuses_a_credential_or_permission_for_another_recipient(tmp_path, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PyQt6")

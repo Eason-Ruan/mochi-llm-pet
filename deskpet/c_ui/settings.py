@@ -8,6 +8,7 @@ from uuid import uuid4
 import sqlite3
 
 from PyQt6.QtCore import QSignalBlocker, QTimer, pyqtSignal
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QSpinBox,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL, VISION
+from deskpet.perception.macos import screen_recording_access
 from deskpet.settings import Habit, HabitBehavior, Settings, SettingsConflict
 
 from .work_panel import MinutesSpinBox
@@ -246,6 +248,14 @@ class SettingsPanel(_Panel):
         exclusions.setObjectName("settings-observation-exclusions")
         exclusions.clicked.connect(self._edit_exclusions)
         section.addWidget(exclusions)
+        self._screen_recording_status = None
+        if QGuiApplication.platformName() == "cocoa":
+            request = QPushButton("请求屏幕录制权限")
+            request.setObjectName("settings-request-screen-recording")
+            request.clicked.connect(lambda: self._render_screen_recording(request=True))
+            section.addWidget(request)
+            self._screen_recording_status = _text(size=11, color=MUTED, wrap=True)
+            section.addWidget(self._screen_recording_status)
         documents = QPushButton("编辑文档名权限")
         documents.setObjectName("settings-document-permissions")
         documents.clicked.connect(self._edit_document_sources)
@@ -292,6 +302,7 @@ class SettingsPanel(_Panel):
         self._render_routes()
         self._render_document_permissions()
         self._render_notification_status()
+        self._render_screen_recording()
 
     def showEvent(self, event):
         self.refresh()
@@ -369,6 +380,19 @@ class SettingsPanel(_Panel):
     def _check_notifications(self):
         self.refresh_notification_permission()
         self._render_notification_status()
+
+    def _render_screen_recording(self, *, request=False):
+        if self._screen_recording_status is None:
+            return
+        granted = screen_recording_access(request=request)
+        if granted is True:
+            status = "macOS 屏幕录制权限已授权。"
+        elif granted is False:
+            status = ("macOS 屏幕录制尚未授权。可在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」"
+                      "中允许 Mochi，然后重新启动应用。")
+        else:
+            status = "无法读取 macOS 屏幕录制权限。"
+        self._screen_recording_status.setText(status)
 
     def _edit_exclusions(self):
         dialog = QDialog(self)

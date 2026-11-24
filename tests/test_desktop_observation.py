@@ -172,6 +172,76 @@ def test_managed_cli_pins_scope_and_revokes_previous_worker(tmp_path, monkeypatc
     cli.main()
 
 
+def test_macos_recording_permission_preflight_and_explicit_request(monkeypatch):
+    from deskpet.perception.macos import screen_recording_access
+
+    events = []
+    allowed = False
+
+    def preflight():
+        events.append("check")
+        return allowed
+
+    def request():
+        events.append("request")
+        return True
+
+    monkeypatch.setitem(sys.modules, "Quartz", SimpleNamespace(
+        CGPreflightScreenCaptureAccess=preflight, CGRequestScreenCaptureAccess=request,
+    ))
+    assert screen_recording_access() is False
+    assert events == ["check"]
+    assert screen_recording_access(request=True) is True
+    assert events == ["check", "check", "request"]
+    allowed = True
+    assert screen_recording_access(request=True) is True
+    assert events == ["check", "check", "request", "check"]
+    monkeypatch.setitem(sys.modules, "Quartz", None)
+    assert screen_recording_access(request=True) is None
+
+
+@pytest.mark.parametrize("platform,request_flag,locked,expected", [
+    ("cocoa", True, False, ["request", "pet", "exec", "quit", "unlock"]),
+    ("cocoa", False, False, ["pet", "exec", "quit", "unlock"]),
+    ("cocoa", True, True, []),
+    ("offscreen", True, False, ["pet", "exec", "quit", "unlock"]),
+])
+def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
+    tmp_path, monkeypatch, platform, request_flag, locked, expected,
+):
+    pytest.importorskip("PyQt6.QtWidgets")
+    from deskpet.__main__ import main
+    from deskpet.c_ui import refine
+
+    events = []
+    app = SimpleNamespace(platformName=lambda: platform, exec=lambda: events.append("exec") or 0)
+
+    def lock_file(path):
+        assert path == str(tmp_path / "desktop.lock")
+        return SimpleNamespace(setStaleLockTime=lambda _: None, tryLock=lambda: not locked,
+                               unlock=lambda: events.append("unlock"))
+
+    def launch(application, args):
+        assert application is app and args.data_dir == tmp_path
+        events.append("pet")
+        return SimpleNamespace(quit=lambda: events.append("quit"))
+
+    def permission(*, request):
+        assert request
+        events.append("request")
+        return False
+
+    monkeypatch.setattr(refine, "_desktop_profile", lambda path: (app, path))
+    monkeypatch.setattr(refine, "QLockFile", lock_file)
+    monkeypatch.setattr(refine.QGuiApplication, "platformName", lambda: "offscreen")
+    monkeypatch.setattr(refine, "platform_notifications", lambda **_: None)
+    monkeypatch.setattr(refine, "RefineSession", launch)
+    monkeypatch.setattr(refine, "screen_recording_access", permission)
+    flags = ["--request-screen-recording"] if request_flag else []
+    assert main(["--data-dir", str(tmp_path), *flags]) == int(locked)
+    assert events == expected
+
+
 @pytest.mark.parametrize("platform,scope,flags,error", [
     ("darwin", "all-displays", [], "requires --capture-screen"),
     ("darwin", "all-displays", ["--capture-screen", "--split-models"], "requires the multimodal collector"),
