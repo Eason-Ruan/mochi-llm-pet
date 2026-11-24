@@ -17,6 +17,20 @@ def test_proposal_confirmation_reports_the_phase_action_that_committed(action, t
     assert _result_reply("proposal.resolve", receipt)["text"] == expected
 
 
+@pytest.mark.parametrize(("function", "error_code", "text"), [
+    ("item.update", "NOT_FOUND", "找不到所请求的内容。"),
+    ("item.update", "NOT_AUTHORIZED", "这次操作未获授权，未执行。"),
+    ("phase.start", "DUPLICATE", "这次重复请求未再次执行。"),
+    ("phase.start", "IDEMPOTENCY_MISMATCH", "这次请求与先前的操作冲突，未执行。"),
+])
+def test_rejected_action_receipt_reports_the_actual_error(function, error_code, text):
+    reply = _result_reply(function, {"call_id": "try", "status": "rejected", "error_code": error_code})
+    assert reply["status"] == "rejected"
+    assert reply["outcome"] == "rejected"
+    assert reply["error_code"] == error_code
+    assert reply["text"] == text
+
+
 def test_unknown_state_does_not_cancel_background_grants_or_authorize_writes():
     context = {"current_status": "unknown", "enabled_settings": {"auto_adjust": True},
                "eligible_items": [{"occurrence_id": "drink:2"}], "recheck_items": []}

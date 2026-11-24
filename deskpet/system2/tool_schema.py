@@ -194,7 +194,8 @@ _register("proposal.resolve", "Accept, decline, or cancel the proposal answered 
           answer=(Literal["accept", "reject", "cancel"], ...), amendments=(ProposalAmendments | None, None),
           **IdentifiedWrite)
 _register("phase.get", "Read a phase by ID, or read the current phase if omitted.", id=(Identifier | None, None))
-_register("phase.start", "Start a focus or break phase. A blank focus title uses 专注.",
+_register("phase.start", "Start a focus or break phase. A blank focus title uses 专注. "
+          "Use the habit ID and version to start a named habit. Omit predecessor fields for a new focus.",
           kind=(PhaseKind, "focus"), planned_duration_s=(Duration | None, None),
           habit_id=(Identifier | None, None), previous_phase_id=(Identifier | None, None),
           expected_previous_version=(Version | None, None), expected_habit_version=(Version | None, None),

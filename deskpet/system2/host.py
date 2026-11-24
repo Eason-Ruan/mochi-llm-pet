@@ -157,13 +157,17 @@ def _tool_outcome(function: str, result: dict) -> str:
 
 def _result_reply(function: str, result: dict, timezone: str | None = None) -> dict:
     status = _original_status(result)
+    error_code = result.get("error_code")
+    phase_action = result.get("resolved_function") if function == "proposal.resolve" else function
     view = result.get("view")
     view = view if isinstance(view, dict) else {}
     if status in {"applied", "accepted"}:
         text = result.get("message") or _ACTION_LABELS.get(function, "已处理。")
         phase = view.get("phase", view)
         seconds = phase.get("planned_duration_s") if isinstance(phase, dict) else None
-        if function == "item.create" and view.get("type") == "reminder" and (title := view.get("title")):
+        if function == "habit.create":
+            text = f"已创建习惯「{title}」。" if (title := view.get("title")) else "已创建习惯。"
+        elif function == "item.create" and view.get("type") == "reminder" and (title := view.get("title")):
             text = f"已设置提醒「{title}」。"
             if timezone and (rule := view.get("rule")):
                 earliest, latest, target = (rule.get(field) for field in ("remind_after", "remind_by", "target_at"))
@@ -175,24 +179,31 @@ def _result_reply(function: str, result: dict, timezone: str | None = None) -> d
                     label = local_time.strftime("%H:%M:%S" if same_day else "%m月%d日 %H:%M:%S")
                     prefix = "" if earliest == latest else "最晚 " if latest else "约 " if target else "最早 "
                     text = f"已设置提醒「{title}」，{prefix}{label}。"
-        phase_action = result.get("resolved_function") if function == "proposal.resolve" else function
         if phase_action in {"phase.start", "phase.adjust"} and isinstance(seconds, (int, float)):
             length = f"{seconds / 60:g} 分钟" if seconds % 60 == 0 else f"{seconds:g} 秒"
             text = f"{'已调整' if phase_action == 'phase.adjust' else '已开始'} · {length}"
     elif status == "pending":
         text = result.get("message") or "已提交，正在等待确认。"
-    elif result.get("error_code") in _STALE:
+    elif error_code in _STALE:
         text = "相关事项或设置已经更新。请刷新后再确认。"
     elif status == "timeout":
         text = "这次未能确认操作结果。"
-    elif timezone and result.get("error_code") == "INVALID_ARGUMENT":
+    elif error_code == "INVALID_TRANSITION" and phase_action == "phase.start":
+        text = "当前状态无法开始新的计时。"
+    elif error_code == "NOT_FOUND":
+        text = result.get("message") or "找不到所请求的内容。"
+    elif error_code == "NOT_AUTHORIZED":
+        text = "这次操作未获授权，未执行。" if phase_action != "phase.start" else "这次启动请求未获授权，未开始新的计时。"
+    elif error_code == "DUPLICATE":
+        text = "这次重复请求未再次执行。"
+    elif error_code == "IDEMPOTENCY_MISMATCH":
+        text = "这次请求与先前的操作冲突，未执行。"
+    elif timezone and error_code == "INVALID_ARGUMENT":
         text = "这条事项没有保存。请核对内容和时间。" if function == "item.create" else "操作参数无效，未能保存更改。"
-    elif timezone and result.get("error_code") == "NOT_AUTHORIZED":
-        text = "找不到可操作的对应对象，未能保存更改。"
     else:
         text = result.get("message") or "这次没有执行成功。"
     return {"text": text, "status": status, "outcome": _tool_outcome(function, result),
-            "command_id": result.get("call_id"), "error_code": result.get("error_code"),
+            "command_id": result.get("call_id"), "error_code": error_code,
             "result_ref": result.get("subject_ref"), "delivery_id": result.get("delivery_id")}
 
 

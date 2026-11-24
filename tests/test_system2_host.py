@@ -685,6 +685,94 @@ def test_committed_scope_allows_same_turn_update_without_unrelated_title(runtime
         host.close()
 
 
+@pytest.mark.parametrize("old_state", ["elapsed", "running", "paused"])
+def test_chat_creates_and_starts_named_habit_with_existing_focus(runtime, old_state):
+    business, create = runtime
+    old = business.tools.execute_local("phase.start", {"planned_duration_s": 30}, event_id="old-focus").view
+    if old_state == "elapsed":
+        business.clock.advance(30)
+    elif old_state == "paused":
+        business.tools.execute_local("phase.pause", {"id": old["id"], "expected_version": old["version"]},
+                                     event_id="pause-old-focus")
+    previous = business.phases.current_phase()
+    assert previous.state == old_state
+
+    def model(_request, data, call):
+        assert data["context"]["current_phase"]["id"] == previous.id
+        habit = call("habit_create", "create-habit", {
+            "title": "研究汇丰银行 QDII", "behavior": {"focus_s": 600, "short_break_s": 300},
+        })
+        assert habit["outcome"] == "committed"
+        start = call("phase_start", "start-habit", {
+            "kind": "focus", "title": habit["view"]["title"], "habit_id": habit["view"]["id"],
+            "expected_habit_version": habit["actual_version"],
+        })
+        assert start["outcome"] == ("committed" if old_state == "elapsed" else "rejected")
+        if old_state != "elapsed":
+            assert start["error_code"] == "INVALID_TRANSITION"
+        return ""
+
+    host = create(model)
+    try:
+        host.submit_user("我准备研究一下汇丰银行qdii 创建一个10分钟工作段并设置对应的番茄钟")
+        assert host.pump()
+        habit, = business.settings.list_habits()
+        assert habit.behavior.focus_s == 600
+        assert business.phases.get_phase(previous.id) == previous
+        active = business.phases.current_phase()
+        reply, = host.ui_events()
+        if old_state == "elapsed":
+            assert active.id != previous.id and active.state == "running"
+            assert active.habit_id == habit.id and active.planned_duration_s == 600
+            assert reply.payload["status"] == "applied"
+            assert reply.payload["actions"][1]["text"] == "已开始 · 10 分钟"
+        else:
+            assert active == previous
+            assert reply.payload["status"] == "partial"
+    finally:
+        host.close()
+
+
+def test_chat_receipts_report_habit_created_and_rejected_start_attempts(runtime):
+    business, create = runtime
+    previous = business.tools.execute_local("phase.start", {"planned_duration_s": 30}, event_id="old-focus").view
+
+    def model(_request, _data, call):
+        habit = call("habit_create", "create-habit", {"title": "研究 QDII", "behavior": {"focus_s": 600}})
+        assert habit["outcome"] == "committed"
+        start_args = {"habit_id": habit["view"]["id"], "expected_habit_version": habit["actual_version"]}
+        start = call("phase_start", "start-habit", start_args)
+        assert start["error_code"] == "INVALID_TRANSITION"
+        repeated = call("phase_start", "repeat-start", start_args)
+        assert repeated == start
+        retry = call("phase_start", "protected-start", {
+            **start_args, "previous_phase_id": previous["id"], "expected_previous_version": previous["version"],
+        })
+        assert retry["error_code"] == "NOT_AUTHORIZED"
+        return "已开始新的计时。要等这轮结束再开始吗？"
+
+    host = create(model)
+    try:
+        host.submit_user("创建一个十分钟的研究 QDII 习惯并启动番茄钟")
+        assert host.pump()
+        habit, = business.settings.list_habits()
+        assert habit.title == "研究 QDII"
+        assert business.phases.current_phase().id == previous["id"]
+        reply, = host.ui_events()
+        assert reply.payload["status"] == "partial"
+        assert [action["error_code"] for action in reply.payload["actions"]] == [
+            None, "INVALID_TRANSITION", "NOT_AUTHORIZED",
+        ]
+        assert reply.payload["parts"] == [
+            {"source": "program", "text": "已创建习惯「研究 QDII」。"},
+            {"source": "program", "text": "当前状态无法开始新的计时。"},
+            {"source": "program", "text": "这次启动请求未获授权，未开始新的计时。"},
+            {"source": "model", "text": "要等这轮结束再开始吗？"},
+        ]
+    finally:
+        host.close()
+
+
 def test_receipt_and_concrete_clarification_both_reach_chat(runtime):
     business, create = runtime
 

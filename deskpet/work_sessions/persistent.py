@@ -673,13 +673,16 @@ class PersistentWorkSessionService:
             return self._end(db, current, ReviewInput(), tick, skipped_break=True)
         return self._pause_resume(db, current, command.kind, tick)
 
-    def _start_predecessor(self, db, args, active):
+    def _start_predecessor(self, db, args, active, *, allow_new_focus=False):
         previous = self._get(db, args.previous_phase_id) if args.previous_phase_id else None
         if args.previous_phase_id and (previous is None or previous.version != args.expected_previous_version):
             raise Rejected(ErrorCode.STALE_TASK)
-        if active and (previous is None or previous.id != active.id or active.state != "elapsed"
-                       or active.kind != "focus" or args.kind == "focus"):
-            raise Rejected(ErrorCode.INVALID_TRANSITION)
+        if active:
+            # An elapsed focus stays active so it can be reviewed or extended.
+            fresh_focus = allow_new_focus and previous is None and args.kind == "focus"
+            follow_with_break = previous is not None and previous.id == active.id and args.kind != "focus"
+            if active.state != "elapsed" or active.kind != "focus" or not (fresh_focus or follow_with_break):
+                raise Rejected(ErrorCode.INVALID_TRANSITION)
         if previous and (previous.state not in ("elapsed", "ended") or
                          (previous.kind == "focus") == (args.kind == "focus")):
             raise Rejected(ErrorCode.INVALID_TRANSITION)
@@ -698,7 +701,7 @@ class PersistentWorkSessionService:
         return None
 
     def _start(self, db, command, args, tick, active):
-        previous = self._start_predecessor(db, args, active)
+        previous = self._start_predecessor(db, args, active, allow_new_focus=command.source in ("manual", "chat"))
         defaults = self._defaults(db)
         if args.issue_links and not defaults["link_issues"]:
             raise Rejected(ErrorCode.INVALID_TRANSITION)
