@@ -26,14 +26,20 @@ class MacDesktopFollower:
         self.width, self.height = width, height
         self.quartz = Quartz
         self.workspace = AppKit.NSWorkspace.sharedWorkspace()
+        # A desktop companion must be eligible to overlay another app's full-screen Space.
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
         window = objc.objc_object(c_void_p=int(pet.winId())).window()
+        window.setHidesOnDeactivate_(False)
         behavior = window.collectionBehavior()
         incompatible = (AppKit.NSWindowCollectionBehaviorMoveToActiveSpace
                         | AppKit.NSWindowCollectionBehaviorFullScreenPrimary
-                        | AppKit.NSWindowCollectionBehaviorFullScreenNone)
+                        | AppKit.NSWindowCollectionBehaviorFullScreenNone
+                        | AppKit.NSWindowCollectionBehaviorPrimary
+                        | AppKit.NSWindowCollectionBehaviorAuxiliary)
         window.setCollectionBehavior_((behavior & ~incompatible)
                                       | AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
-                                      | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary)
+                                      | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+                                      | AppKit.NSWindowCollectionBehaviorCanJoinAllApplications)
         self.pointer_screen = self.focus_screen = None
         self.home_area = pet.screen().availableGeometry()
         self.timer = QTimer(pet)
