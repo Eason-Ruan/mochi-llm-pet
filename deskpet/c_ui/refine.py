@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
+from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.timezones import resolve_timezone
 
 from .desktop import DesktopWorkbench
@@ -199,7 +200,7 @@ class RefineSession(RefineDeliveryMixin):
         if self.production:
             self.window.services_ready.connect(self._service_ready)
             try:
-                self._power = DesktopPower(app, self.pet, self.window.action.emit)
+                self._power = DesktopPower(app, self.pet, self._desktop_power_event)
             except (AttributeError, ImportError, OSError) as error:
                 log.warning("Native power events are unavailable (%s)", type(error).__name__)
         else:
@@ -224,6 +225,11 @@ class RefineSession(RefineDeliveryMixin):
             self.presentation.ledger.authorize_early = self._system2.scheduler.authorize_qt
         if self.chat.recovered_event:
             self.window.action.emit({"kind": "recover_chat_result", "event_id": self.chat.recovered_event})
+
+    def _desktop_power_event(self, action):
+        if action["kind"] == "system_sleep":
+            self.presentation.restore_fallbacks()
+        self.window.action.emit(action)
 
     def _queue_chat_message(self, message_id, text, *, proposal=None, supersedes_message_id=None):
         context = {"selected_ref": self._chat_selected_ref}
@@ -383,9 +389,11 @@ class RefineSession(RefineDeliveryMixin):
         self._render_toolbar()
 
     def _render_system2(self, snapshot):
+        semantic = semantic_background_enabled()
         can_show = self._can_show_reminder()
+        can_show_card = self._can_show_reminder(collapsed_ok=semantic)
         self._display_capabilities = {
-            "pet_card": can_show, "pet_badge": True,
+            "pet_card": can_show_card, "pet_badge": can_show if semantic else True,
             "os_notification": (self.presentation.notifications.available
                                 and snapshot["settings"]["allow_system_notifications"]),
         }
@@ -402,6 +410,7 @@ class RefineSession(RefineDeliveryMixin):
         if self._system2 is None or not self._can_show_reminder(collapsed_ok=True):
             return
         indexed = {proposal["id"]: proposal for proposal in proposals}
+        badge_effects = {}
         queued = {item.delivery_id for item in self.waiting_prompts if item.delivery_id}
         if self.prompt:
             queued.add(self.prompt.delivery_id)
@@ -412,11 +421,14 @@ class RefineSession(RefineDeliveryMixin):
                     or delivery["proposal_version"] != proposal["version"]):
                 continue
             prompt = self._proposal_prompt(delivery, proposal)
-            if prompt.direct_focus or (can_show and self.section != "input"):
+            if delivery.get("channel") == "pet_badge":
+                badge_effects[delivery_id] = (prompt.before_paint, prompt.on_painted)
+            elif prompt.direct_focus or (can_show_card and (semantic or self.section != "input")):
                 self.waiting_prompts.append(prompt)
+        self.pet._proposal_badge.set_deliveries(badge_effects)
         if self.prompt is None:
             self._show_next_prompt()
-        if can_show and self.section != "input":
+        if can_show_card and (semantic or self.section != "input"):
             self._render_pet_intents(snapshot)
 
     def _proposal_prompt(self, delivery, proposal):
@@ -426,14 +438,18 @@ class RefineSession(RefineDeliveryMixin):
         gateway = self._system2.gateway
         permitted = False
         generation = delivery["presentation_generation"]
+        semantic = delivery.get("route_binding") is not None
+        badge = delivery.get("channel") == "pet_badge"
 
         direct_focus = (proposal["function"] in {"phase.adjust", "phase.pause", "phase.resume"}
-                        or (proposal["function"] == "phase.start" and proposal["args"].get("kind", "focus") == "focus"))
+                        or (proposal["function"] == "phase.start" and
+                            (semantic or proposal["args"].get("kind", "focus") == "focus")))
 
         def current():
             visible_until = (datetime.fromisoformat(proposal["valid_until"])
                              if delivery_id in self._presented_proposals else deadline)
-            return (self._can_show_reminder(collapsed_ok=direct_focus) and (direct_focus or self.section != "input")
+            return (self._can_show_reminder(collapsed_ok=(semantic or direct_focus) and not badge)
+                    and (semantic or direct_focus or self.section != "input")
                     and self.presentation.now() < visible_until
                     and any((item["id"], item["version"]) == (proposal["id"], proposal["version"])
                             for item in self.snapshot.get("system2_proposals", ())))
@@ -446,9 +462,6 @@ class RefineSession(RefineDeliveryMixin):
                 if permitted:
                     return gateway.validate_presentation(delivery_id, scope, generation=generation)
                 permitted = bool(gateway.permit_presentation(delivery_id, scope, generation=generation))
-                if permitted and not gateway.validate_presentation(delivery_id, scope, generation=generation):
-                    gateway.ack_presentation(delivery_id, scope, displayed=False, generation=generation)
-                    permitted = False
                 return permitted
             except sqlite3.OperationalError:
                 return False
@@ -475,19 +488,82 @@ class RefineSession(RefineDeliveryMixin):
                       delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted, direct_focus=direct_focus)
 
     def _render_pet_intents(self, snapshot):
-        if self.prompt is not None or self.pet._press is not None:
+        if self.prompt is not None or self.pet._press is not None or self._pet_motion_delivery is not None:
             return
-        for delivery_id in snapshot.get("system2_pet_intents", ()):
+        for delivery in snapshot.get("system2_pet_intents", ()):
+            delivery_id = delivery["delivery_id"] if isinstance(delivery, dict) else delivery
+            if isinstance(delivery, dict) and delivery.get("text"):
+                self._queue_pet_bubble(delivery)
+                break
             intent = self._system2.pet.claim(delivery_id, self.presentation.now())
             if intent is None:
                 continue
-            self.pet.apply_motion_intent(intent["position_hint"], intent["animation"])
-            sound = bool(intent["sound"] and self.presentation.native and self.presentation.lock_probe() is False)
-            if sound:
-                self.app.beep()
-            self._system2.pet.receipt(delivery_id, sound_requested=sound)
-            QTimer.singleShot(1000, self.pet.end_temporary_motion)
+            motion, sound = self._apply_pet_effect(intent)
+            if isinstance(delivery, dict) and (motion or sound):
+                self._report_pet_motion(delivery_id, motion, sound)
+            else:
+                self._system2.pet.receipt(delivery_id, sound_requested=sound, now=self.presentation.now())
+                QTimer.singleShot(1000, self.pet.end_temporary_motion)
             break
+
+    def _apply_pet_effect(self, intent):
+        motion = self.pet.apply_motion_intent(intent["position_hint"], intent["animation"])
+        sound = bool(intent["sound"] and self.presentation.native and self.presentation.lock_probe() is False)
+        if sound:
+            self.app.beep()
+        return motion, sound
+
+    def _report_pet_motion(self, delivery_id, motion, sound):
+        self._pet_motion_delivery = delivery_id
+
+        def receipt(displayed):
+            return self._system2.pet.receipt(delivery_id, displayed=displayed, sound_requested=sound,
+                                             now=self.presentation.now())
+
+        if motion:
+            self.pet._report_motion_paint = lambda: receipt(
+                self._can_show_reminder(collapsed_ok=True) and self.pet._widget_exposed(self.pet),
+            )
+
+        def finish():
+            if self._pet_motion_delivery != delivery_id:
+                return
+            self.pet._report_motion_paint = None
+            receipt(False)
+            self._pet_motion_delivery = None
+            self.pet.end_temporary_motion()
+            self._show_next_prompt()
+
+        QTimer.singleShot(1000, finish)
+
+    def _queue_pet_bubble(self, delivery):
+        delivery_id = delivery["delivery_id"]
+        deadline = datetime.fromisoformat(delivery["expires_at"])
+        claimed = None
+        sound = None
+
+        def current():
+            return self._can_show_reminder(collapsed_ok=True) and self.presentation.now() < deadline
+
+        def permit():
+            nonlocal claimed
+            if not current():
+                return False
+            claimed = self._system2.pet.claim(delivery_id, self.presentation.now(), revalidate=claimed is not None)
+            return claimed is not None
+
+        def painted():
+            nonlocal sound
+            if claimed is None:
+                return False
+            if sound is None:
+                _, sound = self._apply_pet_effect(claimed)
+            return self._system2.pet.receipt(delivery_id, displayed=True, sound_requested=sound,
+                                             now=self.presentation.now())
+
+        self.waiting_prompts.append(Prompt("pet", delivery["text"], delivery_id=delivery_id, valid=current,
+                                           before_paint=permit, on_painted=painted))
+        self._show_next_prompt()
 
     def _render_toolbar(self):
         work = current_work(self.snapshot)
@@ -515,6 +591,10 @@ class RefineSession(RefineDeliveryMixin):
             self.chat.reset_input()
         previous = self.section
         self.section = key
+        if key == "reminders":
+            self.pet._badge.clear_attention()
+        elif key == "input":
+            self.pet._proposal_badge.clear_attention()
         if self.production and key in self.overviews:
             self.panels[key] = self.overviews[key]
         if key == "input":
@@ -592,6 +672,7 @@ class RefineSession(RefineDeliveryMixin):
             self._closing = False
 
     def _finished(self):
+        self.presentation.restore_fallbacks()
         if self._power is not None:
             self._power.close()
         if self._observer_timer is not None:

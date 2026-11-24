@@ -176,6 +176,7 @@ class RealtimeHead:
     current_status: CurrentStatus
     publication_cursor: int | None = None
     producer_generation: str | None = None
+    foreground_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,11 +195,18 @@ OBSERVATION_CONTEXT_FIELDS = frozenset({
 
 def _detail_projection(detail: ActivityDetail, *, share_summary: bool, document_sources: tuple[str, ...],
                        include_document_source: bool) -> dict:
-    result = {"observed_at": detail.observed_at.isoformat(),
+    observed_at = detail.observed_at.isoformat()
+    result = {"observed_at": observed_at,
               "activity_kind": detail.activity_kind if detail.activity_kind in _KINDS else "unknown"}
     if share_summary:
         result.update(summary=detail.summary, scene_elements=list(detail.scene_elements),
                       visible_changes=list(detail.visible_changes))
+        if detail.summary:
+            result["summary_observed_at"] = observed_at
+        if detail.visual:
+            result["scene_observed_at"] = observed_at
+        if detail.visible_changes:
+            result["change_observed_at"] = observed_at
     if (detail.document_name and detail.document_source
             and document_source_allowed(detail.document_source, document_sources)):
         result["document_name"] = detail.document_name
@@ -246,6 +254,7 @@ def _activity_history(details: tuple[ActivityDetail, ...], *, retained: tuple[Ac
             if share_summary:
                 if detail.summary and (detail.visual or not segment["summary"]):
                     segment["summary"] = detail.summary
+                    segment["summary_observed_at"] = timestamp
                 if detail.visual:
                     segment["activity_kind"] = detail.activity_kind
                     segment["scene_elements"] = list(detail.scene_elements)
@@ -804,7 +813,28 @@ class ObservationContextReader:
                 return changed
             if previous is None or previous[0] != token or monotonic_s >= previous[2]:
                 self._latest_read = token, at, monotonic_s
-        return RealtimeHead(observation, "fresh", cursor, generation)
+        return RealtimeHead(observation, "fresh", cursor, generation, _row_value(row, "foreground_key"))
+
+    def prior_wait_evidence(self, cursor, generation):
+        """Read the local state paired with a decision when a new publication won the race."""
+        if not cursor or generation is None:
+            return None
+        with self._snapshot(realtime=True) as db:
+            if db is None or not _columns(db, "realtime_observation_head"):
+                return None
+            head = db.execute("SELECT generation, publication_cursor FROM realtime_observation_head").fetchone()
+            if (head is None or head["generation"] != generation or head["publication_cursor"] is None
+                    or head["publication_cursor"] <= cursor):
+                return None
+            row = db.execute("SELECT * FROM effective_observations WHERE observation_id=?", (cursor,)).fetchone()
+            if row is None or _row_value(row, "producer_generation") not in (None, generation):
+                return None
+            locked = _row_value(row, "screen_locked")
+            return {
+                "activity_state": row["state"],
+                "activity_context": [row["activity_kind"], _row_value(row, "foreground_key")],
+                "lock_state": bool(locked) if locked in (0, 1) else None,
+            }
 
     def same_published_state(self, first, last, *, revision, state, generation):
         """Check the entire publication interval, including away-and-back transitions."""
@@ -819,6 +849,45 @@ class ObservationContextReader:
                 FROM effective_observations WHERE observation_id BETWEEN ? AND ?
                 """, (state, first, first, last)).fetchone()
             return count == last - first + 1 and not different and original == revision
+
+    def presentation_context_changed(self, first, last, *, revision, generation, now):
+        """Read only local activity facts that could invalidate a queued presentation."""
+        with self._snapshot(realtime=True) as db:
+            if db is None:
+                return False
+            head = db.execute("""SELECT generation, publication_cursor, activity_id
+                FROM realtime_observation_head WHERE singleton=1""").fetchone()
+            if head is None or (head["generation"], head["publication_cursor"]) != (generation, last):
+                return False
+            original = db.execute("""SELECT state, observed_at, context_revision FROM effective_observations
+                WHERE observation_id=?""", (first,)).fetchone()
+            if original is None or (revision is not None and revision != original["context_revision"]):
+                return False
+            state = original["state"]
+            different = db.execute("""SELECT 1 FROM effective_observations
+                WHERE observation_id>? AND observation_id<=? AND state<>?
+                AND (state='away' OR (?<>'unknown' AND state<>'unknown')) LIMIT 1""",
+                (first, last, state, state)).fetchone()
+            if different is not None:
+                return True
+            activity_id = head["activity_id"]
+            if activity_id is None or not _columns(db, "screen_observations"):
+                return False
+            original_at = datetime.fromisoformat(original["observed_at"])
+            if not original_at <= now:
+                return False
+            meeting = db.execute("""SELECT screen_kind FROM screen_observations
+                WHERE activity_id=? AND captured_at>? AND captured_at<=? AND processed_at<=?
+                AND status='ready' AND realtime_eligible=1 ORDER BY captured_at DESC LIMIT 1""",
+                (activity_id, _timestamp(max(original_at, now - _GAP)), _timestamp(now), _timestamp(now))).fetchone()
+            if meeting is None or meeting[0] != "meeting":
+                return False
+            # A meeting already visible to the model is part of its decision.
+            previous = db.execute("""SELECT screen_kind FROM screen_observations
+                WHERE captured_at>? AND captured_at<=? AND processed_at<=?
+                AND status='ready' AND realtime_eligible=1 ORDER BY captured_at DESC LIMIT 1""",
+                (_timestamp(original_at - _GAP), _timestamp(original_at), _timestamp(original_at))).fetchone()
+            return previous is None or previous[0] != "meeting"
 
     def read_realtime_head(
         self, as_of: datetime | None = None, *, monotonic_s: float | None = None,

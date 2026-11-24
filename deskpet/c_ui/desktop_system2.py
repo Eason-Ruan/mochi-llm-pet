@@ -9,6 +9,7 @@ import sqlite3
 
 from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
+from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.timezones import resolve_timezone
 
 from .refine_conversation_store import ConversationStore
@@ -33,6 +34,8 @@ class DesktopSystem2:
         env.tasks.auto_opportunity = False
         env.tasks.on_occurrence_invalidated = self.scheduler.invalidate_occurrence
         env.sessions.on_focus_released = self.scheduler.on_focus_released
+        env.sessions.attach_system2(on_phase_elapsed=self.scheduler.on_phase_elapsed,
+                                    on_phase_started=self.scheduler.invalidate_focus_waits)
         self.gateway = System2ToolExecutor(
             args.business_database, items=items, phases=env.sessions, settings=settings,
             scheduler=self.scheduler, pet=self.pet, context_reader=env.observation_context_reader,
@@ -47,6 +50,38 @@ class DesktopSystem2:
         )
         self.gateway.after_local_commit = self.host.fence_local
         self.host.start()
+
+    def record_sleep(self):
+        if semantic_background_enabled():
+            self.host.suspend_background()
+            try:
+                self.env.sessions.record_sleep(on_sleep=self._suspend_in_transaction)
+            except BaseException:
+                self.host.resume_background()
+                raise
+        else:
+            self.env.sessions.record_sleep()
+            self.scheduler.close_opportunity(reason="sleep")
+
+    def _suspend_in_transaction(self, db, at):
+        self.host.fence_background(db)
+        self.scheduler.close_opportunity(reason="sleep", now=at, db=db)
+
+    def record_wake(self):
+        semantic = semantic_background_enabled()
+        if semantic:
+            self.host.suspend_background()
+        try:
+            self.env.sessions.record_wake(on_wake=self._resume_in_transaction)
+            if semantic:
+                self.env.tasks.pump()
+        finally:
+            self.host.resume_background()
+
+    def _resume_in_transaction(self, db, at):
+        if semantic_background_enabled():
+            self.host.fence_background(db)
+        self.scheduler.resume(at, db=db)
 
     def apply_preferences(self, action):
         from deskpet.system2.tool_schema import SettingsPatch
@@ -139,39 +174,55 @@ class PetIntentStore:
                 expires_at TEXT NOT NULL, state TEXT NOT NULL
             )""")
 
-    def present(self, *, intent, position_hint=None, animation=None, sound=None, authority, now, db):
+    def present(self, *, intent, position_hint=None, animation=None, sound=None, text=None, authority, now, db):
         poses = {"idle", "look_up", "wave", "approach"}
         positions = {"stay", "home", "screen_edge"}
         if not isinstance(position_hint, (str, type(None))) or (
             position_hint is not None and position_hint not in positions
         ) or (animation is not None and animation not in poses):
             return {"status": "rejected", "error_code": "INVALID_ARGUMENT"}
-        pose = animation or (intent if intent in poses else None)
-        if pose in {None, "idle"} and position_hint in {None, "stay"} and not sound:
+        semantic = semantic_background_enabled()
+        if text and not semantic:
             return {"status": "rejected", "error_code": "UNSUPPORTED_CHANNEL"}
-        if (
+        pose = animation or (intent if intent in poses else None)
+        text = text.strip() if text else None
+        if pose in {None, "idle"} and position_hint in {None, "stay"} and not sound and not text:
+            return {"status": "rejected", "error_code": "UNSUPPORTED_CHANNEL"}
+        if not semantic and (
             authority.context_revision is None or authority.observation_cursor is None
             or authority.observation_generation is None or authority.observation_valid_until is None
         ):
             return {"status": "rejected", "error_code": "STALE_CONTEXT"}
+        expires_at = authority.expires_at if semantic else min(authority.expires_at, authority.observation_valid_until)
         context = {
             "context_revision": authority.context_revision, "observation_cursor": authority.observation_cursor,
             "observation_generation": authority.observation_generation,
-            "context_valid_until": authority.observation_valid_until,
+            "context_valid_until": expires_at if semantic else authority.observation_valid_until,
         }
-        opportunity = self.scheduler.authorize_pet(now=now, db=db, **context)
-        if not opportunity or opportunity != authority.opportunity_id:
-            return {"status": "rejected", "error_code": "STALE_CONTEXT"}
+        event_key = authority.trigger_id if semantic else f"{authority.admission_id}:{authority.call_id}"
         delivery_id = "pet-" + sha256(
-            f"{authority.user_scope}:{authority.admission_id}:{authority.call_id}".encode()
+            f"{authority.user_scope}:{event_key}".encode()
         ).hexdigest()[:32]
-        if not self.scheduler.claim_opportunity(opportunity_id=opportunity, delivery_id=delivery_id, now=now, db=db):
-            return {"status": "rejected", "error_code": "BUSY"}
+        opportunity = None
+        if semantic:
+            existing = self.state(delivery_id, authority.user_scope, db=db)
+            if existing:
+                return {"status": "pending", "delivery_id": delivery_id}
+            if not self.scheduler.presentation_permit(now=now, db=db, **context, capture=True,
+                                                      presentation_kind="pet_presentation", recheck_key=delivery_id):
+                return {"status": "rejected", "error_code": "STALE_CONTEXT", "outcome": "deferred", "retryable": True}
+        else:
+            opportunity = self.scheduler.authorize_pet(now=now, db=db, **context)
+            if not opportunity or opportunity != authority.opportunity_id:
+                return {"status": "rejected", "error_code": "STALE_CONTEXT"}
+            if not self.scheduler.claim_opportunity(opportunity_id=opportunity, delivery_id=delivery_id, now=now, db=db):
+                return {"status": "rejected", "error_code": "BUSY"}
         effect = {"position_hint": position_hint or "stay", "animation": pose or "idle", "sound": bool(sound)}
+        if text:
+            effect["text"] = text
         context["context_valid_until"] = context["context_valid_until"].isoformat()
         payload = {"effect": effect, "context": context, "opportunity_id": opportunity,
-                   "route": self._route_version(db)}
-        expires_at = min(authority.expires_at, authority.observation_valid_until)
+                   "route": self._route_version(db), "semantic": semantic}
         db.execute("INSERT OR IGNORE INTO system2_pet_intents VALUES (?,?,?,?,?)",
                    (delivery_id, authority.user_scope, json.dumps(payload), expires_at.isoformat(), "queued"))
         return {"status": "pending", "delivery_id": delivery_id, "view": {"channel": "qt", **effect}}
@@ -185,32 +236,49 @@ class PetIntentStore:
             return False
         context = payload["context"]
         context["context_valid_until"] = datetime.fromisoformat(context["context_valid_until"])
+        if payload.get("semantic"):
+            return semantic_background_enabled() and self.scheduler.presentation_permit(
+                now=now, db=db, **context, presentation_kind="pet_presentation", recheck_key=delivery_id,
+            )
         return self.scheduler.pet_permit(opportunity_id=payload["opportunity_id"], delivery_id=delivery_id,
                                          now=now, db=db, **context)
 
     def _revoke(self, db, delivery_id):
-        db.execute("UPDATE system2_pet_intents SET state='revoked' WHERE delivery_id=? AND user_scope=? AND state='queued'",
+        db.execute("UPDATE system2_pet_intents SET state='revoked' WHERE delivery_id=? AND user_scope=? "
+                   "AND state IN ('queued','claimed')",
                    (delivery_id, self.routes.user_scope))
         self.scheduler.release_opportunity(delivery_id=delivery_id, db=db)
+
+    @staticmethod
+    def state(delivery_id, user_scope, *, db):
+        row = db.execute("SELECT state FROM system2_pet_intents WHERE delivery_id=? AND user_scope=?",
+                         (delivery_id, user_scope)).fetchone()
+        return row[0] if row else None
 
     def pending(self, now):
         with closing(sqlite3.connect(self.path)) as db, db:
             db.row_factory = sqlite3.Row
-            if db.execute("SELECT 1 FROM system2_pet_intents WHERE user_scope=? AND state='queued' LIMIT 1",
-                          (self.routes.user_scope,)).fetchone() is None:
+            if db.execute("""SELECT 1 FROM system2_pet_intents WHERE user_scope=?
+                AND (state='queued' OR (state='claimed' AND julianday(expires_at)<=julianday(?))) LIMIT 1""",
+                          (self.routes.user_scope, now.isoformat())).fetchone() is None:
                 return ()
             db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE system2_pet_intents SET state='unknown'
+                WHERE user_scope=? AND state='claimed' AND julianday(expires_at)<=julianday(?)""",
+                       (self.routes.user_scope, now.isoformat()))
             rows = db.execute("""SELECT delivery_id,payload,expires_at FROM system2_pet_intents
                 WHERE user_scope=? AND state='queued' ORDER BY rowid""", (self.routes.user_scope,)).fetchall()
             active = []
             for row in rows:
                 if self._valid(db, row["delivery_id"], json.loads(row["payload"]), row["expires_at"], now):
-                    active.append(row["delivery_id"])
+                    payload = json.loads(row["payload"])
+                    active.append({"delivery_id": row["delivery_id"], "text": payload["effect"].get("text"),
+                                   "expires_at": row["expires_at"]} if payload.get("semantic") else row["delivery_id"])
                 else:
                     self._revoke(db, row["delivery_id"])
             return tuple(active)
 
-    def claim(self, delivery_id, now):
+    def claim(self, delivery_id, now, *, revalidate=False):
         if self.lock_probe() is not False:
             return None
         try:
@@ -218,8 +286,8 @@ class PetIntentStore:
                 db.row_factory = sqlite3.Row
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute("""SELECT user_scope, payload, expires_at FROM system2_pet_intents
-                    WHERE delivery_id=? AND user_scope=? AND state='queued'""",
-                    (delivery_id, self.routes.user_scope)).fetchone()
+                    WHERE delivery_id=? AND user_scope=? AND state=?""",
+                    (delivery_id, self.routes.user_scope, "claimed" if revalidate else "queued")).fetchone()
                 if row is None:
                     return None
                 payload = json.loads(row["payload"])
@@ -233,7 +301,8 @@ class PetIntentStore:
                 if settings.reduce_motion:
                     payload.update(position_hint="stay", animation="idle")
                 payload["sound"] = payload["sound"] and settings.reminder_sound
-                if payload["position_hint"] == "stay" and payload["animation"] == "idle" and not payload["sound"]:
+                if (payload["position_hint"] == "stay" and payload["animation"] == "idle"
+                        and not (payload["sound"] or payload.get("text"))):
                     self._revoke(db, delivery_id)
                     return None
                 db.execute("UPDATE system2_pet_intents SET state='claimed' WHERE delivery_id=?", (delivery_id,))
@@ -241,11 +310,23 @@ class PetIntentStore:
         except sqlite3.OperationalError:
             return None
 
-    def receipt(self, delivery_id, *, sound_requested=False):
+    def receipt(self, delivery_id, *, sound_requested=False, displayed=False, now=None):
         try:
             with closing(sqlite3.connect(self.path, timeout=0.025)) as db, db:
-                db.execute("UPDATE system2_pet_intents SET state=? WHERE delivery_id=? AND user_scope=? AND state='claimed'",
-                           ("motion_and_sound_requested" if sound_requested else "motion_requested",
-                            delivery_id, self.routes.user_scope))
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT payload FROM system2_pet_intents WHERE delivery_id=? AND user_scope=? "
+                                 "AND state='claimed'", (delivery_id, self.routes.user_scope)).fetchone()
+                if row is None:
+                    return False
+                if json.loads(row[0]).get("semantic"):
+                    state = "displayed" if displayed else "sound_requested" if sound_requested else "failed"
+                    if displayed:
+                        self.scheduler.record_contact(delivery_id=delivery_id, kind="pet", at=now,
+                                                      channel="qt", db=db)
+                else:
+                    state = "motion_and_sound_requested" if sound_requested else "motion_requested"
+                db.execute("UPDATE system2_pet_intents SET state=? WHERE delivery_id=? AND user_scope=?",
+                           (state, delivery_id, self.routes.user_scope))
+                return True
         except sqlite3.OperationalError:
-            return
+            return False

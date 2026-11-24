@@ -14,7 +14,8 @@ _CONTEXT_FIELDS = {
     "as_of", "timezone", "trigger_reasons", "items", "habits", "eligible_items", "current_phase",
     "enabled_settings", "pending_proposals", "display_capabilities", "recent_decisions",
     "opportunity_id", "publication_cursor", "recheck_items", "selected_phase", "selected_interval",
-    "selected_recovery",
+    "selected_recovery", "recent_user_actions", "candidate_items_truncated", "candidate_habits_truncated",
+    "phase_elapsed", "phase_predecessor",
 }
 _STATES = {"working", "available", "away", "unknown"}
 _CURRENT_STATUSES = {"fresh", "expired", "context_changed", "no_data"}
@@ -112,6 +113,9 @@ def _document_detail(value: dict, *, share: bool, document_sources: tuple[str, .
         result.update(summary=_summary(value.get("summary")),
                       scene_elements=list(validated_scene_elements(value.get("scene_elements"))),
                       visible_changes=list(validated_visible_changes(value.get("visible_changes"))))
+        for key in ("summary_observed_at", "scene_observed_at", "change_observed_at"):
+            if stamp := _stamp(value.get(key)):
+                result[key] = stamp
     source = value.get("document_source")
     if share and isinstance(source, str) and document_source_allowed(source, document_sources):
         if name := sanitize_document_name(value.get("document_name"), source):
@@ -159,8 +163,25 @@ def _document_names(value) -> set[str]:
     return set()
 
 
+def _contact(value: dict) -> dict:
+    identifiers = ("delivery_id", "subject_ref", "occurrence_id")
+    result = {key: value[key] for key in identifiers if isinstance(value.get(key), str)}
+    for key, choices in (
+        ("kind", {"reminder", "proposal", "pet"}),
+        ("channel", {"pet_card", "pet_badge", "os_notification", "qt"}),
+        ("response", {"acknowledged", "accepted", "rejected"}),
+    ):
+        if choice := _enum(value.get(key), choices, None):
+            result[key] = choice
+    if at := _stamp(value.get("at")):
+        result["at"] = at
+    return result
+
+
 def project_context(value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
     result = {key: _clean(data) for key, data in value.items() if key in _CONTEXT_FIELDS}
+    if "recent_contacts" in value:
+        result["recent_contacts"] = [_contact(item) for item in _items(value["recent_contacts"], 12)]
     current = value.get("current")
     history = value.get("history")
     result["current_status"] = _enum(value.get("current_status"), _CURRENT_STATUSES, "no_data")
@@ -213,8 +234,6 @@ def project_context(value: dict, *, share: bool, document_sources: tuple[str, ..
         result["history_1h"] = {
             "from_at": _stamp(hour.get("from_at")), "to_at": _stamp(hour.get("to_at")),
             "segments": [{**_segment(item, share=False),
-                          **{key: _stamp(item[key]) for key in ("scene_observed_at", "change_observed_at")
-                             if share and item.get(key)},
                           **_document_detail(item, share=share, document_sources=document_sources)}
                          for item in hour_segments],
             "gaps": _gap_projection(hour),
@@ -237,16 +256,27 @@ def project_context(value: dict, *, share: bool, document_sources: tuple[str, ..
     return result
 
 
-def project_input(payload: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> tuple[str | None, dict]:
+def project_input(payload: dict, *, share: bool, document_sources: tuple[str, ...] = (),
+                  origin: str | None = None) -> tuple[str | None, dict]:
     context = payload.get("context")
     data = {key: _clean(payload[key]) for key in ("event", "grants") if key in payload}
-    data["context"] = project_context(context, share=share, document_sources=document_sources) if isinstance(context, dict) else {}
+    origin = _enum(origin or payload.get("origin"), {"user", "background"}, None)
+    if origin:
+        data["origin"] = origin
+    for key in ("semantic_chat", "semantic_background"):
+        if type(payload.get(key)) is bool:
+            data[key] = payload[key]
+    data["context"] = (project_context(context, share=share, document_sources=document_sources)
+                       if isinstance(context, dict) else {})
     intent = payload.get("user_intent")
-    if not isinstance(intent, dict):
+    if origin == "background" or not isinstance(intent, dict):
         return None, data
     data["user_intent"] = {
-        key: _clean(intent[key]) for key in ("message_id", "selected_ref", "reply_to_proposal_id") if key in intent
+        key: _clean(intent[key]) for key in ("message_id", "selected_ref", "reply_to_proposal_id",
+                                           "reply_to_proposal_version", "timezone") if key in intent
     }
+    if requested_at := _stamp(intent.get("requested_at")):
+        data["user_intent"]["requested_at"] = requested_at
     utterance = intent.get("utterance")
     return utterance if isinstance(utterance, str) else None, data
 
@@ -257,7 +287,7 @@ def project_business_result(value: dict) -> dict:
 
 def project_tool_result(name: str, value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
     result = project_business_result(value)
-    if name == "context_read":
+    if name in {"context_read", "context.read"}:
         for key in ("view", "data"):
             if isinstance(view := value.get(key), dict):
                 result[key] = project_context(view, share=share, document_sources=document_sources)

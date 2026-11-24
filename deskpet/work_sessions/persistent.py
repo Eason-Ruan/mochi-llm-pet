@@ -15,6 +15,7 @@ import psutil
 from pydantic import ValidationError
 
 from deskpet.contracts import ErrorCode, SessionCommand, SessionResult, WorkSession
+from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.task_service.sqlite import read_task, task_table_exists, transition_issue_for_interval
 
 from .models import (
@@ -102,6 +103,10 @@ _SCHEMA = (
     )""",
     "CREATE TABLE IF NOT EXISTS phase_habit_runs (id TEXT PRIMARY KEY, view TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS phase_habit_completed (phase_id TEXT PRIMARY KEY REFERENCES phase_views(id))",
+    """CREATE TABLE IF NOT EXISTS phase_elapsed_outbox (
+        phase_id TEXT NOT NULL, phase_version INTEGER NOT NULL, details TEXT NOT NULL,
+        PRIMARY KEY(phase_id, phase_version)
+    )""",
 )
 
 
@@ -120,6 +125,8 @@ class PersistentWorkSessionService:
         self._sleeping = False
         self._pending_sleep_recovery: str | None = None
         self.on_focus_released = None
+        self.on_phase_elapsed = None
+        self.on_phase_started = None
         defaults = self._validate_defaults(default_focus_s, default_break_s)
         if path != ":memory:":
             path = Path(path).expanduser()
@@ -137,7 +144,7 @@ class PersistentWorkSessionService:
                 elif version["version"] != 1:
                     raise RuntimeError(f"unsupported focus schema version {version['version']}")
                 db.execute("INSERT OR IGNORE INTO phase_defaults VALUES (1, ?, ?, 1)", defaults)
-                self._refresh(db, self._tick(), allow_automatic=False)
+                self._refresh(db, self._tick(), allow_automatic=False, elapsed_reason="elapsed_on_restart")
         except BaseException:
             self._db.close()
             raise
@@ -169,6 +176,35 @@ class PersistentWorkSessionService:
 
     def attach_settings(self, settings_store):
         self.settings_store = settings_store
+
+    def attach_system2(self, *, on_phase_elapsed, on_phase_started):
+        """Register transactional consumers and flush a transition recovered at startup."""
+        with self._lock:
+            with self._write() as db:
+                for row in db.execute("SELECT * FROM phase_elapsed_outbox ORDER BY rowid").fetchall():
+                    details = json.loads(row["details"])
+                    details["elapsed_at"] = datetime.fromisoformat(details["elapsed_at"])
+                    on_phase_elapsed(row["phase_id"], row["phase_version"], db=db, **details)
+                db.execute("DELETE FROM phase_elapsed_outbox")
+            self.on_phase_elapsed = on_phase_elapsed
+            self.on_phase_started = on_phase_started
+
+    def _phase_elapsed(self, db, phase, successor, reason):
+        if not semantic_background_enabled():
+            return
+        details = {
+            "elapsed_at": phase.ended_at,
+            "phase_kind": phase.kind,
+            "transition_reason": reason,
+            "successor": ({"id": successor.id, "version": successor.version, "kind": successor.kind}
+                          if successor else None),
+        }
+        if self.on_phase_elapsed is not None:
+            self.on_phase_elapsed(phase.id, phase.version, db=db, **details)
+        else:
+            details["elapsed_at"] = phase.ended_at.isoformat()
+            db.execute("INSERT OR IGNORE INTO phase_elapsed_outbox VALUES (?, ?, ?)",
+                       (phase.id, phase.version, json.dumps(details)))
 
     def configure_defaults(self, *, default_focus_s, default_break_s, link_issues=True):
         focus_s, break_s = self._validate_defaults(default_focus_s, default_break_s)
@@ -222,13 +258,18 @@ class PersistentWorkSessionService:
 
     def _save(self, db, phase, *, active):
         callback = self.on_focus_released
-        previous = (self._active(db) if callback is not None and phase.kind == "focus"
-                    and (not active or phase.state != "running") else None)
+        releasing = callback is not None and phase.kind == "focus" and (not active or phase.state != "running")
+        starting = (self.on_phase_started is not None and active and phase.state == "running"
+                    and semantic_background_enabled())
+        previous = self._active(db) if releasing or starting else None
         db.execute("""INSERT INTO phase_views VALUES (?, ?, ?)
                       ON CONFLICT(id) DO UPDATE SET active=excluded.active, view=excluded.view""",
                    (phase.id, active, phase.model_dump_json()))
-        if previous and previous.id == phase.id and previous.state == "running":
+        was_running = previous and previous.id == phase.id and previous.state == "running"
+        if releasing and was_running:
             callback(phase.id, phase.version, db=db)
+        if starting and not was_running:
+            self.on_phase_started(db=db)
         return phase
 
     @staticmethod
@@ -308,7 +349,7 @@ class PersistentWorkSessionService:
             if issue.draft.item_type != "issue" or (not historical and issue.status != "registered"):
                 raise Rejected(ErrorCode.INVALID_TRANSITION)
 
-    def _refresh(self, db, tick, *, force=False, allow_automatic=True):
+    def _refresh(self, db, tick, *, force=False, allow_automatic=True, elapsed_reason="natural_elapsed"):
         allow_automatic = allow_automatic and not self._sleeping
         phase = self._active(db)
         if phase is None or phase.state != "running":
@@ -328,6 +369,8 @@ class PersistentWorkSessionService:
             successor = self._automatic_follow_on(db, elapsed, tick) if allow_automatic and not slept_through_break else None
             if successor is None:
                 self._change_run_state(db, elapsed, "paused")
+            self._phase_elapsed(db, elapsed, successor,
+                                "elapsed_during_sleep" if slept_through_break else elapsed_reason)
             return successor
         checkpoint = self._checkpoint(db, phase.id)
         if not self._owner_alive(checkpoint) or tick.mono < checkpoint.monotonic_s:
@@ -351,8 +394,10 @@ class PersistentWorkSessionService:
             else:
                 self._save_checkpoint(db, projected, tick, checkpoint)
             self._save(db, projected, active=True)
-            if remaining == 0 and allow_automatic:
-                return self._automatic_follow_on(db, projected, tick) or projected
+            if remaining == 0:
+                successor = self._automatic_follow_on(db, projected, tick) if allow_automatic else None
+                self._phase_elapsed(db, projected, successor, elapsed_reason)
+                return successor or projected
         return projected
 
     def _interrupt(self, db, phase, checkpoint, tick, *, origin):
@@ -381,24 +426,33 @@ class PersistentWorkSessionService:
                       ON CONFLICT(id) DO UPDATE SET interval=excluded.interval""",
                    (recovery.id, recovery.phase_id, recovery.model_dump_json()))
 
-    def record_sleep(self):
+    def record_sleep(self, *, on_sleep=None):
         """Commit the observed departure boundary while the device is still awake."""
         self._sleeping = True
         with self._write() as db:
             tick = self._tick()
-            phase = self._refresh(db, tick, force=True, allow_automatic=False)
-            if phase is None or phase.state != "running":
-                return
-            if phase.kind == "focus":
-                self._interrupt(db, phase, self._checkpoint(db, phase.id), tick, origin="sleep")
-            else:
-                db.execute("INSERT OR IGNORE INTO phase_sleeping_break VALUES (?, ?)",
-                           (phase.id, tick.wall.isoformat()))
+            phase = self._refresh(db, tick, force=True, allow_automatic=False,
+                                  elapsed_reason="elapsed_before_sleep")
+            if phase is not None and phase.state == "running":
+                if phase.kind == "focus":
+                    self._interrupt(db, phase, self._checkpoint(db, phase.id), tick, origin="sleep")
+                else:
+                    db.execute("INSERT OR IGNORE INTO phase_sleeping_break VALUES (?, ?)",
+                               (phase.id, tick.wall.isoformat()))
+            if on_sleep is not None:
+                on_sleep(db, tick.wall)
 
-    def record_wake(self):
+    def record_wake(self, *, on_wake=None):
         with self._write() as db:
             tick = self._tick()
-            self._refresh(db, tick, allow_automatic=False)
+            phase = self._active(db)
+            if (semantic_background_enabled() and phase is not None
+                    and phase.kind == "focus" and phase.state == "running"):
+                # Without a recorded departure, only the last trustworthy
+                # checkpoint establishes how much of this focus was completed.
+                self._interrupt(db, phase, self._checkpoint(db, phase.id), tick, origin="recovery")
+            else:
+                self._refresh(db, tick, allow_automatic=False, elapsed_reason="elapsed_on_resume")
             db.execute("DELETE FROM phase_sleeping_break")
             for interval in self._list_recovery(db):
                 if interval.origin == "sleep" and interval.observed_until_at is None:
@@ -408,6 +462,8 @@ class PersistentWorkSessionService:
                         "trusted_end_at": observed if interval.id == self._pending_sleep_recovery else None,
                         "version": interval.version + 1,
                     }))
+            if on_wake is not None:
+                on_wake(db, tick.wall)
         self._pending_sleep_recovery = None
         self._sleeping = False
 
@@ -422,7 +478,8 @@ class PersistentWorkSessionService:
                     checkpoint = self._checkpoint(db, phase.id)
                     if checkpoint.owner_session_id == self.owner_session_id:
                         tick = self._tick()
-                        phase = self._refresh(db, tick, force=True, allow_automatic=False)
+                        phase = self._refresh(db, tick, force=True, allow_automatic=False,
+                                              elapsed_reason="elapsed_before_exit")
                         if phase.state == "running":
                             self._interrupt(db, phase, self._checkpoint(db, phase.id), tick, origin="exit")
             self._db.close()
@@ -616,7 +673,7 @@ class PersistentWorkSessionService:
             return self._end(db, current, ReviewInput(), tick, skipped_break=True)
         return self._pause_resume(db, current, command.kind, tick)
 
-    def _start(self, db, command, args, tick, active):
+    def _start_predecessor(self, db, args, active):
         previous = self._get(db, args.previous_phase_id) if args.previous_phase_id else None
         if args.previous_phase_id and (previous is None or previous.version != args.expected_previous_version):
             raise Rejected(ErrorCode.STALE_TASK)
@@ -628,7 +685,20 @@ class PersistentWorkSessionService:
             raise Rejected(ErrorCode.INVALID_TRANSITION)
         if previous and self._latest_phase_id(db) != previous.id:
             raise Rejected(ErrorCode.STALE_TASK)
+        return previous
 
+    def phase_start_error(self, db, payload, active):
+        """Validate the same transition a later proposal acceptance will execute."""
+        try:
+            self._start_predecessor(db, StartInput.model_validate(payload), active)
+        except Rejected as exc:
+            return exc.code
+        except ValidationError:
+            return ErrorCode.INVALID_ARGUMENT
+        return None
+
+    def _start(self, db, command, args, tick, active):
+        previous = self._start_predecessor(db, args, active)
         defaults = self._defaults(db)
         if args.issue_links and not defaults["link_issues"]:
             raise Rejected(ErrorCode.INVALID_TRANSITION)

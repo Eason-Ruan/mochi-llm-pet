@@ -215,7 +215,7 @@ def exercise_desktop():
 
         send("改成 40 分钟")
         wait_for(lambda: any(
-            label.isVisible() and label.text() == "已调整 · 40 分钟"
+            label.isVisible() and "已调整 · 40 分钟" in label.text().splitlines()
             for label in session.chat.findChildren(QLabel, "refine-chat-message-text")
         ), "native DSH chat reply rendered")
         wait_for(lambda: active() and (active()["id"], active()["planned_duration_s"]) == (first, 2400),
@@ -295,7 +295,7 @@ def exercise_desktop():
             wait_for(lambda: task()["displayed_at"] and session.prompt and session.prompt.painted,
                      "soft reminder actually painted")
             command = session.prompt.command
-            assert command.sound is None and command.position_hint == "screen_edge"
+            assert command.sound is None and command.position_hint == "stay", command
             assert session.pet._temporary_anchor is None
             assert task()["acknowledged_at"] is None
             click(find("refine-bubble-no"))

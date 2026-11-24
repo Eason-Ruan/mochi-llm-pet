@@ -7,9 +7,11 @@ import pytest
 from deskpet.contracts import TaskCommand
 from deskpet.mocks.clock import FakeClock
 from deskpet.mocks.delivery import FakeDeliveryPort
+from deskpet.observation_v2.activity import ActivityRecorder, ActivitySample
 from deskpet.observation_v2.context import ObservationContextReader
 from deskpet.observation_v2.pipeline import ObservationStore
 from deskpet.observation_v2.state import Observation
+from deskpet.observation_v2.vision import ScreenObservation
 from deskpet.settings import SettingsStore
 from deskpet.system2.scheduler import Scheduler
 from deskpet.task_service.presentation import PresentationLedger
@@ -55,10 +57,10 @@ class Desktop:
         assert result.status == 'applied', result
         return result.view
 
-    def present(self, occurrence, *, reason='available', authority=None, scheduler=None):
+    def present(self, occurrence, *, reason='available', authority=None, scheduler=None, presentation=None):
         scheduler = scheduler or self.scheduler
         authority = authority or self.authority(scheduler)
-        return scheduler.present(occurrence_ids=[occurrence], presentation={'sound': True},
+        return scheduler.present(occurrence_ids=[occurrence], presentation=presentation or {'sound': True},
                                  reason_code=reason, authority=authority, now=self.now)
 
     def authority(self, scheduler=None):
@@ -104,6 +106,11 @@ def test_minute_tick_and_upgrade_from_a_persisted_two_minute_schedule(desktop):
         event, = scheduler.pending_wakes()
         assert (event.kind, event.at) == ('tick', original + timedelta(minutes=cycle + 1))
         scheduler.ack_wakes([event.event_id])
+
+
+@pytest.fixture
+def legacy_background(monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
 
 
 def test_window_open_recheck_and_idle_tick_merge(desktop):
@@ -166,7 +173,7 @@ def test_snooze_invalidates_wait_and_old_deadline_while_exact_deadline_runs_offl
     assert [(command.reason, command.occurrence) for command in desktop.delivery.commands] == [('hard_due', 2)]
 
 
-def test_working_urgency_and_focus_override_are_rechecked_at_qt_permit(desktop):
+def test_working_urgency_and_focus_override_are_rechecked_at_qt_permit(desktop, legacy_background):
     phases = PersistentWorkSessionService(path=desktop.path, clock=desktop.clock)
     try:
         ordinary = desktop.reminder('drink')
@@ -194,7 +201,7 @@ def test_working_urgency_and_focus_override_are_rechecked_at_qt_permit(desktop):
         phases.close()
 
 
-def test_concurrent_opportunity_claim_and_replay_of_intervening_departure(desktop):
+def test_concurrent_opportunity_claim_and_replay_of_intervening_departure(desktop, legacy_background):
     first = desktop.reminder('first')
     second = desktop.reminder('second')
     desktop.publish()
@@ -225,7 +232,7 @@ def test_concurrent_opportunity_claim_and_replay_of_intervening_departure(deskto
     assert desktop.present(winner.occurrence_id, scheduler=restarted)['status'] == 'pending'
 
 
-def test_replay_wait_both_publication_orders_and_settings_change(desktop):
+def test_replay_wait_both_publication_orders_and_settings_change(desktop, legacy_background):
     desktop.enable_focus_waits()
     deadline = desktop.now + timedelta(minutes=3)
     first = desktop.scheduler.register_wait(purpose='focus_suggestion', after_cursor=0, valid_until=deadline)
@@ -269,7 +276,7 @@ def test_wait_rollback_transaction_and_expired_publication_do_not_authorize(desk
     assert [event.publication_cursor for event in recovered.pending_wakes()] == [2]
 
 
-def test_rollback_never_allows_previous_observation_or_queued_effect(desktop):
+def test_rollback_never_allows_previous_observation_or_queued_effect(desktop, legacy_background):
     task = desktop.reminder('drink')
     desktop.publish(revision=71)
     admitted = desktop.authority()
@@ -287,7 +294,7 @@ def test_rollback_never_allows_previous_observation_or_queued_effect(desktop):
     assert restarted.snapshot(desktop.now)['current'].context_revision == 73
 
 
-def test_time_sensitive_reminder_priority_and_shared_interruption_quota(desktop):
+def test_time_sensitive_reminder_priority_and_shared_interruption_quota(desktop, legacy_background):
     desktop.enable_focus_waits()
     normal = desktop.reminder('drink')
     urgent = desktop.reminder('minutes', expires_at=desktop.now + timedelta(seconds=60))
@@ -336,3 +343,151 @@ def test_pause_registers_recheck_even_before_first_phase_poll(desktop):
         assert desktop.scheduler.pending_wakes() == wakes
     finally:
         phases.close()
+
+
+def test_semantic_reminders_use_explicit_bounds_and_model_selected_style(desktop):
+    start = desktop.now
+    ordinary = desktop.reminder("ordinary", earliest_at=start + timedelta(seconds=2),
+                                window_open_at=start + timedelta(seconds=10),
+                                window_close_at=start + timedelta(seconds=12))
+    urgent = desktop.reminder("urgent", remind_by=start + timedelta(seconds=20))
+    desktop.enable_focus_waits()
+    phases = PersistentWorkSessionService(path=desktop.path, clock=desktop.clock)
+    try:
+        phases.apply_phase(PhaseCommand(command_id="start", kind="start", phase_id="focus"))
+        desktop.publish("working")
+        assert desktop.present(ordinary.occurrence_id)["error_code"] == "OUTSIDE_WINDOW"
+        desktop.clock.advance(2)
+        snapshot = desktop.scheduler.snapshot(desktop.now)
+        assert {candidate["task_id"] for candidate in snapshot["eligible_items"]} == {"ordinary", "urgent"}
+        assert desktop.scheduler.authorize_proposal(context_revision=71, now=desktop.now)
+
+        result = desktop.present(ordinary.occurrence_id)
+        assert result["status"] == "pending"
+        duplicate = desktop.present(ordinary.occurrence_id)
+        assert duplicate["delivery_id"] == result["delivery_id"]
+        desktop.tasks.pump()
+        command, = desktop.delivery.commands
+        assert command.sound == "reminder" and command.position_hint != "screen_edge"
+
+        desktop.clock.advance(18)
+        desktop.tasks.pump()
+        assert [(c.task_id, c.reason) for c in desktop.delivery.commands if c.task_id == urgent.task_id] == [
+            ("urgent", "deadline_fallback"),
+        ]
+    finally:
+        phases.close()
+
+
+def test_presentation_survives_new_sampling_and_expired_estimates(desktop):
+    start = desktop.now
+    task = desktop.reminder("review", window_open_at=start, window_close_at=start + timedelta(seconds=4))
+    desktop.publish("working", ttl=3)
+    authority = desktop.authority()
+    desktop.publish("working", revision=72, seconds=1, ttl=3)
+    assert desktop.present(task.occurrence_id, authority=authority)["status"] == "pending"
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    desktop.publish("working", revision=73, seconds=5, ttl=3)
+    desktop.clock.advance(4)
+    restarted = desktop.reopen_scheduler()
+    restarted.poll()
+    assert restarted.snapshot(desktop.now)["recent_contacts"] == []
+    ledger = PresentationLedger(desktop.path, authorize_early=restarted.authorize_qt)
+    assert ledger.permit_qt(command, desktop.now)
+    assert ledger.mark_painted(command, desktop.now)
+    contact, = restarted.snapshot(desktop.now)["recent_contacts"]
+    assert contact["kind"] == "reminder" and contact["delivery_id"] == command.delivery_id
+    assert not ledger.permit_qt(command, desktop.now)
+
+
+def test_material_change_rechecks_once_and_lock_unknown_blocks_detail(desktop):
+    task = desktop.reminder("handoff")
+    desktop.publish("working")
+    assert desktop.present(task.occurrence_id)["status"] == "pending"
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    desktop.publish("away", revision=72, seconds=1)
+    ledger = PresentationLedger(desktop.path, authorize_early=desktop.scheduler.authorize_qt)
+    assert not ledger.permit_qt(command, desktop.now)
+    assert not ledger.permit_qt(command, desktop.now)
+    events = [event for event in desktop.scheduler.pending_wakes() if event.reason == "presentation_context_changed"]
+    wake, = events
+    assert wake.occurrence_id == task.occurrence_id
+
+    another = desktop.reminder("water")
+    desktop.scheduler.lock_probe = lambda: None
+    assert desktop.present(another.occurrence_id)["error_code"] == "STALE_CONTEXT"
+    assert desktop.present(another.occurrence_id, presentation={"channel": "os_notification"})[
+        "error_code"] == "DISABLED"
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    assert desktop.present(another.occurrence_id, presentation={"channel": "os_notification"})[
+        "status"] == "pending"
+
+
+def test_no_evidence_can_authorize_and_expired_soft_reminder_does_not_display(desktop):
+    now = desktop.now
+    task = desktop.reminder("stretch", target_at=now + timedelta(seconds=30),
+                            expires_at=now + timedelta(seconds=35))
+    desktop.enable_focus_waits()
+    assert desktop.scheduler.snapshot(now)["current"] is None
+    assert desktop.scheduler.authorize_proposal(context_revision=None, now=now)
+    assert desktop.present(task.occurrence_id)["status"] == "pending"
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    ledger = PresentationLedger(desktop.path, authorize_early=desktop.scheduler.authorize_qt)
+    desktop.clock.advance(35)
+    desktop.scheduler.poll()
+    desktop.tasks.pump()
+    assert not ledger.permit_qt(command, desktop.now)
+    assert len(desktop.delivery.commands) == 1
+
+
+
+def test_starting_a_meeting_rechecks_a_reminder_without_a_state_change(desktop):
+    task = desktop.reminder("handoff")
+    desktop.publish("working")
+    assert desktop.present(task.occurrence_id)["status"] == "pending"
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    desktop.publish("working", revision=72, seconds=1)
+
+    recorder = ActivityRecorder(desktop.observation)
+    sample = ActivitySample(desktop.now, desktop.clock.monotonic_now(), app_name="Meeting",
+                            window_id=1, screen_locked=False, idle_s=1)
+    recorder.observe(sample)
+    activity = recorder.current_activity
+    with desktop.observation.connection:
+        desktop.observation._record_live_sample(desktop.now, desktop.clock.monotonic_now(),
+                                                sample=sample, activity=activity)
+    desktop.observation.save_screen(ScreenObservation(
+        "meeting", activity.activity_id, desktop.now, "ready", "fixture", "meeting", None, None,
+    ), processed_at=desktop.now)
+
+    ledger = PresentationLedger(desktop.path, authorize_early=desktop.scheduler.authorize_qt)
+    assert not ledger.permit_qt(command, desktop.now)
+    events = [event for event in desktop.scheduler.pending_wakes() if event.reason == "presentation_context_changed"]
+    assert [event.occurrence_id for event in events] == [task.occurrence_id]
+
+
+
+def test_scheduled_native_fallback_does_not_block_an_early_candidate(desktop):
+    deadline = desktop.now + timedelta(minutes=5)
+    task = desktop.reminder("hand in application", remind_by=deadline)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    ledger = PresentationLedger(desktop.path, authorize_early=desktop.scheduler.authorize_qt)
+    delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    # The ledger may be populated before the app's deadline so native
+    # delivery can run while the app is unavailable.
+    with ledger._transaction() as db:
+        ledger._write_owner(db, delivery_id, task, "os_notification", "scheduled", desktop.now, "fallback")
+    candidate, = desktop.scheduler.snapshot(desktop.now)["eligible_items"]
+    assert candidate["task_id"] == task.task_id
+    pending = desktop.present(task.occurrence_id)
+    assert pending["view"]["channel"] == "pet_card" and pending["delivery_id"] == delivery_id
+    desktop.scheduler.poll()
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    assert command.channel == "pet_card"
+    row, = ledger.rows()
+    assert row["state"] == "scheduled" and row["channel"] == "os_notification"

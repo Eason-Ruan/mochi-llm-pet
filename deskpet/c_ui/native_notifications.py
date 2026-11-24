@@ -42,6 +42,9 @@ class UnavailableNotifications:
 class MacNotifications:
     can_schedule = True
     can_verify_removal = False
+    # The two inventories can confirm an early handover while the original
+    # scheduled fire time is still safely in the future.
+    can_verify_early_transfer = True
 
     def __init__(self):
         from Foundation import NSBundle

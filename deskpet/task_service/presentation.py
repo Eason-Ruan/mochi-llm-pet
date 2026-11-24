@@ -8,6 +8,7 @@ import sqlite3
 from uuid import uuid4
 
 from deskpet.contracts import DisplayCommand, TaskView
+from deskpet.system2.semantic_policy import semantic_background_enabled
 
 
 PRESENTATION_TABLE = """
@@ -19,6 +20,8 @@ CREATE TABLE IF NOT EXISTS presentations (
 """
 
 RELEASED_STATES = {"cancelled", "failed", "released", "unavailable"}
+EARLY_OS_TRANSFER = "semantic_early_transfer"
+_TRANSFER_MARGIN = timedelta(seconds=5)
 
 
 def running_focus(db):
@@ -76,7 +79,8 @@ class PresentationLedger:
 
     def _event(self, db, delivery_id, task_id, version, channel, state, now, reason):
         event = {"submitting": "presentation.claimed", "permitted": "presentation.claimed",
-                 "painted": "card.painted", "submitted": "os.accepted", "unavailable": "os.failed"}.get(state)
+                 "painted": "card.painted", "badge_shown": "badge.painted",
+                 "submitted": "os.accepted", "unavailable": "os.failed"}.get(state)
         if event is None:
             event = f"os.{state}" if channel == "os_notification" else f"presentation.{state}"
         fields = {"task_id": task_id, "task_version": version, "delivery_id": delivery_id,
@@ -122,6 +126,16 @@ class PresentationLedger:
 
     def permit_qt(self, command, now):
         """Read current authority and reserve one active channel immediately before a visible paint."""
+        if command.channel != "pet_card":
+            return False
+        return self._permit_pet(command, now, "pet_card")
+
+    def permit_badge(self, command, now):
+        if command.channel != "pet_badge":
+            return False
+        return self._permit_pet(command, now, "pet_badge")
+
+    def _permit_pet(self, command, now, channel):
         try:
             with self._transaction() as db:
                 task = self._eligible_qt(db, command, now)
@@ -139,8 +153,8 @@ class PresentationLedger:
                     return False
                 row = db.execute("SELECT * FROM presentations WHERE delivery_id=?", (command.delivery_id,)).fetchone()
                 if row and row["state"] not in RELEASED_STATES | {"grouped"}:
-                    return row["state"] == "permitted" and row["owner_session"] == self.session
-                self._write_owner(db, command.delivery_id, task, "pet_card", "permitted", now)
+                    return row["channel"] == channel and row["state"] == "permitted" and row["owner_session"] == self.session
+                self._write_owner(db, command.delivery_id, task, channel, "permitted", now)
                 return True
         except sqlite3.OperationalError:
             return False
@@ -148,6 +162,8 @@ class PresentationLedger:
     def _eligible_qt(self, db, command, now):
         task = self._current(db, command.task_id, command.task_version, command.occurrence, now)
         if task is None or not command.requested_at <= now < command.expires_at:
+            return None
+        if semantic_background_enabled() and task.draft.explicit_start_at and now < task.draft.explicit_start_at:
             return None
         row = db.execute("SELECT command FROM deliveries WHERE delivery_id=? AND active=1",
                          (command.delivery_id,)).fetchone()
@@ -178,7 +194,7 @@ class PresentationLedger:
         except sqlite3.OperationalError:
             pass
 
-    def prepare_os(self, task, delivery_id, identifier, now):
+    def prepare_os(self, task, delivery_id, identifier, now, *, command=None):
         """Commit the OS submission intent first. A lost result is ambiguous after restart."""
         try:
             with self._transaction() as db:
@@ -186,11 +202,17 @@ class PresentationLedger:
                     return False
                 if not _stored_preferences(db).get("allow_system_notifications", True):
                     return False
-                existing = db.execute("SELECT state, updated_at FROM presentations WHERE delivery_id=?",
+                if command is not None:
+                    if (command.channel != "os_notification" or command.delivery_id != delivery_id
+                            or self._eligible_qt(db, command, now) is None or self.authorize_early is None
+                            or not self.authorize_early(db, command, now)):
+                        return False
+                existing = db.execute("SELECT state, reason, updated_at FROM presentations WHERE delivery_id=?",
                                       (delivery_id,)).fetchone()
                 if self._other_owner(db, task, delivery_id):
                     return False
-                if existing and existing["state"] != "unavailable":
+                transferred = existing and existing["state"] == "cancelled" and existing["reason"] == EARLY_OS_TRANSFER
+                if existing and existing["state"] != "unavailable" and not transferred:
                     if existing["state"] != "failed" or now < datetime.fromisoformat(existing["updated_at"]) + timedelta(seconds=5):
                         return False
                     tries = db.execute("""SELECT count(*) FROM events WHERE kind='presentation.claimed'
@@ -200,6 +222,45 @@ class PresentationLedger:
                         return False
                 self._write_owner(db, delivery_id, task, "os_notification", "submitting", now, identifier)
                 return True
+        except sqlite3.OperationalError:
+            return False
+
+    def _can_transfer_early(self, db, command, now):
+        task = self._eligible_qt(db, command, now)
+        return (task is not None and task.draft.mode == "soft" and task.draft.hard_deadline is not None
+                and now + _TRANSFER_MARGIN < task.draft.hard_deadline
+                and command.reason == "tool" and self.authorize_early is not None
+                and self.authorize_early(db, command, now))
+
+    def begin_early_transfer(self, command, now):
+        """Keep the existing OS owner until cancellation can be verified at the platform."""
+        try:
+            with self._transaction() as db:
+                row = db.execute("""SELECT * FROM presentations WHERE delivery_id=? AND channel='os_notification'
+                    AND task_version=? AND occurrence=? AND state='scheduled'""",
+                    (command.delivery_id, command.task_version, command.occurrence)).fetchone()
+                if row is None or not self._can_transfer_early(db, command, now):
+                    return None
+                db.execute("UPDATE presentations SET state='cancel_intent', reason=?, updated_at=? WHERE delivery_id=?",
+                           (EARLY_OS_TRANSFER, now.isoformat(), command.delivery_id))
+                self._event(db, command.delivery_id, row["task_id"], row["task_version"], row["channel"],
+                            "cancel_intent", now, EARLY_OS_TRANSFER)
+                return dict(row)
+        except sqlite3.OperationalError:
+            return None
+
+    def can_finish_early_transfer(self, command, now):
+        try:
+            with self._transaction() as db:
+                return self._can_transfer_early(db, command, now)
+        except sqlite3.OperationalError:
+            # A busy writer can be committing the selected effect.
+            return True
+
+    def os_sound_enabled(self):
+        try:
+            with self._transaction() as db:
+                return _stored_preferences(db).get("reminder_sound", True)
         except sqlite3.OperationalError:
             return False
 
@@ -218,7 +279,8 @@ class PresentationLedger:
             return False
 
     def mark_painted(self, command, now):
-        return self.update(command.delivery_id, {"permitted"}, "painted", now, current_session=True)
+        state = "badge_shown" if command.channel == "pet_badge" else "painted"
+        return self.update(command.delivery_id, {"permitted"}, state, now, current_session=True)
 
     def record_unavailable(self, task, delivery_id, now, reason):
         try:

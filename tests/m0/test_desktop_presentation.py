@@ -2,6 +2,7 @@
 
 import sqlite3
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from PyQt6.QtWidgets import QApplication
@@ -10,6 +11,7 @@ from deskpet.c_ui.presentation import DesktopPresentation
 from deskpet.contracts import TaskDraft
 from deskpet.mocks.clock import FakeClock
 from deskpet.settings import SettingsStore
+from deskpet.system2.scheduler import Scheduler
 from deskpet.task_service.sqlite import SQLiteTaskService
 from tests.m0.test_task_service import DisplayProbe, command, observe, register
 
@@ -245,6 +247,100 @@ def test_hidden_deadline_retries_known_failure_with_same_platform_id(business):
     assert presenter.ledger.rows()[0]["state"] == "submitted"
     assert len(notifications.submissions) == 2
     assert notifications.submissions[0][0] == notifications.submissions[1][0]
+
+
+@pytest.mark.parametrize("result", ["paint", "restart", "unverified", "near_deadline"])
+def test_soft_latest_system_fallback_transfers_only_after_verified_removal(business, result):
+    clock, delivery, tasks = business
+    now = clock.wall_now()
+    draft = TaskDraft(content="Soft reminder with a hard latest", mode="soft",
+                      remind_after=now, remind_by=now + timedelta(seconds=30))
+    assert command(tasks, "create", draft=draft.model_dump(mode="json")).status == "applied"
+    task = command(tasks, "confirm").view
+    preferences = SettingsStore(tasks.path)
+    preferences.update(expected_version=preferences.read().version, allow_system_notifications=True)
+    scheduler = Scheduler(tasks, clock=clock, lock_probe=lambda: False)
+    notifications = NotificationProbe()
+    notifications.confirm_removal = result != "unverified"
+    settings = {"allow_system_notifications": True, "reminder_sound": True}
+
+    def presentation():
+        display = DesktopPresentation(path=tasks.path, notifications=notifications,
+                                      lock_probe=lambda: False, synthetic=True)
+        display.ledger.authorize_early = scheduler.authorize_qt
+        display.observe(snapshot(clock, tasks, **settings))
+        return display
+
+    presenter = presentation()
+    identifier, due, _ = notifications.submissions[0]
+    assert due == task.draft.hard_deadline
+    authority = SimpleNamespace(expires_at=now + timedelta(seconds=30))
+    receipt = scheduler.present(occurrence_ids=[task.occurrence_id], presentation={"sound": False},
+                                reason_code="quiet_break", authority=authority, now=now)
+    assert receipt["status"] == "pending"
+    tasks.flush()
+    queued = delivery.commands[-1]
+    assert not presenter.permit(queued)
+    if result == "near_deadline":
+        clock.advance(26)
+        presenter.observe(snapshot(clock, tasks, **settings))
+        presenter.transfer_early(queued)
+        assert not notifications.removals
+        assert presenter.ledger.rows()[0]["state"] == "scheduled"
+        assert not presenter.permit(queued)
+        return
+    presenter.transfer_early(queued)
+    assert notifications.removals == [identifier]
+    assert not presenter.permit(queued)
+    clock.advance(2)
+    presenter.observe(snapshot(clock, tasks, **settings))
+    row, = presenter.ledger.rows()
+    if result == "unverified":
+        assert row["state"] == "unknown"
+        assert not presenter.permit(queued)
+        assert len(notifications.submissions) == 1
+    else:
+        assert row["state"] == "cancelled"
+        if result == "restart":
+            presenter = presentation()
+            assert notifications.submissions == [(identifier, due, False)] * 2
+            assert not presenter.permit(queued)
+        else:
+            assert presenter.permit(queued)
+            assert presenter.painted([queued]) == [queued]
+            assert presenter.ledger.rows()[0]["state"] == "painted"
+            assert len(notifications.submissions) == 1
+
+
+def test_semantic_system_channel_respects_newer_sound_preference(business):
+    clock, delivery, tasks = business
+    now = clock.wall_now()
+    draft = TaskDraft(content="Private reminder", mode="soft", remind_after=now)
+    assert command(tasks, "create", draft=draft.model_dump(mode="json")).status == "applied"
+    task = command(tasks, "confirm").view
+    preferences = SettingsStore(tasks.path)
+    preferences.update(expected_version=preferences.read().version, allow_system_notifications=True, reminder_sound=True)
+    scheduler = Scheduler(tasks, clock=clock, lock_probe=lambda: None)
+    authority = SimpleNamespace(expires_at=now + timedelta(seconds=30))
+    result = scheduler.present(occurrence_ids=[task.occurrence_id],
+                               presentation={"channel": "os_notification", "sound": True},
+                               reason_code="quiet_system_channel", authority=authority, now=now)
+    assert result["status"] == "pending"
+    tasks.flush()
+    queued = delivery.commands[-1]
+    assert queued.sound == "reminder"
+    notifications = NotificationProbe()
+    presenter = DesktopPresentation(path=tasks.path, notifications=notifications,
+                                    lock_probe=lambda: None, synthetic=True)
+    presenter.ledger.authorize_early = scheduler.authorize_qt
+    presenter.observe(snapshot(clock, tasks, allow_system_notifications=True, reminder_sound=True))
+    preferences.update(expected_version=preferences.read().version, reminder_sound=False)
+    presenter.route_hidden(queued)
+    presenter.route_hidden(queued)
+    assert len(notifications.submissions) == 1
+    assert notifications.submissions[0][1:] == (None, False)
+    assert presenter.ledger.rows()[0]["state"] == "submitted"
+    assert not tasks.get(task.task_id).displayed_at
 
 
 def test_estimated_target_does_not_create_a_hard_fallback(business):

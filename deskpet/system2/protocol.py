@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from sqlite3 import Connection
 from typing import Any
 
 
@@ -50,6 +52,7 @@ class ToolAuthority:
     opportunity_id: str | None = None
     proposal_id: str | None = None
     expected_versions: dict[str, int] = field(default_factory=dict)
+    check_model_policy: Callable[[Connection], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

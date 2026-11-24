@@ -129,7 +129,8 @@ def test_fresh_observation_is_rechecked_at_each_visible_effect(business, monkeyp
         host.close()
 
 
-def test_ready_urgent_reminder_takes_the_shared_slot_before_proposal(business):
+def test_legacy_ready_urgent_reminder_takes_the_shared_slot_before_proposal(business, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     business.auto_adjust()
     ordinary = create_reminder(business, "喝水")
     due = (business.clock.wall_now() + timedelta(minutes=1)).isoformat()
@@ -174,7 +175,8 @@ def test_ready_urgent_reminder_takes_the_shared_slot_before_proposal(business):
 
 
 @pytest.mark.parametrize("permit_taken", [False, True])
-def test_restarted_presenter_preserves_a_slot_when_effect_is_unknown(business, permit_taken):
+def test_legacy_restarted_presenter_preserves_a_slot_when_effect_is_unknown(business, permit_taken, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     first = create_reminder(business, "喝水")
     second = create_reminder(business, "起身走动")
     current = business.publish(71)
@@ -200,7 +202,8 @@ def test_restarted_presenter_preserves_a_slot_when_effect_is_unknown(business, p
     assert next_result.status == ("rejected" if permit_taken else "pending")
 
 
-def test_rechecks_estimated_window_without_changing_absolute_target(business):
+def test_legacy_rechecks_estimated_window_without_changing_absolute_target(business, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     start = business.clock.wall_now()
 
     def at(seconds):
@@ -288,7 +291,8 @@ def test_rechecks_estimated_window_without_changing_absolute_target(business):
     ("15:00整点提醒我喝水", ("remind_after", "remind_by")),
     ("只在今天有空时提醒我喝水", ("expires_at",)),
 ])
-def test_chat_binds_the_users_literal_reminder_times(business, message, fields):
+def test_chat_binds_the_users_literal_reminder_times(business, message, fields, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
     zone = ZoneInfo("Asia/Shanghai")
     today = business.clock.wall_now().astimezone(zone).date()
     due = datetime.combine(today, time(15), tzinfo=zone)
@@ -350,7 +354,7 @@ def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(b
         assert host.pump()
         assert len(business.tasks.list_tasks()) == 1
         created, capability = host.ui_events()
-        assert created.payload["text"] == f"已设置提醒「{title}」。"
+        assert created.payload["text"] == f"已设置提醒「{title}」，{due.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}。"
         assert "可以直接叫我设提醒" in capability.payload["text"]
 
         host.submit_user("1秒后提醒我休息", event_id="elapsed-reminder")
@@ -374,7 +378,8 @@ def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(b
     ("fresh", "available", None, False),
     ("fresh", "available", "break", True),
 ])
-def test_background_pet_presentation_requires_a_current_opportunity(business, status, state, opportunity, allowed):
+def test_legacy_background_pet_presentation_requires_a_current_opportunity(business, status, state, opportunity, allowed, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     grants = describe_grants(None, {
         "eligible_items": [], "enabled_settings": {}, "current_status": status,
         "current": {"state": state}, "opportunity_id": opportunity,
@@ -388,6 +393,7 @@ def test_background_pet_presentation_requires_a_current_opportunity(business, st
     ("五分钟后准时", "exact"),
 ])
 def test_chat_snooze_binds_the_mode_and_durable_user_event_time(business, monkeypatch, message, mode):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
     original_due = business.clock.wall_now() + timedelta(minutes=1)
     item = create_reminder(business, "喝水", remind_after=original_due.isoformat(), remind_by=original_due.isoformat())
     occurrence = item["occurrence"]["id"]
@@ -445,7 +451,8 @@ def test_chat_snooze_binds_the_mode_and_durable_user_event_time(business, monkey
 
 
 @pytest.mark.parametrize("scheduled_before_queue", [False, True])
-def test_keeps_os_owner_at_deadline_across_qt_restart_and_content_edit(business, scheduled_before_queue):
+def test_legacy_keeps_os_owner_at_deadline_across_qt_restart_and_content_edit(business, scheduled_before_queue, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     business.settings.update(expected_version=0, allow_system_notifications=True)
     due = business.clock.wall_now() + timedelta(minutes=2)
     item = create_reminder(business, "准时服药", remind_by=due.isoformat())

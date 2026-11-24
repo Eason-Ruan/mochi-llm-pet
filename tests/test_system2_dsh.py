@@ -20,6 +20,7 @@ from deskpet.observation_v2.routes import (
 )
 from deskpet.settings import SettingsStore
 from deskpet.system2.dsh import DSHEngine, verify_system2_route
+from deskpet.system2.dsh_projection import project_input, project_tool_result
 
 SUMMARY = "SYNTHETIC-PRIVATE-ACTIVITY"
 RECENT = "SYNTHETIC-PRIVATE-RECENT"
@@ -218,6 +219,89 @@ def assert_full_wire(requests, *, share=False):
         assert [tool["function"]["name"] for tool in request["tools"]] == ["context_read"]
 
 
+def test_semantic_projection_preserves_decision_evidence_and_separates_user_intent():
+    at = "2026-11-23T19:14:15+08:00"
+    transition = {"phase_id": "focus-1", "phase_version": 3, "elapsed_at": at,
+                  "successor": {"id": "break-1", "kind": "short_break", "version": 1}}
+    contact = {"kind": "proposal", "delivery_id": "proposal-ui-1", "at": at,
+               "channel": "pet_card", "response": "rejected", "subject_ref": "proposal:1"}
+    context = snapshot() | {
+        "timezone": "Asia/Shanghai", "phase_elapsed": [transition],
+        "recent_contacts": [contact | {"screen_text": FRAME}],
+        "recent_user_actions": [{"subject_ref": "reminder:1", "at": at}],
+        "candidate_items_truncated": True,
+        "last_observed_activity": {"observed_at": at, "summary_observed_at": at,
+                                   "scene_observed_at": at, "summary": SUMMARY, "relation": "previous"},
+    }
+    intent = {"requested_at": at, "timezone": "Asia/Shanghai", "reply_to_proposal_version": 3}
+    payload = {"origin": "user", "semantic_chat": True, "semantic_background": True,
+               "event": {"kinds": ["recheck", "resume"], "trigger_reasons": ["phase_elapsed", "resume"],
+                         "phase_elapsed": [transition]}, "user_intent": intent | {"utterance": "稍后提醒我"},
+               "context": context}
+
+    utterance, projected = project_input(payload, share=True, origin="user")
+    assert utterance == "稍后提醒我" and projected["origin"] == "user"
+    assert projected["user_intent"] == intent
+    assert projected["semantic_chat"] is True and projected["semantic_background"] is True
+    assert projected["event"] == payload["event"]
+    assert projected["context"]["phase_elapsed"] == [transition]
+    assert projected["context"]["recent_contacts"] == [contact]
+    assert projected["context"]["recent_user_actions"] == context["recent_user_actions"]
+    assert projected["context"]["candidate_items_truncated"] is True
+    assert projected["context"]["last_observed_activity"]["summary_observed_at"] == at
+    assert FRAME not in json.dumps(projected)
+
+    utterance, projected = project_input(payload, share=False, origin="background")
+    assert utterance is None and projected["origin"] == "background" and "user_intent" not in projected
+    presentation = {"channel": "pet_card", "delivery_id": "proposal-ui-1", "state": "painted"}
+    receipt = {"status": "applied", "outcome": "shown", "presentation_receipt": presentation, "view": context}
+    wire = project_tool_result("context_read", receipt, share=False)
+    assert wire["outcome"] == "shown" and wire["presentation_receipt"] == presentation
+    assert wire["view"]["recent_contacts"] == [contact]
+    assert wire["view"]["last_observed_activity"]["observed_at"] == at
+    assert "scene_observed_at" not in wire["view"]["last_observed_activity"]
+    assert SUMMARY not in json.dumps(wire)
+
+
+@pytest.mark.parametrize("provider, cloud", [("openai_compatible", True), ("local_ollama", False)])
+def test_semantic_background_session_and_document_scope(tmp_path, monkeypatch, provider, cloud):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1")
+
+    class RuntimeStub:
+        def __init__(self, path, policy, *, session_id, document_sources, private_storage, **_):
+            self.session_id = session_id
+            self.document_sources = document_sources
+            self.storage = private_storage
+
+        def close(self):
+            if self.storage:
+                self.storage.cleanup()
+
+    monkeypatch.setattr("deskpet.system2.dsh._Runtime", RuntimeStub)
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    base_url = "https://example.test/v1" if cloud else "http://127.0.0.1:11434"
+    configured = settings.routes.configure(SYSTEM2, CloudRoute(provider, base_url, "test-model", "Fixture"))
+    if cloud:
+        configured = settings.routes.set_permission(SYSTEM2, True, expected=configured)
+    configured = settings.routes.record_result(configured, probe=True)
+    settings.update(expected_version=settings.read().version,
+                    document_local_sources=("Word", "VS Code"), document_cloud_sources=("Word",))
+    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    try:
+        request = turn()
+        user = engine._select_runtime(request, configured)
+        request.observation_document_query = True
+        document_user = engine._select_runtime(request, configured)
+        request.source = "background"
+        background = engine._select_runtime(request, configured)
+        assert background.session_id not in (user.session_id, document_user.session_id)
+        assert document_user.document_sources == (("app:microsoft-word",) if cloud else ("app:microsoft-word", "app:vscode"))
+        assert background.document_sources == (() if cloud else document_user.document_sources)
+        assert bool(background.storage) is not cloud
+    finally:
+        engine.close()
+
+
 def test_native_projection_tools_metadata_and_restart(tmp_path, endpoints, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "MUST-NOT-LEAK")
     endpoint = endpoints()
@@ -291,8 +375,9 @@ def test_document_name_on_native_wire_before_and_after_source_revocation(tmp_pat
     local_only = "PrivateWorkspace.py"
     endpoint.respond = lambda _: ({"content": RECEIPT}, "stop")
 
-    def ask():
+    def ask(source="user"):
         request = turn("刚才打开的是哪份文档？", tools=())
+        request.source = source
         request.observation_document_query = True
         request.observation_generation = settings.read().observation_generation
         payload = json.loads(request.input_json)
@@ -313,10 +398,37 @@ def test_document_name_on_native_wire_before_and_after_source_revocation(tmp_pat
         first = json.dumps(endpoint.requests[-1], ensure_ascii=False)
         assert shared in first
         assert local_only not in first and "app:microsoft-word" not in first
+        assert ask("background").text == RECEIPT
+        background = json.dumps(endpoint.requests[-1], ensure_ascii=False)
+        assert shared not in background and local_only not in background
+        assert "刚才打开的是哪份文档？" not in background
         settings.update(expected_version=settings.read().version, document_cloud_sources=())
         assert ask().text == RECEIPT
         second = json.dumps(endpoint.requests[-1], ensure_ascii=False)
         assert shared not in second and local_only not in second
+    finally:
+        engine.close()
+
+
+def test_chat_rollback_uses_a_separate_native_session(tmp_path, endpoints, monkeypatch):
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint)
+    private_chat = "SYNTHETIC-SEMANTIC-SESSION-CHAT"
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "1")
+    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    try:
+        semantic = engine.run(turn(private_chat, tools=()), reply)
+        assert private_chat in json.dumps(endpoint.requests[-1])
+    finally:
+        engine.close()
+
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    try:
+        legacy = engine.run(turn("Test legacy chat with a fresh session", tools=()), reply)
+        assert legacy.session_id != semantic.session_id
+        assert private_chat not in json.dumps(endpoint.requests[-1])
     finally:
         engine.close()
 

@@ -49,7 +49,7 @@ def pet(tmp_path):
         tasks.close()
 
 
-def offer(pet):
+def offer(pet, **effect):
     clock, observation, settings, _, scheduler, store = pet
     now = clock.wall_now()
     authority = ToolAuthority(
@@ -61,13 +61,14 @@ def offer(pet):
     with closing(sqlite3.connect(settings.path)) as db, db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN IMMEDIATE")
-        result = store.present(intent="wave", position_hint="screen_edge", sound=True,
-                               authority=authority, now=now, db=db)
+        args = {"intent": "wave", "position_hint": "screen_edge", "sound": True} | effect
+        result = store.present(**args, authority=authority, now=now, db=db)
     assert result["status"] == "pending"
     return result["delivery_id"], authority.opportunity_id
 
 
-def test_motion_and_proposal_share_slot_and_motion_is_consumed_once(pet):
+def test_legacy_motion_shares_slot_and_is_consumed_once(pet, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     clock, _, _, _, scheduler, store = pet
     delivery_id, opportunity_id = offer(pet)
     assert not scheduler.claim_opportunity(opportunity_id=opportunity_id, delivery_id="proposal",
@@ -81,7 +82,8 @@ def test_motion_and_proposal_share_slot_and_motion_is_consumed_once(pet):
 
 
 @pytest.mark.parametrize("invalidate", ["revision", "expiry", "lock", "recipient", "consent"])
-def test_queued_pet_intent_rechecks_live_authority_at_claim(pet, invalidate):
+def test_legacy_queued_pet_intent_rechecks_live_authority_at_claim(pet, invalidate, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     clock, observation, settings, lock, scheduler, store = pet
     if invalidate == "consent":
         route = CloudRoute("openai_compatible", "https://test.example/v1", "test-model", "Test endpoint")
@@ -106,3 +108,23 @@ def test_queued_pet_intent_rechecks_live_authority_at_claim(pet, invalidate):
     if invalidate in {"revision", "consent", "recipient"}:
         assert scheduler.claim_opportunity(opportunity_id=opportunity_id, delivery_id="proposal",
                                           now=clock.wall_now())
+
+
+def test_semantic_pet_bubble_survives_revision_and_observation_expiry(pet):
+    clock, observation, settings, _, scheduler, store = pet
+    delivery_id, _ = offer(pet, intent="idle", position_hint="stay", sound=False, text="休息一下？")
+    observation.cursor += 1
+    observation.current = replace(observation.current, context_revision=72)
+    clock.advance(10)
+    with closing(sqlite3.connect(settings.path)) as db, db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE")
+        assert store.state(delivery_id, "default", db=db) == "queued"
+    assert store.pending(clock.wall_now())[0]["text"] == "休息一下？"
+    assert store.claim(delivery_id, clock.wall_now()) == {
+        "animation": "idle", "position_hint": "stay", "sound": False, "text": "休息一下？",
+    }
+    assert store.receipt(delivery_id, displayed=True, now=clock.wall_now())
+    assert store.claim(delivery_id, clock.wall_now()) is None
+    contact, = scheduler.snapshot(clock.wall_now())["recent_contacts"]
+    assert (contact["delivery_id"], contact["kind"]) == (delivery_id, "pet")

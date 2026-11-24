@@ -171,6 +171,7 @@ def test_document_history_stays_timed_and_separate_from_interruptibility(tmp_pat
         assert [segment["document_name"] for segment in segments] == ["notes-a.py", "notes-b.py"]
         assert segments[0]["first_observed_at"] == at_a.isoformat()
         assert segments[0]["last_observed_at"] == at_dirty.isoformat()
+        assert segments[0]["summary_observed_at"] == at_a.isoformat()
         assert segments[0]["scene_observed_at"] == at_a.isoformat()
         assert segments[0]["visible_changes"] == ["editor view changed"]
         assert segments[0]["change_observed_at"] == at_a.isoformat()
@@ -236,6 +237,8 @@ def test_historical_foreground_keeps_covered_facts_and_shows_short_lock_gap(tmp_
     assert historical["interruptibility"]["current"] is None
     assert historical["last_observed_activity"]["summary"] == "A spreadsheet is open."
     assert historical["last_observed_activity"]["activity_kind"] == "work"
+    assert historical["last_observed_activity"]["summary_observed_at"] == historical["last_observed_activity"]["observed_at"]
+    assert historical["last_observed_activity"]["scene_observed_at"] == historical["last_observed_activity"]["observed_at"]
     view = project_observation_context(reader.read_observation_context(NOW + timedelta(seconds=102)))
     assert view["history_1h"]["gaps"] == [{
         "last_observed_at": (NOW + timedelta(seconds=99)).isoformat(),

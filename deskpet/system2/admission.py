@@ -11,7 +11,9 @@ from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
-from .intent import READ_TOOLS, allows, cancels_start, ref_id
+from deskpet.observation_v2.routes import CloudRouteError
+
+from .intent import READ_TOOLS, allows, cancels_start, literal_start_cancellation, ref_id
 from .protocol import ToolAuthority, UiEvent
 
 
@@ -40,6 +42,9 @@ _SCHEMA = (
         grants TEXT, authority_context TEXT, initial_step_id TEXT, owner TEXT,
         replans INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS s2_queue ON s2_admissions(user_scope, state, sequence)",
+    """CREATE TABLE IF NOT EXISTS s2_revoked_actions(
+        admission_id TEXT NOT NULL, function TEXT NOT NULL, superseded_by TEXT NOT NULL,
+        PRIMARY KEY(admission_id, function))""",
     """CREATE TABLE IF NOT EXISTS s2_steps(
         admission_id TEXT NOT NULL, step_id TEXT NOT NULL,
         intent_generation INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -132,6 +137,14 @@ class AdmissionStore:
                 WHERE user_scope = ? AND state = 'running' AND owner = ?
             """, (self.scope, self.owner))
 
+    def interrupt_background(self, db):
+        """Fence an in-flight background judgment at the observed sleep boundary."""
+        if self._owned(db):
+            db.execute("""
+                UPDATE s2_admissions SET state = 'interrupted', intent_generation = intent_generation + 1
+                WHERE user_scope = ? AND source = 'background' AND state = 'running' AND owner = ?
+            """, (self.scope, self.owner))
+
     def _insert(self, db, admission_id, source, event, user, at, expires, fingerprint, *,
                 supersedes=None, start_intent=False):
         db.execute("""
@@ -164,8 +177,12 @@ class AdmissionStore:
             if prior["fingerprint"] != fingerprint:
                 raise ValueError("A user event ID already refers to a different input")
             return admission_id
-        target = self._target(db, user, explicit_supersedes)
-        if target is not None:
+        semantic = event.get("semantic_chat") is True
+        target = self._target(db, user, explicit_supersedes, semantic=semantic)
+        if target is not None and semantic and not explicit_supersedes:
+            db.execute("INSERT OR IGNORE INTO s2_revoked_actions VALUES (?, 'phase.start', ?)",
+                       (target, admission_id))
+        elif target is not None:
             db.execute("""
                 UPDATE s2_admissions SET state = CASE
                     WHEN state IN ('queued', 'running') THEN 'superseded' ELSE state END,
@@ -176,23 +193,44 @@ class AdmissionStore:
                      supersedes=target, start_intent=start_intent)
         return admission_id
 
-    def _target(self, db, user, explicit):
+    def _target(self, db, user, explicit, *, semantic=False):
         if explicit:
             row = db.execute("""
                 SELECT admission_id FROM s2_admissions
                 WHERE user_scope = ? AND source = 'user' AND admission_id = ?
             """, (self.scope, explicit)).fetchone()
             return row["admission_id"] if row else None
-        if user.get("reply_to_proposal_id") or not user.get("utterance") or not cancels_start(user["utterance"]):
+        cancels = literal_start_cancellation if semantic else cancels_start
+        if user.get("reply_to_proposal_id") or not user.get("utterance") or not cancels(user["utterance"]):
             return None
         rows = db.execute("""
-            SELECT admission_id, user_intent FROM s2_admissions WHERE user_scope = ?
-                AND start_intent = 1 AND source = 'user' AND superseded_by IS NULL
-                AND state IN ('queued', 'running') ORDER BY sequence DESC LIMIT 2
-        """, (self.scope,)).fetchall()
+            SELECT a.admission_id, a.user_intent FROM s2_admissions AS a WHERE a.user_scope = ?
+                AND a.source = 'user' AND a.superseded_by IS NULL AND a.state IN ('queued', 'running')
+                AND (a.start_intent = 1 OR (? AND EXISTS (
+                    SELECT 1 FROM s2_calls AS c WHERE c.admission_id = a.admission_id AND c.function = 'phase.start'
+                )))
+                AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
+                    WHERE r.admission_id = a.admission_id AND r.function = 'phase.start')
+                ORDER BY a.sequence DESC LIMIT 2
+        """, (self.scope, semantic)).fetchall()
         selected = ref_id(user.get("selected_ref"))
         if selected:
             rows = [row for row in rows if ref_id(json.loads(row["user_intent"]).get("selected_ref")) == selected]
+        if not rows and semantic:
+            # A pending conversational turn can choose phase.start even before
+            # its first tool call. Revoke only that function on a unique turn.
+            rows = db.execute("""
+                SELECT a.admission_id, a.user_intent, a.state FROM s2_admissions AS a
+                WHERE a.user_scope = ? AND a.source = 'user' AND a.superseded_by IS NULL
+                    AND a.state IN ('running', 'queued') AND json_extract(a.event, '$.semantic_chat') = 1
+                    AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
+                        WHERE r.admission_id = a.admission_id AND r.function = 'phase.start')
+                ORDER BY a.state = 'running' DESC, a.sequence DESC LIMIT 2
+            """, (self.scope,)).fetchall()
+            if selected:
+                rows = [row for row in rows if ref_id(json.loads(row["user_intent"]).get("selected_ref")) == selected]
+            if rows and rows[0]["state"] == "running":
+                rows = rows[:1]
         return rows[0]["admission_id"] if len(rows) == 1 else None
 
     def supersede_direct(self, function, subject_ref, event_id, *, db=None):
@@ -278,7 +316,8 @@ class AdmissionStore:
                 ORDER BY a.sequence
             """, (self.scope,)))
 
-    def register_call(self, admission, step_id, native_call_id, function, args, now):
+    def register_call(self, admission, step_id, native_call_id, function, args, now, *, validation_error=None,
+                      attempt_target=None):
         fingerprint = stable_id(function, json_text(args))
         command_id = "s2c-" + stable_id(admission.admission_id, native_call_id)
         with self.write() as db:
@@ -295,23 +334,42 @@ class AdmissionStore:
                 return None, _failure(command_id, "SUPERSEDED")
             if now < admission.created_at or admission.expires_at <= now:
                 return None, _failure(command_id, "EXPIRED_REQUEST")
-            if not allows(json.loads(row["grants"] or "{}"), function, args):
-                return None, _failure(command_id, "NOT_AUTHORIZED")
+            revoked = db.execute("SELECT 1 FROM s2_revoked_actions WHERE admission_id = ? AND function = ?",
+                                 (admission.admission_id, function)).fetchone()
+            if revoked:
+                return None, _failure(command_id, "SUPERSEDED")
+            grants = json.loads(row["grants"] or "{}")
+            versions = json.loads(row["authority_context"] or "{}").get("expected_versions", {})
+            semantic = admission.source == "user" and grants.get(function, {}).get("semantic_chat")
+            rejection = None
+            if validation_error is not None and semantic:
+                rejection = _failure(command_id, "INVALID_ARGUMENT") | {"invalid_fields": validation_error}
+            elif not allows(grants, function, args, versions=versions):
+                if not semantic:
+                    return None, _failure(command_id, "NOT_AUTHORIZED")
+                rejection = _failure(command_id, "NOT_AUTHORIZED")
+            if rejection is not None and attempt_target is not None:
+                rejection["_attempt_target"] = attempt_target
             if prior:
                 return None, _failure(command_id, "RESULT_PENDING", status="pending")
-            calls = db.execute("SELECT command_id, function, result FROM s2_calls WHERE admission_id = ? ORDER BY rowid",
-                               (admission.admission_id,)).fetchall()
+            calls = db.execute("""
+                SELECT function, fingerprint, result FROM s2_calls WHERE admission_id = ? ORDER BY rowid
+            """, (admission.admission_id,)).fetchall()
             if len(calls) >= _TOOL_BUDGET:
                 return None, _failure(command_id, "TOOL_BUDGET_EXHAUSTED")
-            repeat = [call for call in calls if call["function"] == function and call["result"]]
+            recoverable = _RECOVERABLE | {"INVALID_ARGUMENT", "NOT_AUTHORIZED"} if semantic else _RECOVERABLE
             if function not in READ_TOOLS:
-                if admission.source == "user" and repeat:
-                    result = json.loads(repeat[-1]["result"])
-                    if result.get("error_code") not in _RECOVERABLE:
-                        return None, result
+                for call in reversed(calls):
+                    if call["function"] != function or not call["result"]:
+                        continue
+                    if not semantic or call["fingerprint"] == fingerprint:
+                        result = json.loads(call["result"])
+                        if admission.source == "user" and result.get("error_code") not in recoverable:
+                            return None, result
+                        break
                 write_results = [json.loads(call["result"]) for call in calls
                                  if call["function"] not in READ_TOOLS and call["result"]]
-                if write_results and write_results[-1].get("error_code") in _RECOVERABLE:
+                if write_results and write_results[-1].get("error_code") in recoverable:
                     if row["replans"] >= _REPLAN_BUDGET:
                         return None, _failure(command_id, "REPLAN_BUDGET_EXHAUSTED")
                     db.execute("UPDATE s2_admissions SET replans = replans + 1 WHERE admission_id = ?",
@@ -320,25 +378,46 @@ class AdmissionStore:
                        (admission.admission_id, step_id, admission.generation, timestamp(now)))
             db.execute("""
                 INSERT INTO s2_calls(
-                    command_id, admission_id, step_id, native_call_id, function, fingerprint, declared_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    command_id, admission_id, step_id, native_call_id, function, fingerprint, declared_reason, result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (command_id, admission.admission_id, step_id, native_call_id, function, fingerprint,
-                  args.get("reason_code") if function == "reminder.present" else None))
-        return command_id, None
+                  args.get("reason_code") if function == "reminder.present" else None,
+                  json_text(rejection) if rejection else None))
+        return (None, rejection) if rejection else (command_id, None)
 
     def save_call_result(self, command_id, result):
         with self.write() as db:
             db.execute("UPDATE s2_calls SET result = ? WHERE command_id = ? AND result IS NULL",
                        (json_text(result), command_id))
 
-    def calls(self, admission_id):
-        with self.connect() as db:
+    def calls(self, admission_id, *, db=None):
+        with (self.connect() if db is None else nullcontext(db)) as db:
             return tuple((row["command_id"], row["function"], row["declared_reason"],
                           json.loads(row["result"]) if row["result"] else None)
                          for row in db.execute("SELECT * FROM s2_calls WHERE admission_id = ? ORDER BY rowid",
                                                (admission_id,)))
 
-    def finish(self, admission, decision, reply, session_id, prompt_version, *, expected_state):
+    def _background_effect_committed(self, db, admission_id):
+        # Business receipts are written in the same transaction as the effect.
+        # An interruption may land after that commit but before s2_calls is saved.
+        durable_receipts = db.execute("""SELECT 1 FROM sqlite_master WHERE type='table'
+            AND name='system2_command_receipts'""").fetchone()
+        for command_id, function, _, recorded in self.calls(admission_id, db=db):
+            if function in READ_TOOLS:
+                continue
+            if durable_receipts:
+                stored = db.execute("""SELECT result FROM system2_command_receipts
+                    WHERE user_scope=? AND command_id=?""", (self.scope, command_id)).fetchone()
+                result = json.loads(stored["result"]) if stored else recorded
+            else:
+                result = recorded
+                if result is None or result["status"] == "timeout":
+                    return True
+            if result and (result.get("original_status") or result["status"]) in {"applied", "accepted", "pending"}:
+                return True
+        return False
+
+    def finish(self, admission, decision, reply, session_id, prompt_version, *, expected_state, recover_wakes=None):
         with self.write() as db:
             if not self._owned(db):
                 return
@@ -350,6 +429,8 @@ class AdmissionStore:
                                   (admission.admission_id, self.scope, decision["as_of"], json_text(decision)))
             if inserted.rowcount != 1:
                 return
+            if recover_wakes is not None and not self._background_effect_committed(db, admission.admission_id):
+                recover_wakes(db)
             if reply is not None:
                 event_id = admission.user_intent["message_id"]
                 db.execute("""
@@ -366,15 +447,15 @@ class AdmissionStore:
                 UPDATE s2_admissions SET state = 'complete' WHERE admission_id = ? AND state = 'running'
             """, (admission.admission_id,))
 
-    def decisions(self, count=12, *, background_only=False):
-        with self.connect() as db:
+    def decisions(self, count=12, *, background_only=False, user_only=False, db=None):
+        with (self.connect() if db is None else nullcontext(db)) as db:
             statement = """
                 SELECT d.record FROM s2_decisions AS d
                 JOIN s2_admissions AS a ON a.admission_id = d.decision_id
-                WHERE d.user_scope = ? AND (? = 0 OR a.source = 'background')
+                WHERE d.user_scope = ? AND (? = 0 OR a.source = 'background') AND (? = 0 OR a.source = 'user')
                 ORDER BY d.rowid DESC LIMIT ?
             """
-            return tuple(json.loads(row["record"]) for row in db.execute(statement, (self.scope, background_only, count)))
+            return tuple(json.loads(row["record"]) for row in db.execute(statement, (self.scope, background_only, user_only, count)))
 
     def ui_events(self):
         with self.connect() as db:
@@ -405,7 +486,9 @@ def authorize_tool(db: sqlite3.Connection, function: str, args: dict, authority:
         JOIN s2_steps AS s ON s.admission_id = a.admission_id AND s.intent_generation = a.intent_generation
         JOIN s2_calls AS c ON c.admission_id = a.admission_id AND c.step_id = s.step_id
         WHERE a.admission_id = ? AND a.user_scope = ? AND s.step_id = ?
-            AND c.command_id = ? AND c.function = ?
+            AND c.command_id = ? AND c.function = ? AND c.result IS NULL
+            AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
+                WHERE r.admission_id = a.admission_id AND r.function = c.function)
     """, (authority.admission_id, authority.user_scope, authority.step_id, authority.call_id, function)).fetchone()
     if row is None:
         return "SUPERSEDED"
@@ -432,4 +515,17 @@ def authorize_tool(db: sqlite3.Connection, function: str, args: dict, authority:
             != expected.get("observation_valid_until")
             or authority.expected_versions != expected.get("expected_versions")):
         return "NOT_AUTHORIZED"
-    return None if allows(json.loads(grants), function, args) else "NOT_AUTHORIZED"
+    grants = json.loads(grants)
+    if grants.get(function, {}).get("semantic_chat") and (
+        source != "user" or "user_message" not in event["trigger_reasons"] or not user.get("utterance")
+    ):
+        return "NOT_AUTHORIZED"
+    if not allows(grants, function, args, versions=expected.get("expected_versions", {})):
+        return "NOT_AUTHORIZED"
+    if authority.check_model_policy is not None:
+        # Route and Observation policy edits serialize against this business write.
+        try:
+            authority.check_model_policy(db)
+        except CloudRouteError:
+            return "MODEL_AUTHORIZATION_CHANGED"
+    return None

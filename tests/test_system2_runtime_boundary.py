@@ -221,7 +221,8 @@ def test_native_read_scope_reply_and_budget_survive_a_host_restart(desktop):
     assert len(desktop.tasks.list_tasks()) == 2
 
 
-def test_context_read_crosses_ttl_without_authorizing_historical_head(desktop):
+def test_context_read_crosses_ttl_without_authorizing_historical_head(desktop, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     desktop.publish(70, "earlier observation")
     desktop.clock.advance(5)
     desktop.publish(71, "current observation", state="available")
@@ -293,9 +294,9 @@ def test_native_chat_amendment_and_restarted_old_button_share_one_phase(desktop)
             assert not host.ui_events()
             script.extend([
                 ("proposal_resolve", {
-                    "id": card["id"], "answer": "accept", "amendments": {"planned_duration_s": 1500},
+                    "id": card["id"], "answer": "accept", "amendments": {"planned_duration_s": 2400},
                 }),
-                "已开始 · 25 分钟",
+                "已开始 · 40 分钟",
             ])
             host.submit_user("改成 40 分钟开始", event_id="amend",
                              reply_to_proposal_id=card["id"], reply_to_proposal_version=card["version"])
@@ -323,6 +324,43 @@ def test_native_chat_amendment_and_restarted_old_button_share_one_phase(desktop)
             restarted.close()
 
 
+@pytest.mark.parametrize("change", ["route_consent", "observation_policy"])
+def test_policy_change_after_model_callback_check_blocks_the_business_write(desktop, monkeypatch, change):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1")
+    desktop.settings.update(expected_version=0, auto_adjust=True)
+    desktop.scheduler.resume()
+    recommendation = {
+        "function": "phase.start", "args": {"planned_duration_s": 900},
+        "display_text": "开始 15 分钟专注吗？",
+    }
+    with model_wire([("proposal_offer", recommendation)]) as (origin, requests):
+        route = desktop.route(origin, share=True)
+        execute = desktop.gateway.execute
+        outcomes = []
+
+        def revoke_then_execute(function, args, authority):
+            assert function == "proposal.offer"
+            if change == "route_consent":
+                desktop.settings.routes.set_permission(SYSTEM2, False, expected=route)
+            else:
+                desktop.settings.update(expected_version=desktop.settings.read().version, observation_paused=True)
+            result = execute(function, args, authority)
+            outcomes.append(result)
+            return result
+
+        monkeypatch.setattr(desktop.gateway, "execute", revoke_then_execute)
+        host = desktop.host()
+        try:
+            assert host.pump()
+            result, = outcomes
+            assert result.error_code == "MODEL_AUTHORIZATION_CHANGED"
+            assert not host.pending_proposals()
+            assert not desktop.gateway.pending_presentations()
+            assert len(requests) == 1
+        finally:
+            host.close()
+
+
 def test_question_shaped_write_claim_is_replaced_with_host_owned_text(desktop):
     class FakeModel:
         def run(self, *_):
@@ -336,7 +374,7 @@ def test_question_shaped_write_claim_is_replaced_with_host_owned_text(desktop):
         host.submit_user("记下整理实验记录", event_id="unacknowledged-write")
         assert host.pump()
         event, = host.ui_events()
-        assert event.payload == {"status": "clarification", "text": "请再说明你要操作的对象或参数。"}
+        assert event.payload == {"status": "failed", "text": "这次没有执行成功。"}
         assert not desktop.tasks.list_tasks()
     finally:
         host.close()

@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 import json
 import math
 import os
@@ -19,6 +20,7 @@ from uuid import uuid4
 
 from .activity import Activity, ActivityRecorder, ActivitySample, ActivityStore, NativeActivitySampler
 from .context import _timestamp
+from .documents import is_mochi_app
 from .media import capture_desktop, recording_frames
 from .realtime import boot_id as system_boot_id, clocks_agree
 from .sampling import ACTIVITY_POLL_S, CaptureSchedule, frame_thumbnail, known_video_source
@@ -113,6 +115,9 @@ class ObservationStore(ActivityStore):
                 "realtime_eligible": "INTEGER NOT NULL DEFAULT 1",
             })
             if live:
+                self._add_columns("effective_observations", {
+                    "foreground_key": "TEXT", "producer_generation": "TEXT", "screen_locked": "INTEGER",
+                })
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS realtime_observation_head (
                         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -330,6 +335,7 @@ class ObservationStore(ActivityStore):
                 deadline = None
                 if monotonic_s is not None:
                     deadline = monotonic_s + (observation.valid_until - published_at).total_seconds()
+                self._record_publication_evidence(cursor.lastrowid)
                 self.connection.execute("""
                     UPDATE realtime_observation_head
                     SET publication_cursor = ?, published_monotonic_s = ?, valid_until_monotonic_s = ?
@@ -338,6 +344,26 @@ class ObservationStore(ActivityStore):
                 if (observation.state in {"working", "away"} and monotonic_s is not None
                         and observation.observed_at <= published_at < observation.valid_until):
                     self._record_live_departure(observation.state)
+
+    def _record_publication_evidence(self, cursor):
+        # Correlate a pending decision with the exact sample it received. Keep
+        # only an opaque local foreground fingerprint and the sampled lock flag.
+        row = self.connection.execute("""
+            SELECT h.generation, h.app_name, h.screen_locked, a.domain, a.document_status
+            FROM realtime_observation_head h LEFT JOIN activities a ON a.activity_id=h.activity_id
+            WHERE h.singleton=1
+        """).fetchone()
+        if row is None:
+            return
+        app = row["app_name"]
+        key = None
+        if (row["screen_locked"] == 0 and app and not is_mochi_app(app)
+                and row["document_status"] != "private_window"):
+            key = sha256(json.dumps([app.casefold(), row["domain"]]).encode()).hexdigest()
+        self.connection.execute("""
+            UPDATE effective_observations SET producer_generation=?, foreground_key=?, screen_locked=?
+            WHERE observation_id=?
+        """, (row["generation"], key, row["screen_locked"], cursor))
 
     def counts(self) -> dict:
         activities = self.connection.execute("SELECT count(*) FROM activities").fetchone()[0]

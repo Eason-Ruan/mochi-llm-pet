@@ -189,3 +189,89 @@ assert receipts == ["first", "second"], receipts
                             env=dict(os.environ, QT_QPA_PLATFORM="offscreen"),
                             capture_output=True, text=True, timeout=12)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_semantic_proposal_and_pet_bubble_take_turns_in_qt(tmp_path):
+    code = r'''
+from dataclasses import replace
+from datetime import timedelta
+import sys
+from time import monotonic
+from types import SimpleNamespace
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QPushButton
+from deskpet.c_ui.refine import RefineSession
+from deskpet.system2.protocol import ToolAuthority
+
+app = QApplication([])
+app.setQuitOnLastWindowClosed(False)
+session = RefineSession(app, SimpleNamespace(profile="realtime", scenario="semantic-presentation",
+    data_dir=sys.argv[1], output=sys.argv[1], synthetic_delivery=True, adapters=None))
+
+def wait(predicate):
+    until = monotonic() + 6
+    while monotonic() < until and not predicate():
+        QTest.qWait(20)
+    assert predicate(), (session.window.errors, session.prompt)
+
+try:
+    wait(lambda: session._system2 and session.snapshot.get("settings"))
+    session.pet._collapse()
+    wait(lambda: not session.pet._expanded and not session.pet._closing_toolbar)
+    settings = session.settings_store
+    settings.update(expected_version=settings.read().version, auto_adjust=True)
+    gateway = session._system2.gateway
+    gateway.authorization = lambda *_args, **_kwargs: None
+    now = gateway.now()
+
+    def authority(call_id, trigger):
+        return ToolAuthority("test-admission", "test-step", call_id, 1, "default", "agent",
+                             trigger, now, now + timedelta(seconds=30))
+
+    proposal_args = {"function": "phase.start", "args": {"planned_duration_s": 900},
+                     "display_text": "开始 15 分钟专注？"}
+    proposed = gateway.execute("proposal.offer", proposal_args, authority("proposal", "test-trigger-one"))
+    hinted = gateway.execute("pet.present", {"intent": "idle", "text": "小猫在这里"},
+                             authority("pet", "test-trigger-two"))
+    assert proposed.outcome == hinted.outcome == "pending_display"
+    wait(lambda: gateway.get_result("proposal").outcome == "shown")
+    assert not session.pet._expanded
+    assert session.prompt.text == proposal_args["display_text"]
+    assert gateway.get_result("pet").outcome == "pending_display"
+    assert session.snapshot.get("active_phase") is None
+    reject = next(button for button in session.pet.bubble.findChildren(QPushButton) if button.text() == "拒绝")
+    reject.click()
+    wait(lambda: gateway.get_result("pet").outcome == "shown")
+    assert session.prompt.text == "小猫在这里"
+    assert session.snapshot.get("active_phase") is None
+    wait(lambda: not gateway.pending_proposals())
+    declined = gateway.execute("proposal.offer", proposal_args, authority("repeat", "test-trigger-three"))
+    assert declined.error_code == "ALREADY_RESOLVED"
+
+    created = gateway.execute_local("item.create", {
+        "type": "reminder", "title": "收衣服", "reminder_rule": {"remind_after": now.isoformat()},
+    }, event_id="badge-item")
+    occurrence = created.view["occurrence"]
+    badge_authority = replace(authority("badge", "test-trigger-four"),
+                              expected_versions={f"occurrence:{occurrence['id']}": occurrence["version"]})
+    badge = gateway.execute("reminder.present", {
+        "occurrence_ids": [occurrence["id"]], "presentation": {"channel": "pet_badge", "sound": False},
+        "reason_code": "take_a_quiet_look",
+    }, badge_authority)
+    assert badge.outcome == "pending_display"
+    wait(lambda: bool(session._reminder_pending))
+    assert not session.pet._badge._attention
+    assert gateway.get_result("badge").outcome == "pending_display"
+    session.pet._open_toolbar()
+    wait(lambda: gateway.get_result("badge").outcome == "shown")
+    assert session.pet._badge._attention == {badge.delivery_id}
+    assert session.prompt.text == "小猫在这里"
+    assert gateway.get_result("badge").presentation_receipt["channel"] == "pet_badge"
+finally:
+    session.quit()
+    wait(lambda: not session.window.thread.isRunning())
+'''
+    result = subprocess.run([sys.executable, "-c", code, str(tmp_path)], cwd=ROOT,
+                            env=dict(os.environ, QT_QPA_PLATFORM="offscreen", MOCHI_SYSTEM2_SEMANTIC_BACKGROUND="1"),
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr

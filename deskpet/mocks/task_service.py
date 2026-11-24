@@ -654,6 +654,7 @@ class MemoryTaskService:
                     attempt.command = attempt.command.model_copy(update={
                         "reason": "deadline_fallback", "context_revision": None, "context_valid_until": None,
                         "expires_at": self._lease_end(view, now), "sound": "reminder",
+                        "channel": "pet_card", "position_hint": None, "animation": None,
                     })
                     self._dispatch(attempt)
                     continue
@@ -684,12 +685,10 @@ class MemoryTaskService:
                 elif attempt.status == "failed" and elapsed >= self.retry_interval_s:
                     self._dispatch(attempt)
                 continue
-            if view.draft.opens_at is not None and now < view.draft.opens_at:
+            if deadline is not None and now >= deadline:
+                self._ensure_delivery(view, "hard_due" if view.draft.mode == "hard" else "deadline_fallback")
+            elif view.draft.opens_at is not None and now < view.draft.opens_at:
                 continue
-            if view.draft.mode == "hard":
-                self._ensure_delivery(view, "hard_due")
-            elif deadline is not None and now >= deadline:
-                self._ensure_delivery(view, "deadline_fallback")
             elif (self.auto_opportunity and self._available()
                   and (view.draft.window_close_at is None or now < view.draft.window_close_at)
                   and (not self.enforce_opportunities or self.claim_opportunity(self._delivery_id(view)) is not None)):

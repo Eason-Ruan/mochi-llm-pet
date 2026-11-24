@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Union
 
-from pydantic import AwareDatetime, Field, StrictBool, StrictFloat, StrictInt, create_model
+from pydantic import AwareDatetime, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, create_model
 
 from deskpet.contracts.models import Model
 from deskpet.settings import HabitBehavior
@@ -14,6 +14,14 @@ Identifier = Annotated[str, Field(min_length=1, max_length=500)]
 Version = Annotated[StrictInt, Field(ge=0)]
 Duration = Annotated[StrictFloat, Field(gt=0, le=86400)]
 Seconds = Annotated[StrictFloat, Field(ge=0, le=86400)]
+RelativeSeconds = Annotated[StrictFloat, Field(ge=0, le=366 * 86400)]
+RELATIVE_TIME_FIELDS = {
+    "due_offset_s": "due_at",
+    "remind_after_offset_s": "remind_after",
+    "target_offset_s": "target_at",
+    "remind_by_offset_s": "remind_by",
+    "expires_offset_s": "expires_at",
+}
 Scope = Literal["default", "habit", "current"]
 PhaseKind = Literal["focus", "short_break", "long_break"]
 Status = Literal["created", "in_progress", "paused", "completed", "cancelled", "finished", "expired", "postponing"]
@@ -43,6 +51,10 @@ class ReminderRuleInput(Model):
     window_close_at: AwareDatetime | None = None
     urgency_until: AwareDatetime | None = None
     urgency_reason: str | None = None
+    remind_after_offset_s: RelativeSeconds | None = None
+    target_offset_s: RelativeSeconds | None = None
+    remind_by_offset_s: RelativeSeconds | None = None
+    expires_offset_s: RelativeSeconds | None = None
 
 
 class ItemFilter(Model):
@@ -56,7 +68,25 @@ class ItemPatch(Model):
     title: Identifier | None = None
     description: str | None = None
     due_at: AwareDatetime | None = None
+    due_offset_s: RelativeSeconds | None = None
     reminder_rule: ReminderRuleInput | None = None
+
+
+class ProposalPresentation(Model):
+    channel: Literal["pet_card", "pet_badge"] = "pet_card"
+
+
+class ProposalAmendments(Model):
+    planned_duration_s: Duration | None = None
+    total_s: Duration | None = None
+    add_s: Duration | None = None
+    title: Identifier | None = None
+    description: Annotated[str, Field(max_length=4000)] | None = None
+    due_at: AwareDatetime | None = None
+    due_offset_s: RelativeSeconds | None = None
+    reminder_rule: ReminderRuleInput | None = None
+    rule: ReminderRuleInput | None = None
+    patch: ItemPatch | None = None
 
 
 class HabitPatch(Model):
@@ -109,6 +139,7 @@ _register("item.list", "List reminders or issues.", filter=(ItemFilter | None, N
 _register("item.create", "Create a reminder or issue. An issue deadline does not create a notification.",
           type=(Literal["reminder", "issue"], ...), title=(Identifier, ...),
           description=(str | None, None), due_at=(AwareDatetime | None, None),
+          due_offset_s=(RelativeSeconds | None, None),
           reminder_rule=(ReminderRuleInput | None, None), **VersionFields)
 _register("item.update", "Change the specified fields on an item. Omit unchanged timing fields.",
           patch=(ItemPatch, ...), **IdentifiedWrite)
@@ -131,15 +162,16 @@ _register("reminder.recheck", "Recheck an occurrence later or estimate its soft 
           on_next_fresh=(StrictBool, False), window_open_at=(AwareDatetime | None, None),
           window_close_at=(AwareDatetime | None, None), **VersionFields)
 _register("observation.wait_fresh", "Request one wake for the next fresh Observation.",
-          purpose=(Literal["focus_suggestion", "reminder_recheck"], ...),
+          purpose=(Literal["focus_suggestion", "reminder_recheck", "pet_presentation"], ...),
+          changes=(Annotated[list[Literal["activity_state", "activity_context", "lock_state"]],
+                             Field(min_length=1, max_length=3)] | None, None),
           after_cursor=(Version, ...), valid_until=(AwareDatetime, ...),
           occurrence_id=(Identifier | None, None), **VersionFields)
 
-_register("proposal.offer", "Ask the user before making an inferred domain change.",
-          function=(Identifier, ...), args=(dict, ...), subject_refs=(list[Identifier], []),
-          display_text=(Identifier, ...))
+_register("decision.recheck", "Review a focus suggestion or desktop pet hint at a later time.",
+          purpose=(Literal["focus_suggestion", "pet_presentation"], ...), recheck_at=(AwareDatetime, ...))
 _register("proposal.resolve", "Accept, decline, or cancel the proposal answered by the user.",
-          answer=(Literal["accept", "reject", "cancel"], ...), amendments=(dict | None, None),
+          answer=(Literal["accept", "reject", "cancel"], ...), amendments=(ProposalAmendments | None, None),
           **IdentifiedWrite)
 _register("phase.get", "Read a phase by ID, or read the current phase if omitted.", id=(Identifier | None, None))
 _register("phase.start", "Start a focus or break phase. A blank focus title uses 专注.",
@@ -183,10 +215,33 @@ _register("settings.update", "Change default preferences, a named habit, or the 
           scope=(Scope, ...), id=(Identifier | None, None),
           patch=(SettingsPatch | HabitPatch | AdjustInput, ...), **VersionFields)
 _register("pet.present", "Request a temporary desktop pet presentation.",
-          intent=(Identifier, ...), position_hint=(Literal["stay", "home", "screen_edge"] | None, None),
+          intent=(Identifier, ...), text=(Annotated[str, Field(min_length=1, max_length=200)] | None, None),
+          position_hint=(Literal["stay", "home", "screen_edge"] | None, None),
           animation=(Literal["idle", "look_up", "wave", "approach"] | None, None), sound=(StrictBool | None, None))
 _register("command.get_result", "Look up a previous command receipt before attempting a fresh command.",
           command_id=(Identifier, ...))
+
+PROPOSABLE_ACTIONS = (
+    "phase.start", "phase.pause", "phase.resume", "phase.adjust", "phase.set_links", "phase.end",
+    "item.create", "item.update", "item.set_status", "item.archive", "reminder.configure",
+    "habit.create", "habit.update", "habit.archive", "settings.update",
+)
+
+# Preserve the tool's function/args contract and publish the specific argument schema
+# for each action. Validate the same variant before persisting a proposal.
+_proposal_variants = tuple(create_model(
+    name.replace(".", "_") + "_proposal", __base__=Model,
+    function=(Literal[name, name.replace(".", "_")], ...), args=(_MODELS[name], ...),
+    subject_refs=(list[Identifier], []), display_text=(Identifier, ...),
+    presentation=(ProposalPresentation | None, None),
+) for name in PROPOSABLE_ACTIONS)
+_proposal_adapter = TypeAdapter(Annotated[
+    Union[_proposal_variants], Field(discriminator="function"),
+])
+_DEFINITIONS.append(ToolDefinition(
+    "proposal_offer", "proposal.offer", "Ask the user before making an inferred domain change.",
+    {"type": "object", **_proposal_adapter.json_schema()},
+))
 
 tool_definitions = tuple(_DEFINITIONS)
 _WIRE_NAMES = {definition.name: definition.canonical_name for definition in tool_definitions}
@@ -198,5 +253,17 @@ def canonical_tool_name(name):
     return _WIRE_NAMES.get(name, name)
 
 
-def validate_tool_args(name, args):
-    return _MODELS[name].model_validate(args).model_dump(mode="json", exclude_unset=True)
+def validate_tool_args(name, args, *, relative_time=False):
+    if name == "proposal.offer":
+        model = _proposal_adapter.validate_python(args)
+    else:
+        model = _MODELS[name].model_validate(args)
+    result = model.model_dump(mode="json", exclude_unset=True)
+    if not relative_time and _has_time_offsets(result):
+        raise ValueError("relative times require a trusted user message timestamp")
+    return result
+
+
+def _has_time_offsets(args):
+    return any(key in RELATIVE_TIME_FIELDS or isinstance(value, dict) and _has_time_offsets(value)
+               for key, value in args.items())

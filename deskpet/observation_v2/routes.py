@@ -298,8 +298,10 @@ class ObservationCloudSettings:
             self.check(expected, probe=probe)
             yield
 
-    def check(self, expected: CloudRouteSnapshot, *, probe: bool = False) -> None:
-        self._require_send(self.snapshot(expected.role), expected, probe=probe)
+    def check(self, expected: CloudRouteSnapshot, *, probe: bool = False,
+              db: sqlite3.Connection | None = None) -> None:
+        current = self.snapshot(expected.role) if db is None else self._get(db, expected.role)
+        self._require_send(current, expected, probe=probe)
 
     def _require_send(
         self, current: CloudRouteSnapshot, expected: CloudRouteSnapshot, *, probe: bool,

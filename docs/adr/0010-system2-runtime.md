@@ -1,5 +1,7 @@
 # 0010 · Mochi System 2 的思考与执行
 
+聊天和后台的最新决策边界见 [ADR 0012](0012-system2-semantic-decisions-proposal.md)。
+
 日常桌宠、命令和定时唤醒通过同一套业务服务访问事项、提醒和工作段。DSH 负责一次推理需要哪些工具调用，Mochi 保存业务事实、校验授权并实际执行。相关产品决策见 [System 2 v1.2](https://app.notion.com/p/421eb246ea0681e2a730fa9b940babf8) 和[打扰机会、Observation 与 UI 的补充 ADR](https://app.notion.com/p/421eb246ea0681c398f4ec863dcb69e2)。
 
 ```mermaid

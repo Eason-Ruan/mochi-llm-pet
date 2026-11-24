@@ -8,6 +8,9 @@ import unicodedata
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .semantic_policy import semantic_background_enabled, semantic_background_grants
+from .tool_schema import PROPOSABLE_ACTIONS, RELATIVE_TIME_FIELDS, canonical_tool_name
+
 
 READ_TOOLS = frozenset({
     "context.read", "item.get", "item.list", "phase.get", "habit.get", "habit.list",
@@ -19,11 +22,23 @@ _IDENTIFIED_ACTIONS = {
     "item.update", "item.set_status", "item.archive", "reminder.configure",
     "reminder.snooze", "reminder.ack", "habit.update", "habit.archive", "proposal.resolve",
 }
+_CHAT_ACTIONS = frozenset(PROPOSABLE_ACTIONS) | _IDENTIFIED_ACTIONS | {"proposal.offer"}
+_CLEAR_READ_ONLY = re.compile(
+    r"(?:目前|现在)是什么状态[，,]\s*还剩多久[?。 ]*"
+    r"|(?:请)?(?:查看|看看|查询)(?:这条|这个|这项)(?:事项|任务|提醒)的?(?:概要|摘要|详情)[?。 ]*"
+    r"|(?:我)?(?:目前|现在)(?:有什么需要注意|需要注意什么)[?。 ]*"
+)
+_QUOTED_TEXT = re.compile(r"(?:「[^」]+」|『[^』]+』|“[^”]+”|《[^》]+》|\"[^\"]+\")[。?！! ]*", re.S)
+_PROTECTED_PHASE_FIELDS = {
+    "previous_phase_id", "expected_previous_version", "habit_run_id", "expected_habit_run_version",
+}
 _CANCEL_START = re.compile(
     r"^(?:算了[，,、\s]*)?(?:别|不要|先别|不用|取消)\s*(?:再)?(?:开始|启动|开启|开)(?:[了吧。.!！\s]|专注|番茄|钟|计时|$)"
     r"|^(?:never\s+mind[,.\s]*)?(?:don't|do not|cancel)\s+(?:the\s+)?start\b", re.I,
 )
 _DELAY_ZH = r"(?:[0-9０-９]+(?:[.．][0-9０-９]+)?|[零一二两三四五六七八九十百]+)\s*(?:分钟|小时|秒|分)"
+_LITERAL_REMINDER_ACTIONS = {"喝水", "起身", "休息", "去上厕所"}
+_QUOTED_REMINDER_TITLE = re.compile(r"(?:「([^」]+)」|“([^”]+)”|\"([^\"]+)\")")
 _RELATIVE_REMINDER = re.compile(
     r"^(?:(?:请(?:你|帮我)?|帮我)\s*)?"
     rf"(?P<delay>过\s*{_DELAY_ZH}(?:\s*(?:之后|以后|后))?|{_DELAY_ZH}\s*(?:之后|以后|后))"
@@ -55,6 +70,16 @@ def ref_kind(value: object) -> str | None:
 
 def cancels_start(utterance: str) -> bool:
     return bool(_CANCEL_START.search(normalized(utterance)))
+
+
+def literal_start_cancellation(utterance: str) -> bool:
+    text = normalized(utterance)
+    text = re.sub(r"^(?:算了|never mind)[,、 ]+", "", text)
+    clause = re.split(r"[,、;。]", text, maxsplit=1)[0]
+    return bool(re.fullmatch(
+        r"(?:别|不要|先别|不用|取消)\s*(?:再)?(?:开始|启动|开启|开)\s*(?:专注|番茄钟|番茄|钟|计时)?(?:了|吧|了吧)?[!. ]*"
+        r"|(?:don't|do not|cancel)\s+(?:the\s+)?start[!. ]*", clause,
+    ))
 
 
 def without_cancellation(utterance: str) -> str:
@@ -220,6 +245,8 @@ def _settings_grant(text: str, selected_ref: str | None, context: dict) -> dict 
 
 def describe_grants(user: dict | None, context: dict, *, requested_at: datetime) -> dict[str, dict]:
     if user is None:
+        if semantic_background_enabled():
+            return semantic_background_grants(context)
         eligible = [ref_id(item["occurrence_id"]) for item in context["eligible_items"] if item.get("occurrence_id")]
         rechecks = [ref_id(item["occurrence_id"]) for item in context.get("recheck_items", ()) if item.get("occurrence_id")]
         reviewable = list(dict.fromkeys(eligible + rechecks))
@@ -518,6 +545,120 @@ def bind_tool_args(grants: dict[str, dict], function: str, args: dict) -> dict:
     return args
 
 
+def chat_grants(user: dict, context: dict) -> dict[str, dict]:
+    """Offer domain capabilities to this message, with local candidate identities."""
+    if user.get("proposal_button"):
+        return describe_grants(user, context, requested_at=datetime.fromisoformat(context["as_of"]))
+    text = normalized(user["utterance"])
+    if _CLEAR_READ_ONLY.fullmatch(text) or _QUOTED_TEXT.fullmatch(text):
+        return {}
+    issues = [item["id"] for item in context["items"] if item.get("type") == "issue"]
+    grants = {name: {"semantic_chat": True} for name in _CHAT_ACTIONS}
+    for name in ("phase.start", "phase.set_links", "phase.reassign_interval", "proposal.offer"):
+        grants[name]["issues"] = issues
+    if proposal_id := user.get("reply_to_proposal_id"):
+        grants["proposal.resolve"]["target"] = proposal_id
+        grants["proposal.resolve"]["proposal_version"] = user.get("reply_to_proposal_version")
+    return grants
+
+
+def literal_chat_reminder(utterance: str, requested_at: datetime, timezone: str) -> dict | None:
+    match = _RELATIVE_REMINDER.fullmatch(utterance.strip())
+    if not match or not (delay := _seconds(normalized(match["delay"]))):
+        return None
+    title = match["title"].strip()
+    if title not in _LITERAL_REMINDER_ACTIONS:
+        quoted = _QUOTED_REMINDER_TITLE.fullmatch(title)
+        if quoted is None:
+            return None
+        title = next(part.strip() for part in quoted.groups() if part is not None)
+        if not title:
+            return None
+    at = (requested_at.astimezone(UTC) + timedelta(seconds=delay)).isoformat()
+    return {"type": "reminder", "title": title,
+            "reminder_rule": {"remind_after": at, "remind_by": at, "timezone": timezone}}
+
+
+def materialize_chat_times(function: str, args: dict, requested_at: datetime, timezone: str) -> dict:
+    """Resolve elapsed durations from the captured message instant, including across DST."""
+    if function == "proposal.offer":
+        action = canonical_tool_name(args["function"])
+        return {**args, "args": materialize_chat_times(action, args["args"], requested_at, timezone)}
+
+    def resolve(values, *, rule=False):
+        values = dict(values)
+        for offset, field in RELATIVE_TIME_FIELDS.items():
+            if offset not in values:
+                continue
+            delta = values.pop(offset)
+            if values.get(field) is not None or delta is None:
+                raise ValueError(f"provide exactly one of {offset} and {field}")
+            values[field] = (requested_at.astimezone(UTC) + timedelta(seconds=delta)).isoformat()
+        for key in ("patch", "reminder_rule", "rule", "amendments"):
+            if isinstance(values.get(key), dict):
+                values[key] = resolve(values[key], rule=key in {"reminder_rule", "rule"})
+        if rule:
+            if provided_zone := values.get("timezone"):
+                try:
+                    ZoneInfo(provided_zone)
+                except (ValueError, ZoneInfoNotFoundError):
+                    raise ValueError("invalid reminder timezone") from None
+        return values
+
+    result = resolve(args)
+    if (function == "item.create" and result.get("type") == "reminder"
+            and not any((result.get("reminder_rule") or {}).get(key) for key in (
+                "remind_after", "remind_by", "target_at", "expires_at",
+            ))):
+        raise ValueError("a new reminder needs a requested time")
+    if function == "item.create" and (rule := result.get("reminder_rule")):
+        rule.setdefault("timezone", timezone)
+    return result
+
+
+def _allows_chat(binding, function, args, versions):
+    def known(kind, value):
+        return isinstance(value, str) and f"{kind}:{value}" in versions
+
+    if function in {"item.update", "item.set_status", "item.archive"}:
+        return known("item", args.get("id"))
+    if function == "reminder.configure":
+        return known("item", args.get("item_id"))
+    if function in {"reminder.snooze", "reminder.ack"}:
+        return known("occurrence", args.get("occurrence_id"))
+    if function in {"habit.update", "habit.archive"}:
+        return known("habit", args.get("id"))
+    if function == "settings.update":
+        scope, target = args["scope"], args.get("id")
+        if scope == "default":
+            return target is None and known("settings", "default")
+        return known("phase" if scope == "current" else "habit", target)
+    if function == "proposal.resolve":
+        target = args.get("id")
+        return (known("proposal", target) and binding.get("target", target) == target
+                and (binding.get("proposal_version") is None
+                     or args.get("expected_version", versions[f"proposal:{target}"]) == binding["proposal_version"]))
+    if function == "proposal.offer":
+        name = canonical_tool_name(args["function"])
+        return name in PROPOSABLE_ACTIONS and _allows_chat(binding, name, args["args"], versions)
+    if function.startswith("phase."):
+        if function != "phase.start" and (target := args.get("id")) and not known("phase", target):
+            return False
+        if function in {"phase.credit_sleep", "phase.credit_recovery"}:
+            return known("recovery", args.get("interval_id") or args.get("recovery_interval_id"))
+        if function == "phase.reassign_interval" and not known("interval", args.get("interval_id")):
+            return False
+        if any(args.get(field) is not None for field in _PROTECTED_PHASE_FIELDS):
+            return False
+        if args.get("habit_id") and not known("habit", args["habit_id"]):
+            return False
+        links = set(args.get("issue_links") or ()) | {
+            args[field] for field in ("primary_issue_id", "target_issue_id") if args.get(field)
+        }
+        return links.issubset(binding.get("issues", ()))
+    return function in {"habit.create", "item.create"}
+
+
 def _same_time(value, expected) -> bool:
     try:
         return datetime.fromisoformat(value) == datetime.fromisoformat(expected)
@@ -525,12 +666,39 @@ def _same_time(value, expected) -> bool:
         return False
 
 
-def allows(grants: dict[str, dict], function: str, args: dict) -> bool:
+def allows(grants: dict[str, dict], function: str, args: dict, *, versions=None) -> bool:
     if function in READ_TOOLS:
         return True
     if function not in grants:
         return False
     binding = grants[function]
+    if binding.get("semantic_chat"):
+        return _allows_chat(binding, function, args, versions or {})
+    if binding.get("semantic_background"):
+        if function == "decision.recheck":
+            return args.get("purpose") in binding.get("purposes", ())
+        if function == "observation.wait_fresh":
+            if args.get("purpose") not in binding.get("purposes", ()):
+                return False
+            occurrence = args.get("occurrence_id")
+            return (ref_id(occurrence) in binding.get("occurrences", ()) if args["purpose"] == "reminder_recheck"
+                    else occurrence is None)
+        if function == "proposal.offer":
+            offered = canonical_tool_name(args.get("function"))
+            if offered not in binding.get("functions", ()):
+                return False
+            if offered == "phase.start":
+                payload = args.get("args")
+                if not isinstance(payload, dict) or any(payload.get(key) for key in (
+                        "habit_id", "primary_issue_id", "issue_links", "habit_run_id")):
+                    return False
+                previous_id, previous_version = payload.get("previous_phase_id"), payload.get("expected_previous_version")
+                if previous_id is None and previous_version is None:
+                    return True
+                predecessor = binding.get("predecessor") or {}
+                return (previous_id is not None and ref_id(previous_id) == ref_id(predecessor.get("id"))
+                        and type(previous_version) is int and previous_version == predecessor.get("version")
+                        and (payload.get("kind", "focus") == "focus") != (predecessor.get("kind") == "focus"))
     if any(args.get(key) != value for key, value in binding.get("equal", {}).items()
            if key != "amendments" or value):
         return False
@@ -624,12 +792,13 @@ def allows(grants: dict[str, dict], function: str, args: dict) -> bool:
             return ref_id(occurrence) in binding["occurrences"]
         return function == "observation.wait_fresh" and binding.get("focus") and args.get("purpose") == "focus_suggestion"
     if function == "proposal.offer":
-        name, payload = args.get("function"), args.get("args")
+        name, payload = canonical_tool_name(args.get("function")), args.get("args")
         if not isinstance(payload, dict):
             return False
         if binding.get("background"):
             if name == "phase.start":
                 return not any(payload.get(key) for key in ("habit_id", "primary_issue_id", "issue_links", "previous_phase_id", "habit_run_id"))
-            return name in {"phase.pause", "phase.resume", "phase.adjust"} and bool(binding["target"]) and ref_id(payload.get("id")) == binding["target"]
+            targets = binding.get("functions", {"phase.pause", "phase.resume", "phase.adjust"})
+            return name in targets and bool(binding["target"]) and ref_id(payload.get("id")) == binding["target"]
         return name == binding.get("action") and (not binding.get("target") or ref_id(payload.get("id")) == binding["target"])
     return True

@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import secrets
+import sqlite3
 from threading import Event, Thread
 
 import httpcore
@@ -50,15 +51,15 @@ class SendPolicy:
     routes: ObservationCloudSettings
     snapshot: CloudRouteSnapshot
     probe: bool = False
-    is_observation_current: Callable[[], bool] | None = None
+    is_observation_current: Callable[[sqlite3.Connection | None], bool] | None = None
 
-    def _check_observation(self) -> None:
-        if self.is_observation_current is not None and not self.is_observation_current():
+    def _check_observation(self, db: sqlite3.Connection | None = None) -> None:
+        if self.is_observation_current is not None and not self.is_observation_current(db):
             raise CloudRouteError("System 2 activity authorization changed")
 
-    def check(self) -> None:
-        self.routes.check(self.snapshot, probe=self.probe)
-        self._check_observation()
+    def check(self, db: sqlite3.Connection | None = None) -> None:
+        self.routes.check(self.snapshot, probe=self.probe, db=db)
+        self._check_observation(db)
 
     @contextmanager
     def admit(self):

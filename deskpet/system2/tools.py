@@ -12,13 +12,15 @@ from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from deskpet.contracts import ErrorCode
+from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import HabitBehavior, SettingsConflict
 from deskpet.work_sessions.models import PhaseCommand, PhaseResult, PhaseView
 
 from . import proposals
 from .protocol import ToolAuthority
+from .semantic_policy import semantic_background_enabled
 from .tool_schema import (
-    HabitPatch, READ_TOOLS, SettingsPatch, canonical_tool_name, tool_definitions, validate_tool_args,
+    HabitPatch, PROPOSABLE_ACTIONS, READ_TOOLS, SettingsPatch, canonical_tool_name, tool_definitions, validate_tool_args,
 )
 
 _MESSAGES = {
@@ -32,6 +34,7 @@ _MESSAGES = {
     "NEEDS_CONFIRMATION": "这项操作需要你确认。",
     "ALREADY_RESOLVED": "这张确认卡已处理。",
     "SUPERSEDED": "已由你更新的指令替代。",
+    "MODEL_AUTHORIZATION_CHANGED": "模型授权已变更，这次操作没有执行。",
     "DISABLED": "此功能已关闭。",
     "UNSUPPORTED_CHANNEL": "当前无法使用这个展示渠道。",
 }
@@ -43,13 +46,9 @@ _APPLIED = {
     "phase.adjust": "已调整时长。", "phase.end": "已结束。", "phase.skip_break": "已跳过休息。",
 }
 _BACKGROUND_WRITES = frozenset({
-    "proposal.offer", "reminder.present", "reminder.recheck", "observation.wait_fresh", "pet.present",
+    "proposal.offer", "reminder.present", "reminder.recheck", "observation.wait_fresh", "pet.present", "decision.recheck",
 })
-_PROPOSABLE = frozenset({
-    "phase.start", "phase.pause", "phase.resume", "phase.adjust", "phase.set_links", "phase.end",
-    "item.create", "item.update", "item.set_status", "item.archive", "reminder.configure",
-    "habit.create", "habit.update", "habit.archive", "settings.update",
-})
+_PROPOSABLE = frozenset(PROPOSABLE_ACTIONS)
 _AMENDABLE = {
     "phase.start": {"planned_duration_s", "title", "description"},
     "phase.adjust": {"total_s", "add_s"},
@@ -73,6 +72,10 @@ class ToolResult:
     retry_at: str | None = None
     message: str | None = None
     view: Any = None
+    outcome: str | None = None
+    retryable: bool | None = None
+    presentation_receipt: dict | None = None
+    resolved_function: str | None = None
 
     def to_dict(self):
         return {field: getattr(self, field) for field in self.__slots__ if getattr(self, field) is not None}
@@ -104,7 +107,8 @@ def _error_code(code):
 def _rejected(call_id, code, **fields):
     code = _error_code(code)
     return ToolResult(call_id, "rejected", error_code=code,
-                      message=_MESSAGES.get(code, "这次操作未完成。"), **fields)
+                      message=_MESSAGES.get(code, "这次操作未完成。"), outcome="rejected",
+                      retryable=code in {"STALE_CONTEXT", "STALE_TASK", "BUSY"}, **fields)
 
 
 def _model_view(model):
@@ -127,6 +131,7 @@ class System2ToolExecutor:
         self.items = items
         self.phases = phases
         self.settings = settings
+        self.routes = settings.routes
         self.scheduler = scheduler
         self.pet = pet
         self.context_reader = context_reader
@@ -160,7 +165,7 @@ class System2ToolExecutor:
 
     def _receipt(self, db, scope, command_id):
         return db.execute(
-            "SELECT fingerprint, result FROM system2_command_receipts WHERE user_scope=? AND command_id=?",
+            "SELECT fingerprint, result, function FROM system2_command_receipts WHERE user_scope=? AND command_id=?",
             (scope, command_id),
         ).fetchone()
 
@@ -175,7 +180,40 @@ class System2ToolExecutor:
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
             row = self._receipt(db, scope, command_id)
-        return ToolResult(**json.loads(row["result"])) if row else None
+            return self._receipt_with_presentation(db, scope, row) if row else None
+
+    def _receipt_with_presentation(self, db, scope, row):
+        result = ToolResult(**json.loads(row["result"]))
+        if not result.delivery_id:
+            return result
+        channel = None
+        state = None
+        if row["function"] == "proposal.offer":
+            delivery = proposals.delivery(db, scope, result.delivery_id)
+            if delivery:
+                channel, state = delivery["channel"], delivery["state"]
+        elif row["function"] == "pet.present" and self.pet is not None:
+            state = self.pet.state(result.delivery_id, scope, db=db)
+            channel = "qt"
+        elif row["function"] == "reminder.present":
+            delivery = db.execute("SELECT channel,state,reason FROM presentations WHERE delivery_id=?",
+                                  (result.delivery_id,)).fetchone()
+            if delivery:
+                channel, state = delivery["channel"], delivery["state"]
+            else:
+                authority = db.execute("SELECT state FROM system2_reminder_authority WHERE delivery_id=? AND user_scope=?",
+                                       (result.delivery_id, scope)).fetchone()
+                if authority and authority["state"] == "revoked":
+                    state = "revoked"
+        if state is None:
+            return result
+        outcome = {
+            "displayed": "shown", "painted": "shown", "badge_shown": "shown", "delivered": "shown",
+            "revoked": "rejected", "cancelled": "rejected", "failed": "failed",
+            "unavailable": "failed", "unknown": "deferred", "sound_requested": "deferred",
+        }.get(state, "pending_display")
+        return replace(result, outcome=outcome, retryable=state in {"failed", "released", "unavailable"},
+                       presentation_receipt={"delivery_id": result.delivery_id, "channel": channel, "state": state})
 
     def execute(self, function, args, authority):
         return self._admit(function, args, authority, local=False)
@@ -242,7 +280,7 @@ class System2ToolExecutor:
                 if previous:
                     if previous["fingerprint"] != fingerprint:
                         return _rejected(call_id, "INVALID_ARGUMENT")
-                    result = ToolResult(**json.loads(previous["result"]))
+                    result = self._receipt_with_presentation(db, authority.user_scope, previous)
                     return replace(result, status="duplicate", original_status=result.original_status or result.status)
             now = self.now()
             if not local:
@@ -260,6 +298,12 @@ class System2ToolExecutor:
             if function not in _EXTERNAL_READS:
                 result = self._guarded_execute(db, function, args, authority, now)
                 if function not in READ_TOOLS:
+                    if result.outcome is None:
+                        outcome = {
+                            "applied": "committed", "rejected": "rejected",
+                            "pending": "pending_display" if result.delivery_id else "deferred",
+                        }.get(result.status, "failed")
+                        result = replace(result, outcome=outcome)
                     if local and result.status == "applied" and self.after_local_commit:
                         self.after_local_commit(db, function, args, authority.trigger_id)
                     self._remember(db, authority.user_scope, function, fingerprint, result)
@@ -323,7 +367,7 @@ class System2ToolExecutor:
                 reason_code=args["reason_code"], authority=authority, now=now, db=db,
             )
             return self._from_outcome(call_id, function, outcome)
-        if function in ("reminder.recheck", "observation.wait_fresh"):
+        if function in ("reminder.recheck", "observation.wait_fresh", "decision.recheck"):
             return self._wait_or_recheck(db, function, args, authority, now)
         if function == "pet.present":
             if self.pet is None:
@@ -364,7 +408,7 @@ class System2ToolExecutor:
             row = self._receipt(db, authority.user_scope, args["command_id"])
             if not row:
                 return _rejected(call_id, "NOT_FOUND")
-            return ToolResult(call_id, "applied", view=json.loads(row["result"]))
+            return ToolResult(call_id, "applied", view=self._receipt_with_presentation(db, authority.user_scope, row).to_dict())
         if function == "item.list":
             return ToolResult(call_id, "applied", view=self.items.list(args.get("filter"), db=db))
         if function == "habit.list":
@@ -408,6 +452,8 @@ class System2ToolExecutor:
             refs.append(f"interval:{args['interval_id']}")
         elif function in ("phase.credit_recovery", "phase.credit_sleep"):
             refs.append(f"recovery:{args.get('recovery_interval_id') or args['interval_id']}")
+        elif function == "phase.start" and args.get("previous_phase_id"):
+            refs.append(f"phase:{args['previous_phase_id']}")
         elif function != "phase.start" and args.get("id"):
             refs.append(f"phase:{args['id']}")
         if args.get("habit_id"):
@@ -607,8 +653,10 @@ class System2ToolExecutor:
         call_id = authority.call_id
         occurrence_id = args.get("occurrence_id")
         version = self._require_version(db, f"occurrence:{occurrence_id}", args, authority) if occurrence_id else None
-        run_at = _when(args.get("run_at"))
+        run_at = _when(args.get("recheck_at") if function == "decision.recheck" else args.get("run_at"))
         register = function == "observation.wait_fresh" or args.get("on_next_fresh")
+        if run_at and register and semantic_background_enabled():
+            raise CommandRejected("INVALID_ARGUMENT")
         window_open, window_close = (_when(args.get(key)) for key in ("window_open_at", "window_close_at"))
         if window_open is not None or window_close is not None:
             if window_open is None or window_close is None or run_at or register:
@@ -622,7 +670,8 @@ class System2ToolExecutor:
             raise CommandRejected("INVALID_ARGUMENT")
         view = {}
         if run_at:
-            event_id = self.scheduler.schedule_recheck(occurrence_id=occurrence_id, run_at=run_at, now=now, db=db)
+            event_id = self.scheduler.schedule_recheck(occurrence_id=occurrence_id, purpose=args.get("purpose"),
+                                                        run_at=run_at, now=now, db=db)
             view.update(event_id=event_id, run_at=run_at.isoformat())
         if register:
             purpose = args.get("purpose", "reminder_recheck")
@@ -636,7 +685,7 @@ class System2ToolExecutor:
             valid_until = _when(args.get("valid_until")) or now + timedelta(minutes=2)
             view.update(self.scheduler.register_wait(purpose=purpose, after_cursor=cursor, valid_until=valid_until,
                                                      occurrence_id=occurrence_id, settings_version=settings.version,
-                                                     now=now, db=db))
+                                                     now=now, db=db, changes=args.get("changes")))
         return ToolResult(call_id, "pending", view=view, retry_at=run_at.isoformat() if run_at else None)
 
     @staticmethod
@@ -671,14 +720,18 @@ class System2ToolExecutor:
             active = self.phases.current_phase_in_transaction(db)
             if active and active.state in ("running", "paused"):
                 return True
+            if proposal.args.get("previous_phase_id") and self.phases.phase_start_error(db, proposal.args, active):
+                return True
         return any(self._actual_version(db, ref) != version for ref, version in proposal.expected_versions.items())
 
     def _expire_proposals(self, db, scope, now):
         settings = self.settings.read(db=db)
         for proposal in proposals.pending(db, scope):
+            delivery = proposals.latest_delivery(db, scope, proposal.id)
             if now >= proposal.valid_until:
                 self._retire_proposal(db, scope, proposal, "expired")
-            elif not self._proposal_enabled(settings, proposal) or self._proposal_is_stale(db, proposal):
+            elif ((delivery and not self._proposal_route_valid(db, delivery))
+                  or not self._proposal_enabled(settings, proposal) or self._proposal_is_stale(db, proposal)):
                 self._retire_proposal(db, scope, proposal, "superseded")
 
     def _proposal_versions(self, db, refs, authority):
@@ -708,23 +761,38 @@ class System2ToolExecutor:
             if set(args["subject_refs"]) - target_set:
                 return _rejected(call_id, "NEEDS_CONFIRMATION")
         versions = self._proposal_versions(db, targets, authority)
-        if targets and payload.get("expected_version") is not None:
+        if function == "phase.start":
+            self._new_version(payload)
+        elif targets and payload.get("expected_version") is not None:
             if versions[targets[0]] != payload["expected_version"]:
                 return _rejected(call_id, "STALE_TASK")
         payload.pop("expected_version", None)
-        opportunity = self.scheduler.get_opportunity(db=db)
-        if not function.startswith("phase.") and authority.opportunity_id and authority.opportunity_id != opportunity:
+        semantic = semantic_background_enabled() and authority.origin != "user"
+        opportunity = None if semantic else self.scheduler.get_opportunity(db=db)
+        if (not semantic and not function.startswith("phase.") and authority.opportunity_id
+                and authority.opportunity_id != opportunity):
             return _rejected(call_id, "STALE_CONTEXT")
         active = self.phases.current_phase_in_transaction(db)
-        if function == "phase.start" and active and active.state in ("running", "paused"):
-            return _rejected(call_id, "INVALID_TRANSITION", subject_ref=f"phase:{active.id}",
-                             actual_version=active.version, view=_model_view(active))
-        business_key = _json([
-            function, payload.get("kind", "focus") if function == "phase.start" else None, targets,
-            (active.id, active.state) if active else None, opportunity,
-        ])
-        previous = self._current_proposal(db, scope, business_key, now, authority)
-        if previous and previous.state == "rejected":
+        if function == "phase.start":
+            error = None
+            if active and active.state in ("running", "paused"):
+                error = "INVALID_TRANSITION"
+            elif semantic or payload.get("previous_phase_id"):
+                error = self.phases.phase_start_error(db, payload, active)
+            if error:
+                return _rejected(call_id, error, subject_ref=f"phase:{active.id}" if active else None,
+                                 actual_version=active.version if active else None, view=_model_view(active))
+        kind = payload.get("kind", "focus") if function == "phase.start" else None
+        phase = (active.id, active.state) if active else None
+        if semantic:
+            if phase is None and function == "phase.start":
+                last = db.execute("SELECT id FROM phase_views ORDER BY rowid DESC LIMIT 1").fetchone()
+                phase = (last["id"], "finished") if last else None
+            business_key = _json(["semantic", function, kind, versions, phase])
+        else:
+            business_key = _json([function, kind, targets, phase, opportunity])
+        previous = self._current_proposal(db, scope, business_key, now, authority, semantic)
+        if previous and previous.state in {"rejected", "expired"}:
             return _rejected(call_id, "ALREADY_RESOLVED", subject_ref=f"proposal:{previous.id}",
                              actual_version=previous.version, view=_model_view(previous))
         new = previous is None
@@ -738,48 +806,77 @@ class System2ToolExecutor:
         )
         if not self._proposal_enabled(self.settings.read(db=db), proposal):
             return _rejected(call_id, "DISABLED")
-        if not new and previous.args == proposal.args and previous.expected_versions == proposal.expected_versions:
+        displayed = proposals.latest_delivery(db, scope, previous.id) if semantic and previous else None
+        if not new and ((displayed and displayed["state"] in {"permitted", "displayed", "unknown"})
+                        or (previous.args == proposal.args and previous.expected_versions == proposal.expected_versions)):
             proposal = previous
         else:
             if not new:
                 self._release_proposal_delivery(db, scope, previous.id)
             proposals.save(db, scope, proposal, key=business_key if new else None)
-        delivery_id = self._queue_proposal(db, scope, proposal, authority, now, opportunity)
+        channel = (args.get("presentation") or {}).get("channel", "pet_card") if semantic else "pet_card"
+        delivery_id, denial = self._queue_proposal(db, scope, proposal, authority, now, opportunity, semantic, channel)
+        if semantic and denial:
+            locked = self.scheduler._lock_state()
+            reason = ("desktop_locked" if locked is True else "lock_state_unknown" if locked is None else
+                      "presentation_context_changed" if denial == "STALE_CONTEXT" else "presentation_expired")
+            return ToolResult(call_id, "pending", subject_ref=f"proposal:{proposal.id}",
+                              actual_version=proposal.version, view=_model_view(proposal),
+                              error_code=denial, outcome="deferred", retryable=denial == "STALE_CONTEXT",
+                              presentation_receipt={"channel": channel, "state": "deferred", "reason": reason},
+                              message="建议已加入待确认列表，当前无法显示提示。")
         return ToolResult(call_id, "pending", subject_ref=f"proposal:{proposal.id}",
                           actual_version=proposal.version, delivery_id=delivery_id, view=_model_view(proposal),
                           message="等待你确认。")
 
-    def _current_proposal(self, db, scope, business_key, now, authority):
+    def _current_proposal(self, db, scope, business_key, now, authority, semantic):
         self._expire_proposals(db, scope, now)
         for previous in proposals.get_business(db, scope, business_key):
             if previous.state == "pending" or (previous.state == "rejected" and authority.origin != "user"
-                                               and (authority.opportunity_id or previous.valid_until > now)):
+                                               and (semantic or authority.opportunity_id or previous.valid_until > now)):
                 return previous
+            if semantic and previous.state == "expired":
+                delivery = proposals.latest_delivery(db, scope, previous.id)
+                if delivery and delivery["state"] in {"displayed", "unknown"}:
+                    return previous
         return None
 
-    def _queue_proposal(self, db, scope, proposal, authority, now, opportunity):
-        if authority.origin == "user" or authority.context_revision is None:
-            return None
+    def _queue_proposal(self, db, scope, proposal, authority, now, opportunity, semantic, channel):
+        if authority.origin == "user" or (not semantic and authority.context_revision is None):
+            return None, None
         valid_until = min(proposal.valid_until, authority.expires_at)
-        if not proposal.function.startswith("phase.") and authority.observation_valid_until:
+        if not semantic and not proposal.function.startswith("phase.") and authority.observation_valid_until:
             valid_until = min(valid_until, authority.observation_valid_until)
         if valid_until <= now:
-            return None
+            return None, "EXPIRED_REQUEST"
         bounds = {"context_revision": authority.context_revision, "context_valid_until": valid_until,
                   "observation_cursor": authority.observation_cursor,
                   "observation_generation": authority.observation_generation}
         delivery_id = _stable_id("proposal-delivery", scope, proposal.id, proposal.version, opportunity)
         previous = proposals.delivery(db, scope, delivery_id)
         if previous and previous["state"] != "revoked":
-            return delivery_id
-        if not self.scheduler.authorize_proposal(**bounds, now=now, db=db):
-            return None
-        # Empty slot denotes a focus suggestion independent of reminder quota.
+            return delivery_id, None
+        options = {"recheck_key": delivery_id} if semantic else {}
+        if not self.scheduler.authorize_proposal(**bounds, now=now, db=db, **options):
+            return None, "STALE_CONTEXT"
+        route_binding = self._proposal_route_binding(db) if semantic else None
         proposals.enqueue(db, scope, proposal, delivery_id=delivery_id, opportunity_id="",
-                          context_revision=authority.context_revision, valid_until=valid_until,
+                          context_revision=authority.context_revision or 0, valid_until=valid_until,
                           observation_cursor=authority.observation_cursor,
-                          observation_generation=authority.observation_generation)
-        return delivery_id
+                          observation_generation=authority.observation_generation,
+                          channel=channel, route_binding=route_binding)
+        return delivery_id, None
+
+    def _proposal_route_binding(self, db):
+        route = self.routes._get(db, SYSTEM2)
+        return _json([route.route_generation, route.consent_generation, route.verified])
+
+    def _proposal_response(self, db, scope, proposal, answer, now):
+        delivery = proposals.latest_delivery(db, scope, proposal.id)
+        if delivery and delivery["route_binding"] is not None:
+            self.scheduler.record_contact(delivery_id=delivery["delivery_id"], kind="proposal", at=now,
+                                          channel=delivery["channel"], subject_ref=proposal.id,
+                                          response=answer, db=db)
 
     def _resolve_proposal(self, db, args, authority, now):
         scope, call_id = authority.user_scope, authority.call_id
@@ -808,6 +905,7 @@ class System2ToolExecutor:
             result = ToolResult(call_id, "applied", subject_ref=ref, actual_version=proposal.version + 1,
                                 message="已拒绝建议。" if args["answer"] == "reject" else "已取消建议。")
             self._retire_proposal(db, scope, proposal, "rejected", resolution=result.to_dict())
+            self._proposal_response(db, scope, proposal, "rejected", now)
             return result
 
         if not self._proposal_enabled(self.settings.read(db=db), proposal):
@@ -828,9 +926,11 @@ class System2ToolExecutor:
             "applied_command_id": command_id if result.status == "applied" else None,
             "args": payload,
         })
-        display_result = replace(result, call_id=call_id)
+        display_result = replace(result, call_id=call_id, resolved_function=proposal.function)
         proposals.save(db, scope, updated, resolution=display_result.to_dict())
         self._release_proposal_delivery(db, scope, proposal_id)
+        if result.status == "applied":
+            self._proposal_response(db, scope, proposal, "accepted", now)
         return display_result
 
     def _amend(self, proposal, amendments):
@@ -867,7 +967,7 @@ class System2ToolExecutor:
             self._expire_proposals(db, scope, now)
             queued = []
             for row in proposals.deliveries(db, scope, state="queued"):
-                if now < _when(row["valid_until"]):
+                if now < _when(row["valid_until"]) and self._proposal_route_valid(db, row):
                     queued.append(row)
                 else:
                     self._revoke_presentation(db, scope, row["delivery_id"])
@@ -880,16 +980,21 @@ class System2ToolExecutor:
         proposals.set_delivery(db, scope, delivery_id, "revoked")
         self.scheduler.release_opportunity(delivery_id=delivery_id, db=db)
 
+    def _proposal_route_valid(self, db, row):
+        return (row["route_binding"] is None or (semantic_background_enabled()
+                and row["route_binding"] == self._proposal_route_binding(db)))
+
     def _live_presentation(self, db, scope, row, now):
         proposal, _ = proposals.get(db, scope, row["proposal_id"])
         if (proposal is None or proposal.state != "pending" or proposal.version != row["proposal_version"]
+                or not self._proposal_route_valid(db, row)
                 or now >= proposal.valid_until or not self._proposal_enabled(self.settings.read(db=db), proposal)):
             return None
         if self._proposal_is_stale(db, proposal):
             return None
         if not self.scheduler.proposal_permit(
             opportunity_id=row["opportunity_id"], delivery_id=row["delivery_id"],
-            context_revision=row["context_revision"], context_valid_until=_when(row["valid_until"]),
+            context_revision=row["context_revision"] or None, context_valid_until=_when(row["valid_until"]),
             observation_cursor=row["observation_cursor"], observation_generation=row["observation_generation"],
             now=now, db=db,
         ):
@@ -935,6 +1040,9 @@ class System2ToolExecutor:
                 return False
             if displayed:
                 proposals.set_delivery(db, scope, delivery_id, "displayed")
+                if row["route_binding"] is not None:
+                    self.scheduler.record_contact(delivery_id=delivery_id, kind="proposal", at=self.now(),
+                                                  channel=row["channel"], subject_ref=row["proposal_id"], db=db)
             else:
                 self._revoke_presentation(db, scope, delivery_id)
             return True

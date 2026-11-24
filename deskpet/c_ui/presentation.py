@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import QApplication
 
 from deskpet.contracts import TaskView
 from deskpet.m0.observation_input import DesktopObservationInput
-from deskpet.task_service.presentation import PresentationLedger
+from deskpet.system2.semantic_policy import semantic_background_enabled
+from deskpet.task_service.presentation import EARLY_OS_TRANSFER, PresentationLedger
 
 from .native_notifications import notification_id, platform_notifications
 
@@ -48,6 +49,7 @@ class DesktopPresentation(QObject):
         self._last_inventory_at = None
         self._in_progress = False
         self._last_notification_status = None
+        self._early_transfers = {}
         self._callback.connect(self._run_callback)
 
     def _run_callback(self, callback):
@@ -100,16 +102,30 @@ class DesktopPresentation(QObject):
         if status != self._last_notification_status:
             self._last_notification_status = status
             self.changed.emit()
-        enabled = bool(self.settings.get("allow_system_notifications"))
-        if enabled:
-            for view in self._active_tasks():
-                deadline = view.draft.hard_deadline
-                if deadline is None or deadline <= now + timedelta(seconds=2):
-                    continue
-                if (self.notifications.can_schedule and self.notifications.available
-                        and view.draft.expires_at is None):
-                    self._submit_os(view, deadline, sound=False)
+        self._schedule_fallbacks(now)
+        self._early_transfers = {key: command for key, command in self._early_transfers.items()
+                                 if now < command.expires_at}
         return self.pending_projection(now)
+
+    def _schedule_fallbacks(self, now):
+        if (not self.settings.get("allow_system_notifications")
+                or not self.notifications.can_schedule or not self.notifications.available):
+            return
+        for task in self._active_tasks():
+            deadline = task.draft.hard_deadline
+            if deadline is None or deadline <= now + timedelta(seconds=2) or task.draft.expires_at is not None:
+                continue
+            delivery_id = self._delivery_id(task)
+            if transfer := self._early_transfers.get(delivery_id):
+                if self.ledger.can_finish_early_transfer(transfer, now):
+                    continue
+                self._early_transfers.pop(delivery_id, None)
+            self._submit_os(task, deadline, sound=False)
+
+    def restore_fallbacks(self):
+        if self._early_transfers and self.ledger is not None and self.snapshot.get("now"):
+            self._early_transfers.clear()
+            self._schedule_fallbacks(self.now())
 
     def _phase_ended(self, snapshot):
         previous = self._active_phase
@@ -131,7 +147,7 @@ class DesktopPresentation(QObject):
     def _delivery_id(task):
         return f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
 
-    def _submit_os(self, task, due_at, *, sound):
+    def _submit_os(self, task, due_at, *, sound, command=None):
         now = self.now()
         delivery_id = self._delivery_id(task)
         identifier = notification_id(delivery_id)
@@ -144,8 +160,9 @@ class DesktopPresentation(QObject):
                                      "cancel_intent", "cancelling", "painted", "grouped"}
                 for row in self.ledger.rows()
             )
-        if not self.ledger.prepare_os(task, delivery_id, identifier, now):
+        if not self.ledger.prepare_os(task, delivery_id, identifier, now, command=command):
             return
+        sound = sound and self.ledger.os_sound_enabled()
 
         def complete(state, reason):
             self._callback.emit(lambda: self.ledger.update(delivery_id, {"submitting"}, state, self.now(), reason))
@@ -156,14 +173,16 @@ class DesktopPresentation(QObject):
             complete("unknown", type(exc).__name__)
 
     def route_hidden(self, command):
-        if self.ledger is None or command.reason not in {"hard_due", "deadline_fallback"}:
+        requested_os = command.channel == "os_notification"
+        if self.ledger is None or (not requested_os and command.reason not in {"hard_due", "deadline_fallback"}):
             return
         if not self.settings.get("allow_system_notifications"):
             return
         for task in self._active_tasks():
             if self._delivery_id(task) == command.delivery_id:
                 if self.notifications.available:
-                    self._submit_os(task, None, sound=self._sound_enabled(command.sound))
+                    self._submit_os(task, None, sound=self._sound_enabled(command.sound),
+                                    command=command if requested_os else None)
                 else:
                     self.ledger.record_unavailable(task, command.delivery_id, self.now(), self.notifications.status)
                 return
@@ -186,6 +205,23 @@ class DesktopPresentation(QObject):
             return True
         now = self.now()
         return self.lock_probe() is False and self.soft_valid(command) and self.ledger.permit_qt(command, now)
+
+    def permit_badge(self, command):
+        return (self.ledger is not None and self.lock_probe() is False and self.soft_valid(command)
+                and self.ledger.permit_badge(command, self.now()))
+
+    def transfer_early(self, command):
+        if (self.ledger is None or not semantic_background_enabled()
+                or not self._can_verify_early_transfer() or not self.notifications.available):
+            return
+        now = self.now()
+        row = self.ledger.begin_early_transfer(command, now)
+        if row is not None:
+            self._early_transfers[command.delivery_id] = command
+            self._remove_os(now, row, reason=EARLY_OS_TRANSFER)
+
+    def _can_verify_early_transfer(self):
+        return getattr(self.notifications, "can_verify_early_transfer", self.notifications.can_verify_removal)
 
     def can_group(self, command):
         return self.ledger is None or (self.lock_probe() is False and self.ledger.can_group(command, self.now()))
@@ -248,11 +284,14 @@ class DesktopPresentation(QObject):
                     self._cancel_os(now, row)
                 elif state in {"submitting", "unknown"}:
                     self.ledger.update(delivery, {state}, "scheduled", now)
-            elif state == "cancelling":
-                verified = (pending is not None and due is not None and now + timedelta(seconds=1) < due
-                            and self.notifications.can_verify_removal)
+            elif state == "cancelling" or (state == "cancel_intent" and row["reason"] == EARLY_OS_TRANSFER):
+                early = row["reason"] == EARLY_OS_TRANSFER
+                can_verify = ((self._can_verify_early_transfer() and delivered is not None)
+                              if early else self.notifications.can_verify_removal)
+                verified = (pending is not None and due is not None
+                            and now + timedelta(seconds=1) < due and can_verify)
                 self.ledger.update(delivery, {state}, "cancelled" if verified else "unknown", now,
-                                   None if verified else "retraction_unconfirmed")
+                                   row["reason"] if verified else "retraction_unconfirmed")
             elif state == "cancel_intent":
                 self.ledger.update(delivery, {state}, "unknown", now, "retraction_unconfirmed")
             elif state in {"scheduled", "submitted"} or (state == "submitting" and row["owner_session"] != self.ledger.session):
@@ -263,12 +302,15 @@ class DesktopPresentation(QObject):
         delivery_id = row["delivery_id"]
         if not self.ledger.update(delivery_id, {row["state"]}, "cancel_intent", now):
             return
+        self._remove_os(now, row)
+
+    def _remove_os(self, now, row, *, reason=None):
         try:
             removed = self.notifications.remove_pending(row["os_id"])
         except (OSError, RuntimeError, ValueError):
             removed = False
-        self.ledger.update(delivery_id, {"cancel_intent"}, "cancelling" if removed else "unknown", now,
-                           None if removed else "retraction_unconfirmed")
+        self.ledger.update(row["delivery_id"], {"cancel_intent"}, "cancelling" if removed else "unknown", now,
+                           reason if removed else "retraction_unconfirmed")
 
     def pending_projection(self, now):
         notes = {}
@@ -276,6 +318,7 @@ class DesktopPresentation(QObject):
                         "delivered": "系统报告已送达，等待确认", "unknown": "投递结果未知 · 静默待处理",
                         "failed": "系统通知未提交", "unavailable": "系统通知不可用", "cancelling": "等待系统撤回",
                         "cancel_intent": "等待系统撤回", "painted": "桌宠已展示，等待确认",
+                        "badge_shown": "已显示轻提醒，打开列表查看",
                         "grouped": "同批到期 · 待查看"}
         for task in self._active_tasks():
             if task.draft.expires_at and now >= task.draft.expires_at:

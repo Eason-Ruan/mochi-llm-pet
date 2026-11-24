@@ -175,7 +175,8 @@ def test_focus_offer_while_working_without_habit_task_or_available_slot(business
     context = {"current_status": "fresh", "current": {"state": "working"},
                "enabled_settings": {"auto_adjust": True}, "eligible_items": []}
     grants = describe_grants(None, context, requested_at=business.clock.wall_now())
-    assert "proposal.offer" in grants and "pet.present" not in grants and "reminder.present" not in grants
+    assert {"proposal.offer", "pet.present"} <= grants.keys()
+    assert "reminder.present" not in grants
     business.clock.advance(16)
     business.publish(72, "working")
     offer = business.command("proposal.offer", _offer(), "work-focus", origin="agent", snapshot=snapshot)
@@ -189,7 +190,7 @@ def test_focus_offer_while_working_without_habit_task_or_available_slot(business
     assert not business.tools.validate_presentation(offer.delivery_id)
 
 
-def test_refusal_persists_in_same_opportunity_until_work_then_available(business):
+def test_refusal_survives_restart_and_observation_changes(business):
     business.auto_adjust()
     snapshot = business.publish(71)
     first = business.command("proposal.offer", _offer(), "offer", origin="agent", snapshot=snapshot)
@@ -210,10 +211,12 @@ def test_refusal_persists_in_same_opportunity_until_work_then_available(business
     business.clock.advance(1)
     next_slot = business.publish(74)
     next_offer = business.command("proposal.offer", _offer(), "new-opportunity", origin="agent", snapshot=next_slot)
-    assert next_offer.status == "pending" and next_offer.subject_ref != first.subject_ref
+    assert next_offer.error_code == "ALREADY_RESOLVED"
+    assert next_offer.subject_ref == first.subject_ref
 
 
-def test_fresh_wait_cancellation_and_proposal_priority_share_same_business_state(business):
+def test_legacy_wait_cancellation_and_proposal_priority(business, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
     business.auto_adjust()
     wait_args = {"purpose": "focus_suggestion", "after_cursor": 0,
                  "valid_until": (business.clock.wall_now() + timedelta(minutes=2)).isoformat()}
@@ -244,6 +247,24 @@ def test_fresh_wait_cancellation_and_proposal_priority_share_same_business_state
     assert not business.tools.pending_proposals()
     disabled = business.command("observation.wait_fresh", wait_args, "wait-disabled", origin="agent")
     assert disabled.error_code == "DISABLED"
+
+
+def test_semantic_proposal_works_without_observation_or_slot_and_records_paint(business):
+    business.auto_adjust()
+    offer = business.command("proposal.offer", _offer(), "semantic-offer", origin="agent")
+    assert offer.outcome == "pending_display"
+    assert not business.scheduler.snapshot(business.clock.wall_now())["recent_contacts"]
+    gateway = business.gateway()
+    assert gateway.permit_presentation(offer.delivery_id)["id"] == offer.view["id"]
+    assert gateway.ack_presentation(offer.delivery_id, displayed=True)
+    receipt = gateway.get_result("semantic-offer")
+    assert receipt.outcome == "shown"
+    assert receipt.presentation_receipt == {
+        "delivery_id": offer.delivery_id, "channel": "pet_card", "state": "displayed",
+    }
+    contact, = business.scheduler.snapshot(business.clock.wall_now())["recent_contacts"]
+    assert contact["subject_ref"] == offer.view["id"]
+    assert business.phases.current_phase() is None
 
 
 def test_local_widget_reuses_original_ids_and_fences_only_applied_writes(business):

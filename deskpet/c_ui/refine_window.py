@@ -299,6 +299,52 @@ class _Bubble(QFrame):
             self._retry_timer.stop()
 
 
+class _DeliveryBadge(QLabel):
+    def __init__(self, pet, *args):
+        super().__init__(*args)
+        self._pet = pet
+        self._deliveries = {}
+        self._attention = set()
+
+    def set_deliveries(self, deliveries):
+        changed = self._deliveries.keys() != deliveries.keys()
+        self._deliveries = deliveries
+        if changed or deliveries:
+            self.update()
+
+    def clear_attention(self):
+        if self._attention:
+            self._attention.clear()
+            self.update()
+
+    def paintEvent(self, event):
+        reports = []
+        if self._pet._backing_store_paint and self._pet._widget_exposed(self):
+            for key, (permit, report) in self._deliveries.items():
+                if permit():
+                    reports.append((key, report))
+        super().paintEvent(event)
+        visible = self._attention | {key for key, _ in reports}
+        if visible:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#9f3b29"))
+            painter.drawRoundedRect(self.rect(), 5, 5)
+            painter.setPen(QColor(PAPER))
+            count = len(visible)
+            cue = "!" if count == 1 else f"{count}!" if count < 10 else "9+"
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, cue)
+        if reports:
+            def painted():
+                if self._pet._widget_exposed(self):
+                    for key, report in reports:
+                        if report():
+                            self._attention.add(key)
+                            self._deliveries.pop(key, None)
+            QTimer.singleShot(0, painted)
+
+
 class RefinePet(DesktopPet):
     """Anchored cat with native child controls and one selected panel."""
 
@@ -371,7 +417,7 @@ class RefinePet(DesktopPet):
         self._bell = QLabel()
         self._bell.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         badge_layout.addWidget(self._bell)
-        self._badge = QLabel("0")
+        self._badge = _DeliveryBadge(self, "0")
         self._badge.setObjectName("refine-reminder-count")
         self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._badge.setMinimumWidth(21)
@@ -384,7 +430,7 @@ class RefinePet(DesktopPet):
         badge_layout.addWidget(self._badge)
         badge_layout.addStretch()
 
-        self._proposal_badge = QLabel(self.buttons["input"])
+        self._proposal_badge = _DeliveryBadge(self, self.buttons["input"])
         self._proposal_badge.setObjectName("refine-proposal-count")
         self._proposal_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._proposal_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -427,16 +473,20 @@ class RefinePet(DesktopPet):
 
     def apply_motion_intent(self, position_hint, animation):
         if self._press is not None or self._reduce_motion:
-            return
+            return False
+        moved = False
         if position_hint == "screen_edge" and self._allow_proactive_movement:
             screen = QGuiApplication.screenAt(self._home_anchor) or self.screen()
             if screen is not None:
                 area = screen.availableGeometry()
                 at_left = self._home_anchor.x() + WIDTH // 2 <= area.center().x()
                 x = area.left() + MARGIN if at_left else area.right() - WIDTH - MARGIN + 1
-                self._temporary_anchor = QPoint(x, self._home_anchor.y())
+                anchor = QPoint(x, self._home_anchor.y())
+                moved = self._temporary_anchor != anchor and self._home_anchor != anchor
+                self._temporary_anchor = anchor
                 self._layout_pet()
         elif position_hint == "home":
+            moved = self._temporary_anchor is not None
             self.end_temporary_motion()
 
         pose = {"look_up": "stretch", "wave": "happy", "approach": "walk"}.get(animation)
@@ -444,6 +494,8 @@ class RefinePet(DesktopPet):
             self.player.set_state(pose, force=True)
             self._motion_pose.start(850)
             self.update(self._cat_area)
+            return True
+        return moved
 
     def end_temporary_motion(self):
         self._motion_pose.stop()
@@ -650,12 +702,15 @@ class RefinePet(DesktopPet):
             self._layout_pet()
 
     def _bubble_exposed(self, bubble: _Bubble) -> bool:
+        return bubble is self.bubble and self._widget_exposed(bubble)
+
+    def _widget_exposed(self, widget) -> bool:
         handle = self.windowHandle()
         return (
-            bubble is self.bubble and (QGuiApplication.platformName() not in ("offscreen", "minimal")
+            (QGuiApplication.platformName() not in ("offscreen", "minimal")
                                        or getattr(self, "_synthetic_receipts", False))
-            and bool(handle and handle.isExposed()) and bubble.isVisible()
-            and not self.isMinimized() and not bubble.visibleRegion().isEmpty()
+            and bool(handle and handle.isExposed()) and widget.isVisible()
+            and not self.isMinimized() and not widget.visibleRegion().isEmpty()
         )
 
     def event(self, event):
@@ -775,6 +830,9 @@ class RefinePet(DesktopPet):
         # A 4× integer scale puts the same 72px cat at the Figma baseline.
         target = QRect(self.width() // 2 - 68, self._cat_area.bottom() + 1 - 128, 128, 128)
         painter.drawPixmap(target, frame)
+        if self._backing_store_paint and (report := getattr(self, "_report_motion_paint", None)):
+            self._report_motion_paint = None
+            QTimer.singleShot(0, report)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._cat_area.contains(event.position().toPoint()):

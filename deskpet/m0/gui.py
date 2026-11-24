@@ -323,13 +323,15 @@ class ServiceWorker(QObject):
                 except (ValueError, RuntimeError):
                     result = {"event_id": action["event_id"], "status": "rejected"}
             elif kind == "system_sleep":
-                self.env.sessions.record_sleep()
                 if self.system2 is not None:
-                    self.system2.scheduler.close_opportunity(reason="sleep", now=self.env.clock.wall_now())
+                    self.system2.record_sleep()
+                else:
+                    self.env.sessions.record_sleep()
             elif kind == "system_wake":
-                self.env.sessions.record_wake()
                 if self.system2 is not None:
-                    self.system2.scheduler.resume(self.env.clock.wall_now())
+                    self.system2.record_wake()
+                else:
+                    self.env.sessions.record_wake()
             elif kind == "start_habit":
                 from deskpet.work_sessions.models import PhaseCommand
 

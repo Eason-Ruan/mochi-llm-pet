@@ -171,6 +171,8 @@ class LocalConversation:
                 payload["duration_s"] = int(minutes) * 60
             return self._action("start", uuid4().hex, 0, payload, "已开始专注。")
 
+        if _separator:
+            return None
         change = re.fullmatch(r"(?:请|帮我)?(?:把专注)?(?:改成|再加)(\d+)分钟(?:专注)?", phrase)
         command = re.fullmatch(r"(?:请|帮我|先)?(暂停|继续|结束|跳过)(?:这段|本次)?(?:专注|计时|休息)?", phrase)
         if change or command:

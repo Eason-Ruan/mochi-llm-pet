@@ -9,6 +9,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QFont, QFontMetrics
 
 from deskpet.contracts import DisplayCommand
+from deskpet.system2.semantic_policy import semantic_background_enabled
 
 from .presentation import DesktopPresentation
 
@@ -44,6 +45,7 @@ class RefineDeliveryMixin:
         self._quiet_grouped = set()
         self._shown_deadlines = set()
         self._reporting_group = False
+        self._pet_motion_delivery = None
         self._reminder_timer = QTimer(self.pet)
         self._reminder_timer.setSingleShot(True)
         self._reminder_timer.timeout.connect(self._show_next_prompt)
@@ -129,7 +131,7 @@ class RefineDeliveryMixin:
         if not all(self._valid_command(command) for command in item.commands()):
             return False
         if item.painted:
-            return True
+            return not self.production or self._can_show_reminder(collapsed_ok=semantic_background_enabled())
         return all(self.presentation.now() < command.expires_at for command in item.commands())
 
     def _clear_prompt(self):
@@ -153,14 +155,36 @@ class RefineDeliveryMixin:
         if not self.snapshot.get("now"):
             return []
         now = self.presentation.now()
-        visible = self._can_show_reminder()
+        semantic = self.production and semantic_background_enabled()
+        visible = self._can_show_reminder(collapsed_ok=semantic)
         ready = []
-        os_owned = {(row["task_id"], row["occurrence"]) for row in self.presentation.rows
-                    if row["state"] in {"unknown", "submitting", "scheduled", "submitted", "delivered", "cancel_intent", "cancelling", "painted", "grouped"}}
+        badges = {}
+        owned = {(row["task_id"], row["occurrence"]): row for row in self.presentation.rows
+                 if row["state"] in {"unknown", "submitting", "scheduled", "submitted", "delivered",
+                                     "cancel_intent", "cancelling", "painted", "grouped", "badge_shown"}}
         for delivery_id, command in list(self._reminder_pending.items()):
-            if delivery_id in self._quiet_grouped or (command.task_id, command.occurrence) in os_owned:
+            if delivery_id in self._quiet_grouped:
                 continue
             if not self._valid_command(command) or not command.requested_at <= now < command.expires_at:
+                continue
+            if owner := owned.get((command.task_id, command.occurrence)):
+                if (semantic and owner["state"] == "scheduled" and owner["channel"] == "os_notification"
+                        and owner["delivery_id"] == delivery_id and command.reason == "tool"):
+                    if (command.channel == "os_notification"
+                            or (command.channel == "pet_badge" and self._can_show_reminder())
+                            or (command.channel == "pet_card" and visible and self.prompt is None
+                                and self._pet_motion_delivery is None)):
+                        self.presentation.transfer_early(command)
+                continue
+            if command.channel == "os_notification":
+                self.presentation.route_hidden(command)
+                continue
+            if command.channel == "pet_badge":
+                if self._can_show_reminder():
+                    badges[delivery_id] = (
+                        lambda command=command: self.presentation.permit_badge(command),
+                        lambda command=command: self._painted_badge(command),
+                    )
                 continue
             if self.production and command.reason in {"hard_due", "deadline_fallback"}:
                 deadline = self._deadline(command)
@@ -175,7 +199,22 @@ class RefineDeliveryMixin:
                 self.presentation.route_hidden(command)
             elif self.presentation.soft_valid(command):
                 ready.append(command)
+        if self.production:
+            self.pet._badge.set_deliveries(badges)
+        if semantic:
+            ready.sort(key=lambda command: command.reason not in {"hard_due", "deadline_fallback"})
         return ready
+
+    def _painted_badge(self, command):
+        if not self._can_show_reminder() or not self.presentation.painted([command], allow_sound=False):
+            return False
+        self._reminder_pending.pop(command.delivery_id, None)
+        self._reporting_group = True
+        try:
+            self.context.report_display(command.delivery_id)
+        finally:
+            self._reporting_group = False
+        return True
 
     def _group_preview(self, commands):
         font = QFont(self.pet.font())
@@ -194,12 +233,24 @@ class RefineDeliveryMixin:
         if self._closing:
             return
         reminders = self._ready_reminders()
+        semantic = self.production and semantic_background_enabled()
+        first_due = reminders and reminders[0].reason in {"hard_due", "deadline_fallback"}
+        if self._pet_motion_delivery is not None:
+            return
         if self.prompt:
-            if self.prompt.command or not reminders:
+            if semantic:
+                if not first_due or (self.prompt.command and
+                                     self.prompt.command.reason in {"hard_due", "deadline_fallback"}):
+                    return
+                self._retire_prompt()
+            elif not self.prompt.command and reminders:
+                if self.prompt.kind != "proposal":
+                    self.waiting_prompts.appendleft(self.prompt)
+                self._clear_prompt()
+            else:
                 return
-            if self.prompt.kind != "proposal":
-                self.waiting_prompts.appendleft(self.prompt)
-            self._clear_prompt()
+        while self.waiting_prompts and not self._valid_prompt(self.waiting_prompts[0]):
+            self.waiting_prompts.popleft()
         if reminders:
             command = reminders[0]
             siblings = ()
@@ -241,6 +292,8 @@ class RefineDeliveryMixin:
 
             def painted():
                 item.painted = item.on_painted()
+                if item.painted and semantic:
+                    self._expire_visible_prompt(item)
                 return item.painted
 
         labels = None
@@ -261,9 +314,10 @@ class RefineDeliveryMixin:
         if self.prompt is not item:
             return False
         if item.painted:
-            return all(self._valid_command(command) for command in item.commands())
+            return (self._can_show_reminder(collapsed_ok=semantic_background_enabled())
+                    and all(self._valid_command(command) for command in item.commands()))
         visible = item.visible_commands()
-        showable = self._can_show_reminder()
+        showable = self._can_show_reminder(collapsed_ok=semantic_background_enabled())
         permitted = [command for command in visible if showable and self._valid_command(command)
                      and self.presentation.permit(command)]
         hidden = [command for command in item.commands() if command not in visible and showable
@@ -301,11 +355,20 @@ class RefineDeliveryMixin:
             if motion is not None:
                 self.pet.apply_motion_intent(motion.position_hint, motion.animation)
             item.painted = bool(commands) or item.preview is not None
+            if item.painted and semantic_background_enabled():
+                self._expire_visible_prompt(item)
             if item.painted and item.command.reason in {"hard_due", "deadline_fallback"}:
                 self._shown_deadlines.add(self._deadline(item.command))
         elif item.command:
             item.painted = self.context.report_display(item.command.delivery_id)
         return item.painted
+
+    def _expire_visible_prompt(self, item):
+        def expire():
+            if self.prompt is item:
+                self._clear_prompt()
+                self._show_next_prompt()
+        QTimer.singleShot(15000, expire)
 
     def _painted_group_row(self, task_id, version):
         if self.section != "reminders" or not self._can_show_reminder():

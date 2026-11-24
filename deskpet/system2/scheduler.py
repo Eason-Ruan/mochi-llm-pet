@@ -13,11 +13,23 @@ from uuid import uuid4
 from deskpet.contracts import DisplayCommand, TaskView
 from deskpet.observation_v2.context import RealtimeBridge, RealtimeHead
 from deskpet.observation_v2.realtime import sample_realtime_clock
+from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
+
+from .semantic_policy import semantic_background_enabled
 
 
 TICK_INTERVAL = timedelta(seconds=60)
 REMINDER_PRIORITY_HORIZON = timedelta(seconds=120)
+_DECISION_PURPOSES = {"focus_suggestion", "pet_presentation"}
+_OBSERVATION_CHANGES = {"activity_state", "activity_context", "lock_state"}
+_DEFER_LIMIT = timedelta(hours=1)
+_ACTIONABLE_WAKE_LIFETIME = timedelta(minutes=5)
+_WAKE_RETRY_DELAY = timedelta(seconds=5)
+_SEMANTIC_WAKE_REASONS = {"phase_elapsed", "presentation_context_changed"}
+_PRESENTATION_LEASE = timedelta(seconds=45)
+_CONTACT_HORIZON = timedelta(hours=1)
+_CONTACT_LIMIT = 8
 _EARLY_REASONS = {"opportunity", "tool"}
 _URGENCY_CODES = {"meeting_preparation", "time_sensitive", "deadline_approaching", "expiring"}
 _SCHEMA = (
@@ -43,10 +55,30 @@ _SCHEMA = (
         valid_until TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('waiting','consumed','cancelled')),
         wake_event_id TEXT, consumed_cursor INTEGER, consumed_generation TEXT
     )""",
+    """CREATE TABLE IF NOT EXISTS system2_defer_context (
+        id TEXT PRIMARY KEY, evidence TEXT NOT NULL
+    )""",
     """CREATE UNIQUE INDEX IF NOT EXISTS system2_one_waiter
         ON system2_waiters(user_scope, purpose, occurrence_key) WHERE state='waiting'""",
     """CREATE INDEX IF NOT EXISTS system2_consumed_waiters
         ON system2_waiters(user_scope, purpose, occurrence_key, consumed_generation, consumed_cursor)""",
+    """CREATE TABLE IF NOT EXISTS system2_phase_wakes (
+        event_id TEXT PRIMARY KEY REFERENCES system2_wakes(event_id), details TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS system2_wake_retries (
+        event_id TEXT PRIMARY KEY REFERENCES system2_wakes(event_id),
+        retry_id TEXT UNIQUE NOT NULL REFERENCES system2_wakes(event_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS system2_presentation_context (
+        delivery_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, channel TEXT NOT NULL,
+        observation_generation TEXT, publication_cursor INTEGER, context_revision INTEGER,
+        policy_generation INTEGER NOT NULL, route_version TEXT NOT NULL, valid_until TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS system2_contacts (
+        user_scope TEXT NOT NULL, delivery_id TEXT NOT NULL, kind TEXT NOT NULL, at TEXT NOT NULL,
+        channel TEXT NOT NULL, subject_ref TEXT, response TEXT,
+        PRIMARY KEY(user_scope, delivery_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS system2_opportunities (
         opportunity_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, opened_at TEXT NOT NULL,
         closed_at TEXT, claimed_delivery_id TEXT
@@ -84,6 +116,7 @@ class WakeEvent:
     reason: str
     publication_cursor: int | None = None
     producer_generation: str | None = None
+    phase_elapsed: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +174,17 @@ def _early(task: TaskView | None, now: datetime, *, check_close: bool = True) ->
     draft = task.draft
     return ((draft.opens_at is None or draft.opens_at <= now)
             and (not check_close or draft.window_close_at is None or now < draft.window_close_at))
+
+
+def _within_user_bounds(task: TaskView | None, now: datetime) -> bool:
+    if not _soft_lifetime(task, now):
+        return False
+    earliest = task.draft.explicit_start_at
+    return earliest is None or now >= earliest
+
+
+def _eligible(task: TaskView | None, now: datetime) -> bool:
+    return _within_user_bounds(task, now) if semantic_background_enabled() else _early(task, now)
 
 
 class Scheduler:
@@ -266,6 +310,9 @@ class Scheduler:
             head = self._bridge_read(tx, at).head
             through = max(head.publication_cursor or 0, self._schedule(tx)["publication_cursor"])
             self._close(tx, at, through)
+            if semantic_background_enabled() and reason in {"locked", "sleep"}:
+                tx.execute("""UPDATE system2_presentation_context SET valid_until=?
+                    WHERE user_scope=? AND valid_until>?""", (_stamp(at), self.user_scope, _stamp(at)))
 
     def _enqueue(self, db, *, event_id: str, kind: str, at: datetime, reason: str,
                  task: TaskView | None = None, valid_until: datetime | None = None,
@@ -279,11 +326,13 @@ class Scheduler:
             head.producer_generation if head else None, head.publication_cursor if head else None,
         ))
 
-    def resume(self, now: datetime | None = None) -> str:
+    def resume(self, now: datetime | None = None, *, db=None) -> str:
         at = now if now is not None else self.clock.wall_now()
         event_id = self._event_id("resume", _stamp(at))
-        with self._transaction() as db:
-            self._enqueue(db, event_id=event_id, kind="resume", at=at, reason="resume")
+        with self._transaction(db) as tx:
+            if db is not None and semantic_background_enabled():
+                self._poll_timers(tx, at)
+            self._enqueue(tx, event_id=event_id, kind="resume", at=at, reason="resume")
         return event_id
 
     def _event_id(self, *key) -> str:
@@ -326,11 +375,48 @@ class Scheduler:
                        (uuid4().hex, self.user_scope, _stamp(now)))
         return head
 
+    def _wait_evidence(self, head):
+        current = head.current if head.current_status == "fresh" else None
+        return {
+            "activity_state": current.state if current else None,
+            "activity_context": [current.activity_kind, getattr(head, "foreground_key", None)] if current else None,
+            "lock_state": self._lock_state(),
+        }
+
+    @staticmethod
+    def _has_wait_change(previous, current):
+        for key, previous_value in previous.items():
+            actual = current[key]
+            if actual is None:
+                continue
+            if key == "activity_context" and previous_value is not None:
+                if actual[0] != previous_value[0] or (actual[1] and previous_value[1] and actual[1] != previous_value[1]):
+                    return True
+            elif actual != previous_value:
+                return True
+        return False
+
+    def _cancel_deferred_waits(self, db, purpose, occurrence_id):
+        db.execute("""UPDATE system2_waiters SET state='cancelled' WHERE user_scope=? AND purpose=?
+                    AND occurrence_key=? AND state='waiting'""", (self.user_scope, purpose, occurrence_id or ""))
+        db.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND reason=?
+                    AND occurrence_id IS ? AND kind='observation_ready' AND state='pending'""",
+                   (self.user_scope, purpose, occurrence_id))
+
+    def _cancel_deferred_timers(self, db, purpose, occurrence_id, *, except_event=None):
+        reason = "scheduled_recheck" if occurrence_id else purpose
+        db.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND reason=?
+                    AND occurrence_id IS ? AND kind='recheck' AND state='pending' AND event_id IS NOT ?""",
+                   (self.user_scope, reason, occurrence_id, except_event))
+
     def _wait_valid(self, db, waiter, now: datetime, settings) -> tuple[bool, TaskView | None]:
         if _time(waiter["valid_until"]) <= now or settings.observation_paused:
             return False, None
-        if (waiter["purpose"] == "focus_suggestion"
-                and (not settings.auto_adjust or waiter["settings_version"] != settings.version)):
+        semantic = semantic_background_enabled()
+        if waiter["purpose"] == "pet_presentation" and not semantic:
+            return False, None
+        if (waiter["purpose"] == "focus_suggestion" and
+                (not settings.auto_adjust or (not semantic and waiter["settings_version"] != settings.version))):
             return False, None
         if not waiter["occurrence_key"]:
             return True, None
@@ -340,17 +426,41 @@ class Scheduler:
 
     def _consume_waits(self, db, now: datetime, head: RealtimeHead) -> None:
         settings = self._settings(db)
-        rows = db.execute("SELECT * FROM system2_waiters WHERE user_scope=? AND state='waiting' ORDER BY rowid",
+        rows = db.execute("""SELECT w.*, c.evidence FROM system2_waiters w
+                          LEFT JOIN system2_defer_context c ON w.waiter_id=c.id
+                          WHERE w.user_scope=? AND w.state='waiting' ORDER BY w.rowid""",
                           (self.user_scope,)).fetchall()
+        current_evidence = None
         for waiter in rows:
             valid, task = self._wait_valid(db, waiter, now, settings)
             if not valid:
                 db.execute("UPDATE system2_waiters SET state='cancelled' WHERE waiter_id=?", (waiter["waiter_id"],))
                 continue
             cursor = head.publication_cursor
-            if head.current_status != "fresh" or head.current is None or cursor is None or cursor <= waiter["after_cursor"]:
+            if cursor is None or cursor <= waiter["after_cursor"]:
                 continue
-            until = min(head.current.valid_until, _time(waiter["valid_until"]))
+            deadline = _time(waiter["valid_until"])
+            if waiter["evidence"] is not None:
+                if not semantic_background_enabled():
+                    db.execute("UPDATE system2_waiters SET state='cancelled' WHERE waiter_id=?", (waiter["waiter_id"],))
+                    continue
+                if current_evidence is None:
+                    current_evidence = self._wait_evidence(head)
+                baseline = json.loads(waiter["evidence"])
+                if not self._has_wait_change(baseline, current_evidence):
+                    previous_context = baseline.get("activity_context")
+                    observed_context = current_evidence["activity_context"]
+                    if (previous_context and previous_context[1] is None
+                            and observed_context and observed_context[1] is not None):
+                        baseline["activity_context"] = observed_context
+                        db.execute("UPDATE system2_defer_context SET evidence=? WHERE id=?",
+                                   (json.dumps(baseline), waiter["waiter_id"]))
+                    continue
+                until = min(head.current.valid_until, deadline) if head.current else deadline
+            else:
+                if head.current_status != "fresh" or head.current is None:
+                    continue
+                until = min(head.current.valid_until, deadline)
             event_id = self._event_id("observation_ready", waiter["waiter_id"])
             self._enqueue(db, event_id=event_id, kind="observation_ready", at=now, reason=waiter["purpose"],
                           task=task, valid_until=until, waiter_id=waiter["waiter_id"], head=head)
@@ -360,15 +470,20 @@ class Scheduler:
 
     def register_wait(self, *, purpose: str, after_cursor=None, valid_until: datetime,
                       occurrence_id: str | None = None, settings_version: int | None = None,
-                      now: datetime | None = None, db=None) -> dict:
+                      now: datetime | None = None, db=None, changes=None) -> dict:
         at = now if now is not None else self.clock.wall_now()
+        semantic = semantic_background_enabled()
         _stamp(valid_until)
         if valid_until <= at:
             raise SchedulerError("EXPIRED_REQUEST", "The wait has already expired")
-        if purpose not in {"focus_suggestion", "reminder_recheck"} or (purpose == "reminder_recheck" and not occurrence_id):
+        purposes = _DECISION_PURPOSES if semantic else {"focus_suggestion"}
+        if ((purpose == "reminder_recheck") != bool(occurrence_id)
+                or purpose not in purposes | {"reminder_recheck"}):
             raise SchedulerError("INVALID_ARGUMENT", "Specify a valid wait purpose and reminder occurrence")
-        if purpose == "focus_suggestion" and occurrence_id is not None:
-            raise SchedulerError("INVALID_ARGUMENT", "A focus suggestion wait has no reminder occurrence")
+        if changes is not None and (not semantic or not changes or set(changes) - _OBSERVATION_CHANGES):
+            raise SchedulerError("INVALID_ARGUMENT", "Specify a valid Observation change")
+        if semantic:
+            valid_until = min(valid_until, at + _DEFER_LIMIT)
         generation = None
         if isinstance(after_cursor, Mapping):
             generation = after_cursor.get("producer_generation")
@@ -394,7 +509,7 @@ class Scheduler:
                                       AND occurrence_key=? AND state='waiting'""", key).fetchone()
             # If a prior wait consumed the head during this registration, return
             # its wake. Registering against the same explicit cursor cannot fork it.
-            if existing is None and after_cursor is not None:
+            if not semantic and existing is None and after_cursor is not None:
                 existing = tx.execute("""SELECT * FROM system2_waiters WHERE user_scope=? AND purpose=?
                     AND occurrence_key=? AND state='consumed' AND after_cursor=? AND consumed_cursor=?
                     AND consumed_generation IS ? AND task_version IS ? AND settings_version IS ?
@@ -407,6 +522,15 @@ class Scheduler:
                     WHERE user_scope=? AND purpose=? AND occurrence_key=?""", key).fetchone()[0]
                 start_cursor = schedule["publication_cursor"] if after_cursor is None else after_cursor
                 start_cursor = max(start_cursor, consumed or 0)
+                known_evidence = None
+                if semantic and after_cursor is not None and after_cursor < schedule["publication_cursor"]:
+                    read_original = getattr(self.observation, "prior_wait_evidence", None)
+                    if read_original is not None:
+                        known_evidence = read_original(after_cursor, generation)
+                    if known_evidence is None:
+                        # Earlier publications cannot be treated as a change
+                        # when the decision's baseline is unavailable.
+                        start_cursor = schedule["publication_cursor"]
                 if start_cursor > schedule["publication_cursor"]:
                     raise SchedulerError("INVALID_ARGUMENT", "The publication cursor is ahead of the live source")
                 waiter_id = uuid4().hex
@@ -417,6 +541,17 @@ class Scheduler:
                     generation or schedule["producer_generation"], settings.version if purpose == "focus_suggestion" else None,
                     _stamp(valid_until),
                 ))
+                if semantic:
+                    evidence = self._wait_evidence(head)
+                    if known_evidence is not None:
+                        evidence.update({key: value for key, value in known_evidence.items() if value is not None})
+                    tx.execute("INSERT INTO system2_defer_context VALUES (?, ?)",
+                               (waiter_id, json.dumps({key: evidence[key] for key in sorted(changes or _OBSERVATION_CHANGES)})))
+                    self._cancel_deferred_timers(tx, purpose, occurrence_id)
+                    # An unclaimed prior observation wake is the same decision.
+                    tx.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND reason=?
+                                  AND occurrence_id IS ? AND kind='observation_ready' AND state='pending'""",
+                               (self.user_scope, purpose, occurrence_id))
                 self._consume_waits(tx, at, head)
                 existing = tx.execute("SELECT * FROM system2_waiters WHERE waiter_id=?", (waiter_id,)).fetchone()
             return {field: existing[field] for field in ("waiter_id", "state", "wake_event_id", "after_cursor", "valid_until")}
@@ -431,35 +566,82 @@ class Scheduler:
 
     def invalidate_focus_waits(self, *, db=None) -> None:
         with self._transaction(db) as tx:
-            tx.execute("UPDATE system2_waiters SET state='cancelled' WHERE user_scope=? AND purpose='focus_suggestion' AND state='waiting'",
-                       (self.user_scope,))
-            tx.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND kind='observation_ready'
-                          AND reason='focus_suggestion' AND state='pending'""", (self.user_scope,))
+            self._cancel_deferred_waits(tx, "focus_suggestion", None)
+            self._cancel_deferred_timers(tx, "focus_suggestion", None)
+
+    def on_phase_elapsed(self, phase_id: str, phase_version: int, *, db, elapsed_at=None,
+                         phase_kind=None, transition_reason=None, successor=None) -> None:
+        if not semantic_background_enabled():
+            return
+        elapsed_at = elapsed_at if elapsed_at is not None else self.clock.wall_now()
+        event_id = self._event_id("phase_elapsed", phase_id, phase_version)
+        details = {"phase_id": phase_id, "phase_version": phase_version, "phase_kind": phase_kind,
+                   "elapsed_at": _stamp(elapsed_at), "transition_reason": transition_reason}
+        if successor:
+            details["successor"] = {key: successor[key] for key in ("id", "version", "kind")}
+        with self._transaction(db) as tx:
+            valid_until = max(elapsed_at, self.clock.wall_now()) + _ACTIONABLE_WAKE_LIFETIME
+            self._enqueue(tx, event_id=event_id, kind="recheck", at=elapsed_at, reason="phase_elapsed",
+                          valid_until=valid_until)
+            tx.execute("INSERT OR IGNORE INTO system2_phase_wakes VALUES (?,?)", (event_id, json.dumps(details)))
 
     def on_focus_released(self, phase_id: str, phase_version: int, *, db) -> None:
         """Wake eligible reminders in the same transaction that releases focus."""
         now = self.clock.wall_now()
         with self._transaction(db) as tx:
             tx.execute("UPDATE system2_schedule SET focus_running=0 WHERE user_scope=?", (self.user_scope,))
-            if any(_early(task, now) for task in self._tasks(tx)):
+            if any(_eligible(task, now) for task in self._tasks(tx)):
                 self._enqueue(tx, event_id=self._event_id("focus_released", phase_id, phase_version),
                               kind="recheck", at=now, reason="focus_released")
 
-    def schedule_recheck(self, *, occurrence_id: str, run_at: datetime, now: datetime | None = None, db=None) -> str:
+    def schedule_recheck(self, *, run_at: datetime, occurrence_id: str | None = None,
+                         purpose: str | None = None, now: datetime | None = None, db=None) -> str:
         at = now if now is not None else self.clock.wall_now()
         stamp = _stamp(run_at)
+        semantic = semantic_background_enabled()
+        if occurrence_id:
+            if purpose not in {None, "reminder_recheck"}:
+                raise SchedulerError("INVALID_ARGUMENT", "A reminder recheck requires its occurrence")
+            purpose = "reminder_recheck"
+        elif not semantic or purpose not in _DECISION_PURPOSES:
+            raise SchedulerError("INVALID_ARGUMENT", "Specify a valid recheck purpose")
         with self._transaction(db) as tx:
-            task = self._resolve(tx, occurrence_id)
-            if not _active(task, at) or task.draft.mode != "soft":
+            task = self._resolve(tx, occurrence_id) if occurrence_id else None
+            if occurrence_id and not _soft_lifetime(task, at):
                 raise SchedulerError("STALE_TASK", "The reminder occurrence is no longer active")
-            if (run_at < at or (task.draft.hard_deadline and run_at >= task.draft.hard_deadline)
-                    or (task.draft.expires_at and run_at >= task.draft.expires_at)):
+            if task and (run_at < at or (task.draft.hard_deadline and run_at >= task.draft.hard_deadline)
+                         or (task.draft.expires_at and run_at >= task.draft.expires_at)):
                 raise SchedulerError("OUTSIDE_WINDOW", "The recheck is outside the reminder lifetime")
-            event_id = self._event_id("recheck", occurrence_id, task.version, stamp)
-            tx.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND occurrence_id=?
-                AND task_version=? AND reason='scheduled_recheck' AND at>? AND event_id<>? AND state='pending'""",
-                (self.user_scope, occurrence_id, task.version, _stamp(at), event_id))
-            self._enqueue(tx, event_id=event_id, kind="recheck", at=run_at, reason="scheduled_recheck", task=task)
+            reason = "scheduled_recheck" if task else purpose
+            event_id = (self._event_id("recheck", occurrence_id, task.version, stamp) if task
+                        else self._event_id("decision_recheck", purpose, stamp))
+            valid_until = None
+            if semantic:
+                if not at < run_at <= at + _DEFER_LIMIT:
+                    raise SchedulerError("OUTSIDE_WINDOW", "Recheck within the next hour")
+                if purpose == "focus_suggestion" and not self._settings(tx).auto_adjust:
+                    raise SchedulerError("DISABLED", "Automatic focus suggestions are disabled")
+                evidence = self._wait_evidence(self._sync(tx, at))
+                phase = _phase(tx)
+                if purpose == "focus_suggestion" and phase:
+                    evidence["phase"] = [phase["id"], phase["state"], phase["kind"]]
+                encoded = json.dumps(evidence, sort_keys=True)
+                repeated = tx.execute("""SELECT 1 FROM system2_wakes w JOIN system2_defer_context c
+                    ON c.id=w.event_id WHERE w.user_scope=? AND w.reason=? AND w.occurrence_id IS ?
+                    AND w.task_version IS ? AND w.state='acked' AND c.evidence=? AND w.at>?
+                    LIMIT 1""", (self.user_scope, reason, occurrence_id, task.version if task else None, encoded,
+                                 _stamp(at - _DEFER_LIMIT))).fetchone()
+                if repeated:
+                    raise SchedulerError("RECHECK_LIMIT", "A recheck already evaluated these facts")
+                self._cancel_deferred_waits(tx, purpose, occurrence_id)
+                self._cancel_deferred_timers(tx, purpose, occurrence_id, except_event=event_id)
+                tx.execute("INSERT OR REPLACE INTO system2_defer_context VALUES (?, ?)", (event_id, encoded))
+                valid_until = run_at + _DEFER_LIMIT
+            else:
+                tx.execute("""UPDATE system2_wakes SET state='cancelled' WHERE user_scope=? AND occurrence_id=?
+                    AND task_version=? AND reason='scheduled_recheck' AND at>? AND event_id<>? AND state='pending'""",
+                    (self.user_scope, occurrence_id, task.version, _stamp(at), event_id))
+            self._enqueue(tx, event_id=event_id, kind="recheck", at=run_at, reason=reason, task=task, valid_until=valid_until)
             tx.execute("UPDATE system2_wakes SET state='pending' WHERE event_id=? AND state='cancelled'", (event_id,))
             return event_id
 
@@ -483,7 +665,7 @@ class Scheduler:
         phase_key = f"{phase.get('id')}:{phase.get('state')}" if phase else None
         stage_changed = schedule["focus_running"] and not running
         if (stage_changed and schedule["phase_key"] != phase_key
-                and any(_early(task, now) for task in self._tasks(db))):
+                and any(_eligible(task, now) for task in self._tasks(db))):
             self._enqueue(db, event_id=self._event_id("focus_released", schedule["phase_key"], phase_key, _stamp(now)),
                           kind="recheck", at=now, reason="focus_released")
         db.execute("""UPDATE system2_schedule SET tick_at=?,last_wall=?,tick_sequence=?,phase_key=?,focus_running=?
@@ -496,11 +678,16 @@ class Scheduler:
                               kind="recheck", at=now, reason="window_estimate", task=task)
             if not _early(task, now, check_close=False):
                 continue
+            semantic = semantic_background_enabled()
+            if semantic and not _within_user_bounds(task, now):
+                continue
             opened_at = task.draft.opens_at or task.confirmed_at or now
+            if semantic and draft.explicit_start_at is not None:
+                opened_at = max(opened_at, draft.explicit_start_at)
             if _early(task, now):
                 self._enqueue(db, event_id=self._event_id("reminder_ready", _occurrence(task), task.version),
                               kind="reminder_ready", at=opened_at, reason="window_open", task=task,
-                              valid_until=task.draft.window_close_at)
+                              valid_until=None if semantic else task.draft.window_close_at)
             close_at = task.draft.window_close_at
             if close_at and close_at <= now:
                 self._enqueue(db, event_id=self._event_id("window_close", _occurrence(task), task.version),
@@ -510,25 +697,45 @@ class Scheduler:
         """Advance local wakes without a model or IPC notification."""
         now = self.clock.wall_now()
         with self._transaction() as db:
+            self._discard_disabled_wakes(db)
             head = self._sync(db, now)
             self._consume_waits(db, now, head)
             self._poll_timers(db, now)
             self._revoke_stale_deliveries(db, now, head)
 
+    def _discard_disabled_wakes(self, db) -> None:
+        if semantic_background_enabled():
+            return
+        db.execute("""UPDATE system2_wakes AS w SET state='cancelled' WHERE user_scope=? AND state='pending'
+            AND (reason IN ('phase_elapsed','presentation_context_changed')
+                 OR (kind='recheck' AND reason IN ('focus_suggestion','pet_presentation'))
+                 OR EXISTS (SELECT 1 FROM system2_defer_context AS c WHERE c.id=w.event_id OR c.id=w.waiter_id)
+                 OR EXISTS (SELECT 1 FROM system2_wake_retries AS r WHERE r.retry_id=w.event_id))""",
+                   (self.user_scope,))
+        db.execute("""UPDATE system2_waiters AS w SET state='cancelled' WHERE user_scope=? AND state='waiting'
+            AND EXISTS (SELECT 1 FROM system2_defer_context AS c WHERE c.id=w.waiter_id)""", (self.user_scope,))
+
     def _wake_live(self, db, row, now: datetime, settings) -> bool:
         if row["valid_until"] and _time(row["valid_until"]) <= now:
             return False
+        if (row["reason"] in _SEMANTIC_WAKE_REASONS and not row["valid_until"]
+                and _time(row["at"]) + _ACTIONABLE_WAKE_LIFETIME <= now):
+            return False
+        if row["reason"] in _DECISION_PURPOSES and row["kind"] == "recheck":
+            return (semantic_background_enabled()
+                    and (row["reason"] != "focus_suggestion" or settings.auto_adjust))
         if row["waiter_id"]:
             waiter = db.execute("SELECT * FROM system2_waiters WHERE waiter_id=?", (row["waiter_id"],)).fetchone()
             if waiter is None or not self._wait_valid(db, waiter, now, settings)[0]:
                 return False
         if row["task_id"]:
             task = self._task(db, row["task_id"])
-            eligible = _early(task, now) if row["reason"] == "window_open" else _soft_lifetime(task, now)
+            eligible = _eligible(task, now) if row["reason"] == "window_open" else _soft_lifetime(task, now)
             return bool(eligible and task.version == row["task_version"] and _occurrence(task) == row["occurrence_id"])
         return True
 
     def _pending_wakes(self, db, now: datetime, ids: set[str] | None = None) -> tuple[WakeEvent, ...]:
+        self._discard_disabled_wakes(db)
         settings = self._settings(db)
         rows = db.execute("""SELECT * FROM system2_wakes WHERE user_scope=? AND state='pending' AND at<=?
             ORDER BY at, rowid""", (self.user_scope, _stamp(now))).fetchall()
@@ -539,21 +746,59 @@ class Scheduler:
             if not self._wake_live(db, row, now, settings):
                 db.execute("UPDATE system2_wakes SET state='cancelled' WHERE event_id=?", (row["event_id"],))
                 continue
+            phase_elapsed = None
+            if row["reason"] == "phase_elapsed":
+                phase = db.execute("SELECT details FROM system2_phase_wakes WHERE event_id=?",
+                                   (row["event_id"],)).fetchone()
+                phase_elapsed = json.loads(phase[0]) if phase else None
             events.append(WakeEvent(row["event_id"], row["kind"], _time(row["at"]), self.user_scope,
                                     (row["task_id"],) if row["task_id"] else (), row["occurrence_id"],
-                                    row["reason"], row["publication_cursor"], row["producer_generation"]))
+                                    row["reason"], row["publication_cursor"], row["producer_generation"],
+                                    phase_elapsed))
         return tuple(events)
 
     def pending_wakes(self) -> tuple[WakeEvent, ...]:
         with self._transaction() as db:
             return self._pending_wakes(db, self.clock.wall_now())
 
-    def claim_wakes(self, ids: Iterable[str], *, now: datetime, db=None) -> tuple[WakeEvent, ...]:
+    def claim_wakes(self, ids: Iterable[str], *, now: datetime, db=None, coalesce=False) -> tuple[WakeEvent, ...]:
         """Recheck and acknowledge candidates inside the admission write transaction."""
         with self._transaction(db) as tx:
-            wakes = self._pending_wakes(tx, now, set(ids))
+            wakes = self._pending_wakes(tx, now, None if coalesce else set(ids))
             self.ack_wakes((wake.event_id for wake in wakes), db=tx)
             return wakes
+
+    def retry_wakes(self, ids: Iterable[str], *, now: datetime, immediate=False, db=None) -> None:
+        """Recover one-shot wakes once, carrying over their original evidence and limits."""
+        if not semantic_background_enabled():
+            return
+        at = now if immediate else now + _WAKE_RETRY_DELAY
+        with self._transaction(db) as tx:
+            settings = self._settings(tx)
+            for event_id in ids:
+                row = tx.execute("""
+                    SELECT * FROM system2_wakes WHERE event_id=? AND user_scope=? AND state='acked'
+                    AND kind IN ('reminder_ready', 'recheck', 'observation_ready')
+                    AND NOT EXISTS (SELECT 1 FROM system2_wake_retries WHERE event_id=? OR retry_id=?)
+                """, (event_id, self.user_scope, event_id, event_id)).fetchone()
+                if row is None or not self._wake_live(tx, row, at, settings):
+                    continue
+                valid_until = _time(row["valid_until"]) if row["valid_until"] else _time(row["at"]) + _ACTIONABLE_WAKE_LIFETIME
+                if at >= valid_until:
+                    continue
+                retry_id = self._event_id("retry", event_id)
+                tx.execute("""INSERT INTO system2_wakes
+                    (event_id,user_scope,kind,at,reason,task_id,occurrence_id,task_version,valid_until,
+                     waiter_id,producer_generation,publication_cursor)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           (retry_id, self.user_scope, row["kind"], _stamp(at), row["reason"], row["task_id"],
+                            row["occurrence_id"], row["task_version"], _stamp(valid_until), row["waiter_id"],
+                            row["producer_generation"], row["publication_cursor"]))
+                tx.execute("INSERT INTO system2_wake_retries VALUES (?,?)", (event_id, retry_id))
+                tx.execute("INSERT INTO system2_phase_wakes SELECT ?,details FROM system2_phase_wakes WHERE event_id=?",
+                           (retry_id, event_id))
+                tx.execute("INSERT INTO system2_defer_context SELECT ?,evidence FROM system2_defer_context WHERE id=?",
+                           (retry_id, event_id))
 
     def recheck_items(self, occurrence_ids: Iterable[str], as_of: datetime) -> list[dict]:
         """Resolve live soft occurrences that caused a wake, even outside their estimate."""
@@ -574,13 +819,47 @@ class Scheduler:
         with self._transaction() as db:
             head = self._sync(db, as_of)
             self._consume_waits(db, as_of, head)
-            candidates = [task for task in self._tasks(db) if _early(task, as_of)]
-            candidates.sort(key=lambda task: self._priority(task, as_of))
+            candidates = [task for task in self._tasks(db) if _eligible(task, as_of)]
+            if semantic_background_enabled():
+                candidates = [task for task in candidates if not self._deadline_owner(db, task, allow_fallback_transfer=True)]
+            else:
+                candidates.sort(key=lambda task: self._priority(task, as_of))
             items = [self.items.get(task.task_id, db=db) if self.items else task.model_dump(mode="json")
                      for task in candidates]
             return {"eligible_items": items, "opportunity_id": self.get_opportunity(db=db),
                     "producer_generation": head.producer_generation, "publication_cursor": head.publication_cursor,
-                    "current_phase": _phase(db), "current_status": head.current_status, "current": head.current}
+                    "current_phase": _phase(db), "current_status": head.current_status, "current": head.current,
+                    "recent_contacts": self._recent_contacts(db, as_of) if semantic_background_enabled() else []}
+
+    def record_contact(self, *, delivery_id, kind, at, channel, subject_ref=None, response=None, db=None):
+        with self._transaction(db) as tx:
+            tx.execute("""INSERT INTO system2_contacts VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(user_scope, delivery_id) DO UPDATE SET
+                response=coalesce(excluded.response, system2_contacts.response)""",
+                (self.user_scope, delivery_id, kind, _stamp(at), channel, subject_ref, response))
+
+    def _recent_contacts(self, db, as_of):
+        since = _stamp(as_of - _CONTACT_HORIZON)
+        contacts = [dict(row) for row in db.execute("""SELECT delivery_id, kind, at, channel, subject_ref, response
+            FROM system2_contacts WHERE user_scope=? AND at BETWEEN ? AND ?
+            ORDER BY at DESC LIMIT ?""", (self.user_scope, since, _stamp(as_of), _CONTACT_LIMIT))]
+        if _table(db, "presentations") and _table(db, "tasks"):
+            for row in db.execute("""SELECT p.delivery_id, p.channel, p.updated_at, t.view, p.occurrence
+                FROM presentations p JOIN tasks t ON p.task_id=t.task_id
+                LEFT JOIN system2_reminder_authority a ON a.delivery_id=p.delivery_id
+                WHERE p.state IN ('painted','badge_shown','delivered')
+                  AND julianday(p.updated_at) BETWEEN julianday(?) AND julianday(?)
+                  AND coalesce(a.user_scope, 'default')=?
+                ORDER BY julianday(p.updated_at) DESC LIMIT ?""", (since, _stamp(as_of), self.user_scope, _CONTACT_LIMIT)):
+                task = TaskView.model_validate_json(row["view"])
+                contact = {"kind": "reminder", "at": _stamp(_time(row["updated_at"])),
+                           "delivery_id": row["delivery_id"], "channel": row["channel"],
+                           "subject_ref": f"item:{task.task_id}",
+                           "occurrence_id": f"{task.task_id}:{row['occurrence']}"}
+                if task.occurrence == row["occurrence"] and task.acknowledged_at and task.acknowledged_at <= as_of:
+                    contact["response"] = "acknowledged"
+                contacts.append(contact)
+        return sorted(contacts, key=lambda contact: contact["at"], reverse=True)[:_CONTACT_LIMIT]
 
     @staticmethod
     def _urgency(task: TaskView, now: datetime) -> str | None:
@@ -593,16 +872,19 @@ class Scheduler:
         return (deadline, not bool(self._urgency(task, now)), task.confirmed_at or task.created_at or now, task.task_id)
 
     @staticmethod
-    def _owned(db, task: TaskView, *, excluding_delivery=None) -> bool:
-        return bool(db.execute("""SELECT 1 FROM presentations WHERE task_id=?
+    def _presentation_owner(db, task: TaskView, *, allow_fallback_transfer=False):
+        return db.execute("""SELECT delivery_id, channel FROM presentations WHERE task_id=?
             AND (occurrence=? OR (channel='os_notification' AND state IN
             ('submitting','scheduled','cancel_intent','cancelling')))
             AND state NOT IN ('cancelled','failed','released','unavailable','grouped')
-            AND (delivery_id IS NOT ? OR channel='os_notification') LIMIT 1""",
-            (task.task_id, task.occurrence, excluding_delivery)).fetchone())
+            AND NOT (? AND occurrence=? AND task_version=? AND channel='os_notification' AND state='scheduled')
+            ORDER BY occurrence=? DESC LIMIT 1""",
+            (task.task_id, task.occurrence, allow_fallback_transfer, task.occurrence, task.version,
+             task.occurrence)).fetchone()
 
-    def _deadline_owner(self, db, task):
-        return self._owned(db, task) or db.execute("""SELECT 1 FROM deliveries
+    def _deadline_owner(self, db, task, *, allow_fallback_transfer=False):
+        return self._presentation_owner(db, task, allow_fallback_transfer=allow_fallback_transfer) is not None or db.execute("""
+            SELECT 1 FROM deliveries
             WHERE task_id=? AND task_version=? AND occurrence=? AND active=1""",
             (task.task_id, task.version, task.occurrence)).fetchone() is not None
 
@@ -647,9 +929,99 @@ class Scheduler:
                     and (cursor is None or head.publication_cursor >= cursor)
                     and (generation is None or head.producer_generation == generation))
 
-    def authorize_proposal(self, *, context_revision: int | None, now: datetime, db=None,
-                           context_valid_until=None, observation_cursor=None, observation_generation=None) -> bool:
+    def _route_version(self, db) -> str:
+        row = None
+        if _table(db, "observation_cloud_routes"):
+            row = db.execute("""SELECT route_generation, consent_generation, permission, verified
+                FROM observation_cloud_routes WHERE user_scope=? AND role=?""",
+                (self.user_scope, SYSTEM2)).fetchone()
+        return json.dumps(tuple(row) if row is not None else None)
+
+    def _material_change(self, head, now, revision, cursor, generation) -> bool:
+        if (head.current is None or not generation or head.producer_generation != generation
+                or cursor is None or head.publication_cursor is None or cursor >= head.publication_cursor):
+            return False
+        check = getattr(self.observation, "presentation_context_changed", None)
+        if check is None:
+            return False
+        try:
+            return check(cursor, head.publication_cursor, revision=revision, generation=generation, now=now)
+        except (sqlite3.Error, OSError, ValueError):
+            return False
+
+    def _context_recheck(self, db, *, presentation_kind, task, cursor, generation, now):
+        # Repeated renders and action retries from the same publication can
+        # request one new judgment. A reminder remains bound to its occurrence.
+        subject = (_occurrence(task), task.version) if task else ()
+        event_id = self._event_id("presentation_changed", presentation_kind, *subject, generation, cursor)
+        self._enqueue(db, event_id=event_id, kind="recheck", at=now, reason="presentation_context_changed",
+                      task=task, valid_until=now + _ACTIONABLE_WAKE_LIFETIME)
+
+    def _presentation_error(self, db, *, now, presentation_kind, channel, context_revision,
+                            observation_cursor, observation_generation, context_valid_until,
+                            recheck_key, capture, task=None, head=None):
+        if context_valid_until is not None and now >= context_valid_until:
+            return "EXPIRED_REQUEST"
+        settings = self._settings(db)
+        if task is not None and not _within_user_bounds(task, now):
+            return "OUTSIDE_WINDOW"
+        previous = None if capture or recheck_key is None else db.execute("""
+            SELECT * FROM system2_presentation_context WHERE delivery_id=? AND user_scope=?
+            """, (recheck_key, self.user_scope)).fetchone()
+        if channel == "os_notification":
+            if not settings.allow_system_notifications:
+                return "DISABLED"
+        else:
+            locked = self._lock_state()
+            if locked is not False:
+                if locked is True and previous is not None:
+                    self._context_recheck(db, presentation_kind=presentation_kind, task=task,
+                                          cursor=previous["publication_cursor"], generation="locked", now=now)
+                return "STALE_CONTEXT"
+        route_version = self._route_version(db)
+        if previous is not None:
+            if now >= _time(previous["valid_until"]):
+                return "EXPIRED_REQUEST"
+            if (previous["channel"] != channel or previous["route_version"] != route_version
+                    or previous["policy_generation"] != settings.observation_generation):
+                return "STALE_CONTEXT"
+            context_revision = previous["context_revision"]
+            observation_cursor = previous["publication_cursor"]
+            observation_generation = previous["observation_generation"]
+        if head is None:
+            head = self._sync(db, now)
+        if self._material_change(head, now, context_revision, observation_cursor, observation_generation):
+            self._context_recheck(db, presentation_kind=presentation_kind, task=task,
+                                  cursor=head.publication_cursor, generation=head.producer_generation, now=now)
+            return "STALE_CONTEXT"
+        if capture and recheck_key:
+            valid_until = context_valid_until or now + _PRESENTATION_LEASE
+            db.execute("""INSERT OR REPLACE INTO system2_presentation_context
+                VALUES (?,?,?,?,?,?,?,?,?)""", (recheck_key, self.user_scope, channel, observation_generation,
+                                               observation_cursor, context_revision, settings.observation_generation,
+                                               route_version, _stamp(valid_until)))
+        return None
+
+    def presentation_permit(self, *, now, presentation_kind, channel="qt", db=None, context_revision=None,
+                            observation_cursor=None, observation_generation=None, context_valid_until=None,
+                            recheck_key=None, capture=False) -> bool:
         with self._transaction(db) as tx:
+            return self._presentation_error(
+                tx, now=now, presentation_kind=presentation_kind, channel=channel, context_revision=context_revision,
+                observation_cursor=observation_cursor, observation_generation=observation_generation,
+                context_valid_until=context_valid_until, recheck_key=recheck_key, capture=capture,
+            ) is None
+
+    def authorize_proposal(self, *, context_revision: int | None, now: datetime, db=None,
+                           context_valid_until=None, observation_cursor=None, observation_generation=None,
+                           recheck_key=None) -> bool:
+        with self._transaction(db) as tx:
+            if semantic_background_enabled():
+                return self._settings(tx).auto_adjust and self.presentation_permit(
+                    now=now, presentation_kind="proposal", context_revision=context_revision,
+                    context_valid_until=context_valid_until, observation_cursor=observation_cursor,
+                    observation_generation=observation_generation, recheck_key=recheck_key, capture=True, db=tx,
+                )
             head = self._sync(tx, now)
             if (head.current_status != "fresh" or not head.current or head.current.state not in {"working", "available"}
                     or (context_valid_until is not None and now >= context_valid_until)
@@ -689,6 +1061,12 @@ class Scheduler:
                         context_valid_until: datetime, now: datetime, db=None,
                         observation_cursor=None, observation_generation=None) -> bool:
         with self._transaction(db) as tx:
+            if semantic_background_enabled():
+                return self._settings(tx).auto_adjust and self.presentation_permit(
+                    now=now, presentation_kind="proposal", context_revision=context_revision,
+                    context_valid_until=context_valid_until, observation_cursor=observation_cursor,
+                    observation_generation=observation_generation, recheck_key=delivery_id, db=tx,
+                )
             if not opportunity_id:
                 return self.authorize_proposal(
                     context_revision=context_revision, context_valid_until=context_valid_until, now=now, db=tx,
@@ -728,8 +1106,22 @@ class Scheduler:
     def authorize_reminder(self, *, occurrence_id: str, context_revision: int | None, reason_code: str,
                            now: datetime, db=None) -> ReminderAuthorization:
         with self._transaction(db) as tx:
+            head = self._sync(tx, now)
+            if semantic_background_enabled():
+                return self._semantic_reminder(tx, occurrence_id, now, head)
             return self._authorize_reminder(tx, occurrence_id=occurrence_id, context_revision=context_revision,
-                                            reason_code=reason_code, now=now, head=self._sync(tx, now))
+                                            reason_code=reason_code, now=now, head=head)
+
+    def _semantic_reminder(self, db, occurrence_id, now, head):
+        task = self._resolve(db, occurrence_id)
+        if not _soft_lifetime(task, now):
+            raise SchedulerError("STALE_TASK", "The soft reminder occurrence is no longer active")
+        earliest = task.draft.explicit_start_at
+        if earliest is not None and now < earliest:
+            raise SchedulerError("OUTSIDE_WINDOW", "The reminder is earlier than the time the user allowed")
+        until = min(value for value in (now + _PRESENTATION_LEASE, task.draft.hard_deadline, task.draft.expires_at)
+                    if value is not None)
+        return ReminderAuthorization(head, task, None, until, False, self._urgency(task, now))
 
     @staticmethod
     def _deny(code: str) -> dict:
@@ -739,30 +1131,49 @@ class Scheduler:
         if len(occurrence_ids) != 1 or not isinstance(reason_code, str) or not reason_code.strip():
             return self._deny("INVALID_ARGUMENT")
         options = presentation if isinstance(presentation, Mapping) else {}
-        if (options.get("channel", "pet_card") != "pet_card"
-                or presentation in ("os_notification", "pet_badge")):
+        semantic = semantic_background_enabled()
+        supported_channels = {"pet_card", "pet_badge", "os_notification"} if semantic else {"pet_card"}
+        channel = options.get("channel", presentation if presentation in ("os_notification", "pet_badge") else "pet_card")
+        if not isinstance(channel, str) or channel not in supported_channels:
             return self._deny("UNSUPPORTED_CHANNEL")
         with self._transaction(db) as tx:
             context_revision = getattr(authority, "context_revision", None)
+            cursor = getattr(authority, "observation_cursor", None)
+            generation = getattr(authority, "observation_generation", None)
             try:
                 grant = self.authorize_reminder(occurrence_id=occurrence_ids[0], context_revision=context_revision,
                                                 reason_code=reason_code, now=now, db=tx)
             except SchedulerError as error:
                 return self._deny(error.code)
-            original_valid_until = getattr(authority, "observation_valid_until", None)
-            if not self._matches_context(grant.head, now, context_revision, original_valid_until,
-                                         getattr(authority, "observation_cursor", None),
-                                         getattr(authority, "observation_generation", None)):
+            authority_limit = getattr(authority, "expires_at" if semantic else "observation_valid_until", None)
+            if not semantic and not self._matches_context(grant.head, now, context_revision, authority_limit,
+                                                          cursor, generation):
                 return self._deny("STALE_CONTEXT")
-            valid_until = min(grant.valid_until, original_valid_until) if original_valid_until else grant.valid_until
+            valid_until = min(grant.valid_until, authority_limit) if authority_limit else grant.valid_until
             task = grant.task
             self._revoke_stale_deliveries(tx, now, grant.head)
             delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
-            if self._owned(tx, task, excluding_delivery=delivery_id) or self._effect_started(tx, delivery_id):
-                return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id}
-            existing = tx.execute("SELECT status,active FROM deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
-            if existing and existing["active"]:
-                return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id}
+            owner = self._presentation_owner(tx, task, allow_fallback_transfer=semantic)
+            if owner is not None:
+                return {"status": "pending", "delivery_id": owner["delivery_id"], "subject_ref": task.task_id,
+                        "view": {"channel": owner["channel"]}}
+            existing = tx.execute("SELECT command FROM deliveries WHERE delivery_id=? AND active=1",
+                                  (delivery_id,)).fetchone()
+            if existing is not None:
+                queued = DisplayCommand.model_validate_json(existing["command"])
+                return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id,
+                        "view": {"channel": queued.channel}}
+            if semantic:
+                error = self._presentation_error(
+                    tx, now=now, presentation_kind="reminder", channel=channel, context_revision=context_revision,
+                    observation_cursor=cursor, observation_generation=generation, context_valid_until=valid_until,
+                    recheck_key=delivery_id, capture=True, task=task, head=grant.head,
+                )
+                if error:
+                    result = self._deny(error)
+                    if error == "STALE_CONTEXT":
+                        result.update(outcome="deferred", retryable=True)
+                    return result
             if grant.opportunity_id:
                 if (grant.opportunity_id != getattr(authority, "opportunity_id", None)
                         or (not self._time_sensitive(task, now) and self.has_time_sensitive_candidate(now=now, db=tx))
@@ -775,12 +1186,18 @@ class Scheduler:
             mover = options.get("animation")
             animation = mover if not low and mover in ("idle", "look_up", "wave", "approach") else None
             settings = self._settings(tx)
-            sound = ("reminder" if not low and settings.reminder_sound
+            sound = ("reminder" if not low and channel != "pet_badge" and settings.reminder_sound
                      and options.get("sound") in (True, "reminder") else None)
+            if semantic:
+                if settings.reduce_motion or not settings.allow_proactive_movement or channel != "pet_card":
+                    position = "stay"
+                if settings.reduce_motion or channel != "pet_card":
+                    animation = None
             command = DisplayCommand(delivery_id=delivery_id, task_id=task.task_id, task_version=task.version,
                                      occurrence=task.occurrence, content=task.draft.content, requested_at=now,
                                      expires_at=valid_until, reason="tool", context_revision=context_revision,
-                                     context_valid_until=valid_until, position_hint=position, sound=sound, animation=animation)
+                                     context_valid_until=valid_until, position_hint=position, sound=sound,
+                                     animation=animation, channel=channel)
             tx.execute("""INSERT OR REPLACE INTO deliveries
                 (delivery_id,task_id,task_version,occurrence,command,status,attempts,last_attempt_at,owner,
                 last_attempt_mono,receipt,active) VALUES (?,?,?,?,?,'pending',1,?,?,?,NULL,1)""", (
@@ -788,23 +1205,35 @@ class Scheduler:
                 now.isoformat(), "system2", self.clock.monotonic_now(),
             ))
             tx.execute("""INSERT OR REPLACE INTO system2_reminder_authority VALUES (?,?,?,?,?,?,?,?,?,?,'pending')""", (
-                delivery_id, self.user_scope, grant.opportunity_id, grant.head.producer_generation,
-                grant.head.publication_cursor, context_revision, _stamp(valid_until), reason_code, grant.urgency_reason,
-                low,
+                delivery_id, self.user_scope, grant.opportunity_id, grant.head.producer_generation or "",
+                grant.head.publication_cursor or 0, context_revision or 0, _stamp(valid_until), reason_code,
+                grant.urgency_reason, low,
             ))
             tx.execute("""INSERT INTO outbox(kind,task_id,task_version,delivery_id,not_before)
                           VALUES ('show',?,?,?,?)""", (task.task_id, task.version, delivery_id, now.isoformat()))
             tx.execute("INSERT INTO events(recorded_at,kind,fields) VALUES (?, 'delivery.requested', ?)", (
                 now.isoformat(), json.dumps({"task_id": task.task_id, "task_version": task.version, "delivery_id": delivery_id,
                     "payload": {"reason": reason_code, "window_open_at": str(task.draft.opens_at),
-                                "window_close_at": str(task.draft.window_close_at), "observation_state": grant.head.current.state,
-                                "style": "low" if low else "ordinary", "occurrence": task.occurrence}}),
+                                "window_close_at": str(task.draft.window_close_at),
+                                "observation_state": grant.head.current.state if grant.head.current else "unknown",
+                                "channel": channel, "style": "low" if low else "ordinary", "occurrence": task.occurrence}}),
             ))
-            return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id}
+            return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id,
+                    "view": {"channel": channel}}
 
-    def _still_authorized(self, db, authority, task, now, head) -> bool:
-        if (authority["state"] == "revoked" or _time(authority["valid_until"]) <= now
-                or head.producer_generation != authority["producer_generation"]
+    def _still_authorized(self, db, authority, task, command, now, head) -> bool:
+        if authority["state"] == "revoked" or _time(authority["valid_until"]) <= now:
+            return False
+        semantic = db.execute("SELECT 1 FROM system2_presentation_context WHERE delivery_id=? AND user_scope=?",
+                              (authority["delivery_id"], self.user_scope)).fetchone()
+        if semantic:
+            return semantic_background_enabled() and self._presentation_error(
+                db, now=now, presentation_kind="reminder", channel=command.channel,
+                context_revision=None, observation_cursor=None, observation_generation=None,
+                context_valid_until=_time(authority["valid_until"]), recheck_key=authority["delivery_id"],
+                capture=False, task=task, head=head,
+            ) is None
+        if (head.producer_generation != authority["producer_generation"]
                 or head.publication_cursor is None or head.publication_cursor < authority["publication_cursor"]):
             return False
         try:
@@ -826,7 +1255,7 @@ class Scheduler:
         if row is None or task is None or task.version != command.task_version or task.occurrence != command.occurrence:
             return False
         head = self._sync(db, now)
-        return bool(self._still_authorized(db, row, task, now, head))
+        return bool(self._still_authorized(db, row, task, command, now, head))
 
     def _revoke_stale_deliveries(self, db, now, head):
         if not _table(db, "deliveries"):
@@ -839,13 +1268,26 @@ class Scheduler:
         for row in rows:
             delivery_id = row["delivery_id"]
             os_owned = row["owner_channel"] == "os_notification"
-            early = DisplayCommand.model_validate_json(row["command"]).reason in _EARLY_REASONS
-            if row["delivery_status"] == "displayed" or row["owner_state"] == "painted":
+            command = DisplayCommand.model_validate_json(row["command"])
+            early = command.reason in _EARLY_REASONS
+            if row["delivery_status"] == "displayed" or row["owner_state"] in {"painted", "badge_shown", "delivered"}:
                 db.execute("UPDATE system2_reminder_authority SET state='presented' WHERE delivery_id=?", (delivery_id,))
                 continue
             task = self._task(db, row["task_id"])
-            if (early and not os_owned and row["active"] and task and task.version == row["task_version"]
-                    and self._still_authorized(db, row, task, now, head)):
+            os_state = row["owner_state"] if os_owned else None
+            fallback_transfer = (task is not None and task.draft.hard_deadline is not None
+                                 and now < task.draft.hard_deadline
+                                 and (os_state in {"scheduled", "cancel_intent", "cancelling"}
+                                      or (os_state == "submitting" and command.channel != "os_notification")))
+            if (os_owned and command.channel == "os_notification" and not fallback_transfer
+                    and os_state in {"submitting", "scheduled", "submitted", "unknown",
+                                     "cancel_intent", "cancelling"}):
+                continue
+            if (early and (not os_owned or command.channel == "os_notification" or fallback_transfer)
+                    and row["active"]
+                    and task and task.version == row["task_version"]
+                    and task.occurrence == row["occurrence"]
+                    and self._still_authorized(db, row, task, command, now, head)):
                 continue
             if not os_owned and self._effect_started(db, delivery_id):
                 continue

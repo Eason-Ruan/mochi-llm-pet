@@ -15,3 +15,4 @@
 | [0009](0009-observation-v2.md) | 独立 Observation v2 的数据流与复跑 |
 | [0010](0010-system2-runtime.md) | DSH 思考运行时、工具授权与验收 |
 | [0011](0011-multimodal-document-observation.md) | 单次多模态调用、文档记忆与 System 2 读取 |
+| [0012](0012-system2-semantic-decisions-proposal.md) | System 2 语义决策、后台唤醒、软提醒和实际投递 |

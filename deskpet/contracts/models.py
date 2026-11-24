@@ -157,6 +157,10 @@ class TaskDraft(Model):
         return value
 
     @property
+    def explicit_start_at(self) -> datetime | None:
+        return max((value for value in (self.earliest_at, self.remind_after) if value is not None), default=None)
+
+    @property
     def opens_at(self) -> datetime | None:
         planned_start = self.window_open_at or self.earliest_at or self.target_at
         edges = [value for value in (planned_start, self.remind_after) if value is not None]
@@ -184,7 +188,7 @@ class TaskDraft(Model):
             raise ValueError("exact reminders require one confirmed time")
         if self.window_close_at is not None and start is not None and self.window_close_at < start:
             raise ValueError("window_close_at precedes the opening time")
-        explicit_start = max((value for value in (self.earliest_at, self.remind_after) if value), default=None)
+        explicit_start = self.explicit_start_at
         if self.target_at is not None and ((explicit_start and self.target_at < explicit_start)
                                            or (deadline and self.target_at > deadline)):
             raise ValueError("target_at is outside the explicit reminder bounds")
@@ -316,6 +320,7 @@ class DisplayCommand(Model):
     context_valid_until: datetime | None = None
     position_hint: Literal["stay", "home", "screen_edge"] | None = None
     animation: Literal["idle", "look_up", "wave", "approach"] | None = None
+    channel: Literal["pet_card", "pet_badge", "os_notification"] = "pet_card"
 
 
 class DisplayReceipt(Model):

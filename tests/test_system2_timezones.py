@@ -102,3 +102,31 @@ def test_qt_reminder_preserves_the_second_hour_when_dst_ends(monkeypatch):
         assert draft["remind_by"] == "2026-11-01T01:30:00-05:00"
     finally:
         panel.close()
+
+
+def test_semantic_relative_reminder_uses_elapsed_time_across_dst(tmp_path):
+    reference = datetime(2026, 3, 8, 6, 30, tzinfo=UTC)
+    business = LocalBusiness(tmp_path)
+    business.clock.advance((reference - business.clock.wall_now()).total_seconds())
+
+    def model(_request, payload, call):
+        assert payload["user_intent"]["requested_at"] == "2026-03-08T01:30:00-05:00"
+        result = call("item_create", "relative", {"type": "reminder", "title": "浇花", "reminder_rule": {
+            "remind_after_offset_s": 3600, "remind_by_offset_s": 3600,
+        }})
+        assert result["outcome"] == "committed"
+        return ""
+
+    host = System2Host(tmp_path, scheduler=business.scheduler, gateway=business.tools,
+                       engine=FixtureEngine(model), settings_store=business.settings, clock=business.clock,
+                       context_reader=business.scheduler.observation, timezone="America/New_York")
+    try:
+        host.submit_user("过一小时叫我去浇花", created_at=reference)
+        business.clock.advance(5)
+        assert host.pump()
+        task, = business.tasks.list_tasks()
+        assert task.draft.remind_by == datetime(2026, 3, 8, 7, 30, tzinfo=UTC)
+        assert host.ui_events()[0].payload["text"] == "已设置提醒「浇花」，03:30:00。"
+    finally:
+        host.close()
+        business.close()

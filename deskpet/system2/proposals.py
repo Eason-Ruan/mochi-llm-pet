@@ -37,12 +37,19 @@ _SCHEMA = (
        FOREIGN KEY(user_scope, proposal_id) REFERENCES system2_proposals(user_scope, id))""",
     """CREATE INDEX IF NOT EXISTS system2_proposal_dispatch
        ON system2_proposal_presentations(user_scope, state)""",
+    """CREATE INDEX IF NOT EXISTS system2_proposal_delivery_subject
+       ON system2_proposal_presentations(user_scope, proposal_id)""",
 )
 
 
 def create_tables(db):
     for statement in _SCHEMA:
         db.execute(statement)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(system2_proposal_presentations)")}
+    if "channel" not in columns:
+        db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet_card'")
+    if "route_binding" not in columns:
+        db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN route_binding TEXT")
 
 
 def _decode(row):
@@ -86,17 +93,19 @@ def save(db, scope, proposal, *, key=None, resolution=None):
 
 
 def enqueue(db, scope, proposal, *, delivery_id, opportunity_id, context_revision, valid_until,
-            observation_cursor, observation_generation):
+            observation_cursor, observation_generation, channel="pet_card", route_binding=None):
     db.execute("""INSERT INTO system2_proposal_presentations
         (delivery_id, user_scope, proposal_id, proposal_version, opportunity_id, context_revision, valid_until,
-         observation_cursor, observation_generation, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+         observation_cursor, observation_generation, channel, route_binding, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
         ON CONFLICT(delivery_id) DO UPDATE SET context_revision=excluded.context_revision,
         valid_until=excluded.valid_until, observation_cursor=excluded.observation_cursor,
-        observation_generation=excluded.observation_generation, state='queued',
+        observation_generation=excluded.observation_generation, channel=excluded.channel,
+        route_binding=excluded.route_binding, state='queued',
         presentation_generation=system2_proposal_presentations.presentation_generation + 1
         WHERE system2_proposal_presentations.state='revoked'""", (
         delivery_id, scope, proposal.id, proposal.version, opportunity_id, context_revision, valid_until.isoformat(),
-        observation_cursor, observation_generation,
+        observation_cursor, observation_generation, channel, route_binding,
     ))
 
 
@@ -117,6 +126,11 @@ def set_delivery(db, scope, delivery_id, state):
     db.execute("""
         UPDATE system2_proposal_presentations SET state=? WHERE user_scope=? AND delivery_id=?
     """, (state, scope, delivery_id))
+
+
+def latest_delivery(db, scope, proposal_id):
+    return db.execute("""SELECT * FROM system2_proposal_presentations
+        WHERE user_scope=? AND proposal_id=? ORDER BY rowid DESC LIMIT 1""", (scope, proposal_id)).fetchone()
 
 
 def revoke_queued(db, scope, proposal_id, *, release):
