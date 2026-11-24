@@ -16,6 +16,7 @@ from deskpet.observation_v2.realtime import sample_realtime_clock
 from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 
+from .contact_history import recent_contacts
 from .semantic_policy import semantic_background_enabled
 
 
@@ -28,8 +29,6 @@ _ACTIONABLE_WAKE_LIFETIME = timedelta(minutes=5)
 _WAKE_RETRY_DELAY = timedelta(seconds=5)
 _SEMANTIC_WAKE_REASONS = {"phase_elapsed", "presentation_context_changed"}
 _PRESENTATION_LEASE = timedelta(seconds=45)
-_CONTACT_HORIZON = timedelta(hours=1)
-_CONTACT_LIMIT = 8
 _EARLY_REASONS = {"opportunity", "tool"}
 _URGENCY_CODES = {"meeting_preparation", "time_sensitive", "deadline_approaching", "expiring"}
 _SCHEMA = (
@@ -74,11 +73,17 @@ _SCHEMA = (
         observation_generation TEXT, publication_cursor INTEGER, context_revision INTEGER,
         policy_generation INTEGER NOT NULL, route_version TEXT NOT NULL, valid_until TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS system2_passive_reminders (
+        user_scope TEXT NOT NULL, task_id TEXT NOT NULL,
+        occurrence INTEGER NOT NULL, PRIMARY KEY(user_scope, task_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS system2_contacts (
         user_scope TEXT NOT NULL, delivery_id TEXT NOT NULL, kind TEXT NOT NULL, at TEXT NOT NULL,
         channel TEXT NOT NULL, subject_ref TEXT, response TEXT,
+        occurrence_id TEXT, exposure TEXT, response_at TEXT, sound_requested INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(user_scope, delivery_id)
     )""",
+    """CREATE INDEX IF NOT EXISTS system2_contact_time ON system2_contacts(user_scope, at)""",
     """CREATE TABLE IF NOT EXISTS system2_opportunities (
         opportunity_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, opened_at TEXT NOT NULL,
         closed_at TEXT, claimed_delivery_id TEXT
@@ -204,6 +209,12 @@ class Scheduler:
         with self._transaction() as db:
             for statement in _SCHEMA:
                 db.execute(statement)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(system2_contacts)")}
+            for name, sql_type in (("occurrence_id", "TEXT"), ("exposure", "TEXT"), ("response_at", "TEXT"),
+                                   ("sound_requested", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE system2_contacts ADD COLUMN {name} {sql_type}")
+            db.execute("CREATE INDEX IF NOT EXISTS system2_contact_response_time ON system2_contacts(user_scope, response_at)")
             created = db.execute("INSERT OR IGNORE INTO system2_schedule(user_scope,tick_at,last_wall) VALUES (?,?,?)",
                                  (self.user_scope, _stamp(now + TICK_INTERVAL), _stamp(now))).rowcount
             if not created:
@@ -807,7 +818,7 @@ class Scheduler:
             for occurrence_id in dict.fromkeys(occurrence_ids):
                 task = self._resolve(db, occurrence_id)
                 if _soft_lifetime(task, as_of):
-                    items.append(self.items.get(task.task_id, db=db) if self.items else task.model_dump(mode="json"))
+                    items.append(self._candidate_view(db, task))
             return items
 
     def ack_wakes(self, ids: Iterable[str], *, db=None) -> None:
@@ -824,42 +835,54 @@ class Scheduler:
                 candidates = [task for task in candidates if not self._deadline_owner(db, task, allow_fallback_transfer=True)]
             else:
                 candidates.sort(key=lambda task: self._priority(task, as_of))
-            items = [self.items.get(task.task_id, db=db) if self.items else task.model_dump(mode="json")
-                     for task in candidates]
+            items = [self._candidate_view(db, task) for task in candidates]
             return {"eligible_items": items, "opportunity_id": self.get_opportunity(db=db),
                     "producer_generation": head.producer_generation, "publication_cursor": head.publication_cursor,
                     "current_phase": _phase(db), "current_status": head.current_status, "current": head.current,
                     "recent_contacts": self._recent_contacts(db, as_of) if semantic_background_enabled() else []}
 
-    def record_contact(self, *, delivery_id, kind, at, channel, subject_ref=None, response=None, db=None):
+    def _candidate_view(self, db, task):
+        view = self.items.get(task.task_id, db=db) if self.items else task.model_dump(mode="json")
+        if semantic_background_enabled() and db.execute("""SELECT 1 FROM system2_passive_reminders
+            WHERE user_scope=? AND task_id=? AND occurrence=?""",
+            (self.user_scope, task.task_id, task.occurrence)).fetchone():
+            view["passive_available"] = True
+        return view
+
+    def passive_reminders(self, now):
+        if not semantic_background_enabled():
+            return []
+        with self._transaction(write=False) as db:
+            rows = db.execute("""SELECT m.occurrence, t.view FROM system2_passive_reminders m
+                JOIN tasks t ON t.task_id=m.task_id WHERE m.user_scope=?""", (self.user_scope,))
+            result = []
+            for row in rows:
+                task = TaskView.model_validate_json(row["view"])
+                if row["occurrence"] == task.occurrence and _within_user_bounds(task, now):
+                    result.append({"task_id": task.task_id, "occurrence": task.occurrence})
+            return result
+
+    def record_contact(self, *, delivery_id, kind, at, channel, subject_ref=None, occurrence_id=None,
+                       exposure=None, response=None, sound_requested=False, db=None):
+        timestamp = _stamp(at)
         with self._transaction(db) as tx:
-            tx.execute("""INSERT INTO system2_contacts VALUES (?,?,?,?,?,?,?)
+            tx.execute("""INSERT INTO system2_contacts
+                (user_scope,delivery_id,kind,at,channel,subject_ref,response,occurrence_id,exposure,response_at,sound_requested)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(user_scope, delivery_id) DO UPDATE SET
-                response=coalesce(excluded.response, system2_contacts.response)""",
-                (self.user_scope, delivery_id, kind, _stamp(at), channel, subject_ref, response))
+                occurrence_id=coalesce(system2_contacts.occurrence_id, excluded.occurrence_id),
+                exposure=CASE WHEN excluded.exposure='painted' THEN excluded.exposure
+                    ELSE coalesce(system2_contacts.exposure, excluded.exposure) END,
+                response=coalesce(excluded.response, system2_contacts.response),
+                response_at=CASE WHEN excluded.response=system2_contacts.response
+                    THEN coalesce(system2_contacts.response_at, excluded.response_at)
+                    ELSE coalesce(excluded.response_at, system2_contacts.response_at) END,
+                sound_requested=max(excluded.sound_requested, system2_contacts.sound_requested)""",
+                (self.user_scope, delivery_id, kind, timestamp, channel, subject_ref, response,
+                 occurrence_id, exposure, timestamp if response else None, int(sound_requested)))
 
     def _recent_contacts(self, db, as_of):
-        since = _stamp(as_of - _CONTACT_HORIZON)
-        contacts = [dict(row) for row in db.execute("""SELECT delivery_id, kind, at, channel, subject_ref, response
-            FROM system2_contacts WHERE user_scope=? AND at BETWEEN ? AND ?
-            ORDER BY at DESC LIMIT ?""", (self.user_scope, since, _stamp(as_of), _CONTACT_LIMIT))]
-        if _table(db, "presentations") and _table(db, "tasks"):
-            for row in db.execute("""SELECT p.delivery_id, p.channel, p.updated_at, t.view, p.occurrence
-                FROM presentations p JOIN tasks t ON p.task_id=t.task_id
-                LEFT JOIN system2_reminder_authority a ON a.delivery_id=p.delivery_id
-                WHERE p.state IN ('painted','badge_shown','delivered')
-                  AND julianday(p.updated_at) BETWEEN julianday(?) AND julianday(?)
-                  AND coalesce(a.user_scope, 'default')=?
-                ORDER BY julianday(p.updated_at) DESC LIMIT ?""", (since, _stamp(as_of), self.user_scope, _CONTACT_LIMIT)):
-                task = TaskView.model_validate_json(row["view"])
-                contact = {"kind": "reminder", "at": _stamp(_time(row["updated_at"])),
-                           "delivery_id": row["delivery_id"], "channel": row["channel"],
-                           "subject_ref": f"item:{task.task_id}",
-                           "occurrence_id": f"{task.task_id}:{row['occurrence']}"}
-                if task.occurrence == row["occurrence"] and task.acknowledged_at and task.acknowledged_at <= as_of:
-                    contact["response"] = "acknowledged"
-                contacts.append(contact)
-        return sorted(contacts, key=lambda contact: contact["at"], reverse=True)[:_CONTACT_LIMIT]
+        return recent_contacts(db, self.user_scope, as_of)
 
     @staticmethod
     def _urgency(task: TaskView, now: datetime) -> str | None:
@@ -873,13 +896,15 @@ class Scheduler:
 
     @staticmethod
     def _presentation_owner(db, task: TaskView, *, allow_fallback_transfer=False):
+        deadline = task.draft.hard_deadline
+        transferable = allow_fallback_transfer and task.draft.mode == "soft" and deadline is not None
         return db.execute("""SELECT delivery_id, channel FROM presentations WHERE task_id=?
             AND (occurrence=? OR (channel='os_notification' AND state IN
             ('submitting','scheduled','cancel_intent','cancelling')))
             AND state NOT IN ('cancelled','failed','released','unavailable','grouped')
-            AND NOT (? AND occurrence=? AND task_version=? AND channel='os_notification' AND state='scheduled')
+            AND NOT (? AND occurrence=? AND deadline IS ? AND channel='os_notification' AND state='scheduled')
             ORDER BY occurrence=? DESC LIMIT 1""",
-            (task.task_id, task.occurrence, allow_fallback_transfer, task.occurrence, task.version,
+            (task.task_id, task.occurrence, transferable, task.occurrence, deadline.isoformat() if deadline else None,
              task.occurrence)).fetchone()
 
     def _deadline_owner(self, db, task, *, allow_fallback_transfer=False):
@@ -1132,9 +1157,17 @@ class Scheduler:
             return self._deny("INVALID_ARGUMENT")
         options = presentation if isinstance(presentation, Mapping) else {}
         semantic = semantic_background_enabled()
+        level = options.get("level")
+        if level not in (None, "quiet", "passive", "actionable", "enhanced"):
+            return self._deny("INVALID_ARGUMENT")
+        if level == "quiet":
+            return {"status": "applied", "outcome": "quiet", "interruption_level": level}
+        if level == "passive" and (not semantic or options.get("channel") not in (None, "pet_badge")):
+            return self._deny("UNSUPPORTED_CHANNEL")
         supported_channels = {"pet_card", "pet_badge", "os_notification"} if semantic else {"pet_card"}
-        channel = options.get("channel", presentation if presentation in ("os_notification", "pet_badge") else "pet_card")
-        if not isinstance(channel, str) or channel not in supported_channels:
+        channel = options.get("channel") or (presentation if presentation in ("os_notification", "pet_badge") else "pet_card")
+        if (not isinstance(channel, str) or channel not in supported_channels
+                or (level in {"actionable", "enhanced"} and channel == "pet_badge")):
             return self._deny("UNSUPPORTED_CHANNEL")
         with self._transaction(db) as tx:
             context_revision = getattr(authority, "context_revision", None)
@@ -1151,6 +1184,15 @@ class Scheduler:
                 return self._deny("STALE_CONTEXT")
             valid_until = min(grant.valid_until, authority_limit) if authority_limit else grant.valid_until
             task = grant.task
+            if level == "passive":
+                # Updating the menu must not claim or acknowledge the occurrence's primary delivery.
+                tx.execute("""INSERT INTO system2_passive_reminders (user_scope, task_id, occurrence) VALUES (?,?,?)
+                    ON CONFLICT(user_scope, task_id) DO UPDATE SET occurrence=excluded.occurrence
+                    WHERE occurrence<>excluded.occurrence""",
+                    (self.user_scope, task.task_id, task.occurrence))
+                return {"status": "applied", "outcome": "committed", "subject_ref": task.task_id,
+                        "interruption_level": level, "view": {"channel": "reminder_menu"},
+                        "presentation_receipt": {"channel": "reminder_menu", "state": "available"}}
             self._revoke_stale_deliveries(tx, now, grant.head)
             delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
             owner = self._presentation_owner(tx, task, allow_fallback_transfer=semantic)
@@ -1186,8 +1228,14 @@ class Scheduler:
             mover = options.get("animation")
             animation = mover if not low and mover in ("idle", "look_up", "wave", "approach") else None
             settings = self._settings(tx)
+            request_sound = options.get("sound") in (True, "reminder")
+            if level == "actionable":
+                request_sound = False
+            elif level == "enhanced":
+                request_sound = options.get("sound") is not False
             sound = ("reminder" if not low and channel != "pet_badge" and settings.reminder_sound
-                     and options.get("sound") in (True, "reminder") else None)
+                     and task.draft.sound is not False
+                     and request_sound else None)
             if semantic:
                 if settings.reduce_motion or not settings.allow_proactive_movement or channel != "pet_card":
                     position = "stay"
@@ -1216,10 +1264,11 @@ class Scheduler:
                     "payload": {"reason": reason_code, "window_open_at": str(task.draft.opens_at),
                                 "window_close_at": str(task.draft.window_close_at),
                                 "observation_state": grant.head.current.state if grant.head.current else "unknown",
-                                "channel": channel, "style": "low" if low else "ordinary", "occurrence": task.occurrence}}),
+                                "channel": channel, "style": "low" if low else "ordinary", "occurrence": task.occurrence,
+                                **({"interruption_level": level} if level else {})}}),
             ))
             return {"status": "pending", "delivery_id": delivery_id, "subject_ref": task.task_id,
-                    "view": {"channel": channel}}
+                    "view": {"channel": channel}, **({"interruption_level": level} if level else {})}
 
     def _still_authorized(self, db, authority, task, command, now, head) -> bool:
         if authority["state"] == "revoked" or _time(authority["valid_until"]) <= now:

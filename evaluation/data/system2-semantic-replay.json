@@ -266,6 +266,141 @@
           "engine":{"delay_s":46,"calls":[{"action":"item.create","args":{"type":"reminder","title":"去趟洗手间"},"at_request_plus_s":600}]},
           "expect":{"effects":[],"reply":["expired_request"]}}
       ]
+    },
+    {
+      "id": "interruption-exact-transfer",
+      "description": "An exact transfer reminder arrives once at 09:00 even though the model is unavailable. The user confirms directly from the cat card.",
+      "at": "2026-11-24T08:59:30+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {"deadlines": {"$transfer.occurrence_id": "$at:30"}},
+      "setup": [
+        {"settings":{"reminder_sound":false,"allow_system_notifications":false}},
+        {"local":{"action":"item.create","save_as":"transfer","args":{"type":"reminder","title":"汇丰转账","reminder_rule":{"remind_after":"$at:30","remind_by":"$at:30"}}}}
+      ],
+      "steps": [
+        {"id":"before","offset_s":29,"events":[{"resume":null}],"engine":{"unavailable":true},"expect":{"effects":[]}},
+        {"id":"due","offset_s":30,"events":[{"local_pump":null}],"run":false,
+          "expect":{"effects":["reminder_shown"],"channel":"pet_card","local_deadline":"2026-11-24T09:00:00+08:00","silent":true}},
+        {"id":"confirm","offset_s":31,"events":[{"reminder_action":{"reminder":"transfer","action":"ack"}}],
+          "expect":{"effects":["changed_item"],"action_status":["applied"]}},
+        {"id":"later","offset_s":90,"events":[{"poll":null}],"quiet":true,"expect":{"effects":[]}}
+      ]
+    },
+    {
+      "id": "interruption-flexible-meeting",
+      "description": "Laundry can wait while a meeting continues. Multiple minute ticks stay quiet. The current reminder surfaces after the meeting and an expired soft reminder stays gone.",
+      "at": "2026-11-24T14:59:30+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {},
+      "setup": [
+        {"local":{"action":"item.create","save_as":"laundry","args":{"type":"reminder","title":"收衣服","reminder_rule":{"target_at":"$at:30","window_open_at":"$at:30","window_close_at":"$at:250","expires_at":"$at:280"}}}},
+        {"local":{"action":"item.create","save_as":"expired","args":{"type":"reminder","title":"会前检查笔记","reminder_rule":{"target_at":"$at:30","window_open_at":"$at:30","window_close_at":"$at:90","expires_at":"$at:100"}}}}
+      ],
+      "steps": [
+        {"id":"in-meeting","offset_s":30,"events":[{"observation":{"state":"working","revision":1,"summary":"Attending a synthetic video meeting."}},{"poll":null}],
+          "engine":{"calls":[
+            {"action":"reminder.recheck","args":{"occurrence_id":"$laundry.occurrence_id","run_at":"$at:210"}},
+            {"action":"reminder.present","args":{"occurrence_ids":["$laundry.occurrence_id"],"presentation":{"level":"quiet"},"reason_code":"meeting"}}
+          ]},"quiet":true,"expect":{"effects":[],"wake_reasons":["window_open"]}},
+        {"id":"meeting-continues","offset_s":90,"events":[{"observation":{"state":"working","revision":2,"summary":"The synthetic meeting continues."}},{"poll":null}],
+          "engine":{"calls":[{"action":"pet.present","args":{"level":"quiet","intent":"look_up","text":"仍在开会"}}]},
+          "quiet":true,"expect":{"effects":[],"wake_reasons":["tick"]}},
+        {"id":"still-in-meeting","offset_s":150,"events":[{"observation":{"state":"working","revision":3,"summary":"The meeting is still in progress."}},{"poll":null}],
+          "quiet":true,"expect":{"effects":["changed_item"],"wake_reasons":["tick"]}},
+        {"id":"after-meeting","offset_s":210,"events":[{"observation":{"state":"available","revision":4,"summary":"The synthetic meeting ended."}},{"poll":null}],
+          "engine":{"calls":[
+            {"action":"reminder.present","args":{"occurrence_ids":["$expired.occurrence_id"],"presentation":{"level":"enhanced"},"reason_code":"old"}},
+            {"action":"reminder.present","args":{"occurrence_ids":["$laundry.occurrence_id"],"presentation":{"level":"actionable"},"reason_code":"meeting_ended"}}
+          ]},"expect":{"effects":["reminder_shown"],"channel":"pet_card","silent":true,"wake_reasons":["scheduled_recheck"]}},
+        {"id":"confirm","offset_s":211,"events":[{"reminder_action":{"reminder":"laundry","action":"ack"}}],
+          "expect":{"effects":["changed_item"],"action_status":["applied"]}}
+      ]
+    },
+    {
+      "id": "interruption-focus-offer-refused",
+      "description": "A working user receives a silent focus suggestion. Explicit refusal keeps identical suggestions off the screen on later ticks.",
+      "at": "2026-11-24T15:59:30+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {},
+      "setup": [{"settings":{"auto_adjust":true}}],
+      "steps": [
+        {"id":"offer","offset_s":60,"events":[{"observation":{"state":"working","revision":1,"summary":"Writing a synthetic report."}},{"poll":null}],
+          "engine":{"calls":[{"action":"proposal.offer","args":{"function":"phase.start","args":{"planned_duration_s":900},"display_text":"开始 15 分钟专注吗？","presentation":{"level":"actionable"}}}]},
+          "expect":{"effects":["proposal_shown"],"channel":"pet_card","silent":true}},
+        {"id":"reject","offset_s":61,"events":[{"resolve_proposal":"reject"}],"expect":{"effects":[],"action_status":["applied"]}},
+        {"id":"first-retry","offset_s":120,"events":[{"observation":{"state":"working","revision":2,"summary":"Still writing the synthetic report."}},{"poll":null}],
+          "engine":{"calls":[{"action":"proposal.offer","args":{"function":"phase.start","args":{"planned_duration_s":900},"display_text":"开始 15 分钟专注吗？","presentation":{"level":"actionable"}}}]},
+          "quiet":true,"expect":{"effects":[],"wake_reasons":["tick"]}},
+        {"id":"second-retry","offset_s":180,"events":[{"observation":{"state":"working","revision":3,"summary":"Still writing the synthetic report."}},{"poll":null}],
+          "engine":{"calls":[{"action":"proposal.offer","args":{"function":"phase.start","args":{"planned_duration_s":900},"display_text":"开始 15 分钟专注吗？","presentation":{"level":"passive"}}}]},
+          "quiet":true,"expect":{"effects":[],"wake_reasons":["tick"]}}
+      ]
+    },
+    {
+      "id": "interruption-phase-and-deadline",
+      "description": "A focus phase ends at the same instant as an exact reminder. The phase settles, the reminder occupies the active visual slot, and the batch requests one sound.",
+      "at": "2026-11-24T16:01:00+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {"deadlines": {"$due.occurrence_id": "$at:12"}},
+      "setup": [
+        {"settings":{"auto_adjust":true,"reminder_sound":true,"phase_end_sound":true,"allow_system_notifications":false}},
+        {"local":{"action":"phase.start","args":{"planned_duration_s":12}}},
+        {"local":{"action":"item.create","save_as":"due","args":{"type":"reminder","title":"提交会前材料","reminder_rule":{"remind_after":"$at:12","remind_by":"$at:12"}}}}
+      ],
+      "steps": [
+        {"id":"phase-running","offset_s":0,"run":false,"expect":{"effects":[]}},
+        {"id":"concurrent","offset_s":12,"events":[{"observation":{"state":"available","revision":1}},{"poll":null}],
+          "engine":{"calls":[{"action":"proposal.offer","args":{"function":"phase.start","args":{"kind":"short_break","planned_duration_s":300},"display_text":"开始短休息吗？","presentation":{"level":"actionable"}}}]},
+          "same_batch":true,"expect":{"effects":["phase_elapsed","reminder_shown"],"local_deadline":"2026-11-24T16:01:12+08:00"}},
+        {"id":"confirm","offset_s":13,"events":[{"reminder_action":{"reminder":"due","action":"ack"}}],
+          "expect":{"effects":["changed_item"],"action_status":["applied"]}},
+        {"id":"second-tick","offset_s":60,"events":[{"poll":null}],"quiet":true,"expect":{"effects":[]}}
+      ]
+    },
+    {
+      "id": "interruption-lock-unlock",
+      "description": "Two exact items arrive on the simulated system channel while locked. Unlock retains the current item in the menu and filters the expired item without opening another active surface.",
+      "at": "2026-11-24T16:20:00+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {"native": true, "deadlines": {"$valid.occurrence_id": "$at:10", "$expired.occurrence_id": "$at:11"}},
+      "setup": [
+        {"settings":{"allow_system_notifications":true,"reminder_sound":false}},
+        {"local":{"action":"item.create","save_as":"valid","args":{"type":"reminder","title":"检查门窗","reminder_rule":{"remind_after":"$at:10","remind_by":"$at:10"}}}},
+        {"local":{"action":"item.create","save_as":"expired","args":{"type":"reminder","title":"及时查看示例状态","reminder_rule":{"remind_after":"$at:11","remind_by":"$at:11","expires_at":"$at:16"}}}}
+      ],
+      "steps": [
+        {"id":"arm","offset_s":0,"run":false,"expect":{"effects":[]}},
+        {"id":"lock","offset_s":2,"events":[{"lock":true}],"run":false,"expect":{"effects":[]}},
+        {"id":"native-valid","offset_s":10,"events":[{"local_pump":null}],"run":false,
+          "expect":{"effects":["reminder_shown"],"channel":"os_notification","silent":true}},
+        {"id":"native-expiring","offset_s":11,"events":[{"local_pump":null}],"run":false,
+          "expect":{"effects":["reminder_shown"],"channel":"os_notification","silent":true}},
+        {"id":"unlock","offset_s":20,"events":[{"lock":false},{"resume":null},{"poll":null}],
+          "expect":{"effects":["changed_item"],"menu_contains":["$valid.id"],"menu_excludes":["$expired.id"],"silent":true}},
+        {"id":"confirm","offset_s":21,"events":[{"native_action":{"reminder":"valid","action":"ack"}}],
+          "expect":{"effects":["changed_item"],"action_status":["applied"]}}
+      ]
+    },
+    {
+      "id": "interruption-stale-native-button",
+      "description": "The first native reminder is snoozed for five minutes. An old notification's confirm button must leave the new occurrence pending. At the new deadline a fresh native action succeeds.",
+      "at": "2026-11-24T16:25:00+08:00", "timezone": "Asia/Shanghai",
+      "interruption": {"native": true, "deadlines": {"$old.occurrence_id": "$at:10", "$new.occurrence_id": "$at:313"}},
+      "setup": [
+        {"settings":{"allow_system_notifications":true,"reminder_sound":false}},
+        {"local":{"action":"item.create","save_as":"old","args":{"type":"reminder","title":"取文件","reminder_rule":{"remind_after":"$at:10","remind_by":"$at:10"}}}}
+      ],
+      "steps": [
+        {"id":"arm","offset_s":0,"run":false,"expect":{"effects":[]}},
+        {"id":"lock","offset_s":1,"run":false,"events":[{"lock":true}],"expect":{"effects":[]}},
+        {"id":"first-due","offset_s":10,"run":false,"events":[{"local_pump":null}],
+          "expect":{"effects":["reminder_shown"],"channel":"os_notification"}},
+        {"id":"unlock","offset_s":12,"events":[{"lock":false}],"expect":{"effects":[]}},
+        {"id":"snooze","offset_s":13,"events":[{"native_action":{"reminder":"old","action":"snooze","save_as":"new"}}],
+          "expect":{"effects":["rescheduled_reminder"],"action_status":["applied"],"deadline":"2026-11-24T16:30:13+08:00"}},
+        {"id":"click-old","offset_s":14,"events":[{"native_action":{"reminder":"old","action":"ack"}}],
+          "expect":{"effects":[],"action_status":["rejected"]}},
+        {"id":"lock-again","offset_s":311,"run":false,"events":[{"lock":true}],"expect":{"effects":[]}},
+        {"id":"second-due","offset_s":313,"run":false,"events":[{"local_pump":null}],
+          "expect":{"effects":["reminder_shown"],"channel":"os_notification"}},
+        {"id":"confirm-new","offset_s":316,"events":[{"lock":false},{"native_action":{"reminder":"new","action":"ack"}}],
+          "expect":{"effects":["changed_item"],"action_status":["applied"]}}
+      ]
     }
   ]
 }

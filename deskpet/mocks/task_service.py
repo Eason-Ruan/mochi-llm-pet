@@ -200,9 +200,10 @@ class MemoryTaskService:
         elif command.kind in {"edit", "configure"}:
             if draft.item_type != view.draft.item_type:
                 return reject(ErrorCode.INVALID_TRANSITION, "an existing item cannot change type")
+            # Adjusting audio on the same timed reminder must preserve its delivery and acknowledgement.
             unchanged_rule = command.kind == "edit" and all(
                 getattr(draft, name) == getattr(view.draft, name) for name in type(draft).model_fields
-                if name not in {"content", "description", "due_at"}
+                if name not in {"content", "description", "due_at", "sound"}
             )
             new_rule = not unchanged_rule and (draft.reminder_enabled or view.draft.reminder_enabled)
             updated = view.model_copy(update={"draft": draft, "version": view.version+1,
@@ -513,7 +514,7 @@ class MemoryTaskService:
                                  expires_at=self._lease_end(view, now), reason=reason,
                                  context_revision=observed.context_revision if observed else None,
                                  context_valid_until=observed.estimate.valid_until if observed else None,
-                                 sound=None if early else "reminder")
+                                 sound=None if early or view.draft.sound is False else "reminder")
         attempt = _Attempt(command=command, last_attempt_mono=self.clock.monotonic_now())
         self._attempts[delivery_id] = attempt
         self._active_delivery[view.task_id] = delivery_id

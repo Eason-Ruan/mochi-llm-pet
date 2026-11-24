@@ -79,7 +79,7 @@ def exercise_desktop(data_dir, run):
         profile="realtime", scenario="native-followup", data_dir=data_dir,
         output=data_dir, synthetic_delivery=True, adapters=None,
     ))
-    locked = run == "first"
+    locked = False
     session.presentation.lock_probe = lambda: locked
 
     def wait(predicate, description):
@@ -138,17 +138,12 @@ def exercise_desktop(data_dir, run):
         return show_bubble(text, *args, **kwargs)
 
     try:
+        if run == "first":
+            session.pet.show_bubble = cancel_queued_bubble
         wait(lambda: session.window.ready_for_actions and len(session.window.views) == len(REMINDERS), "desktop ready")
         click(session.pet.buttons["collapse"])
         wait(lambda: session.pet.findChild(QPushButton, "refine-menu-expand").isVisible(), "collapsed cat")
         if run == "first":
-            session.pet.show_bubble = cancel_queued_bubble
-            QTest.qWait(400)
-            assert session.pet.bubble is None and not paints()
-            locked = None
-            QTest.qWait(400)
-            assert session.pet.bubble is None and not paints()
-            locked = False
             bubble = wait(lambda: find_bubble("提醒：喝水"), "delivered native reminder on the collapsed cat")
             assert cancelled_after_queue
             assert session.window.views["cancel-before-paint"]["status"] == "cancelled"
@@ -168,11 +163,14 @@ def exercise_desktop(data_dir, run):
             locked = True
             click(bubble.findChild(QPushButton, "refine-bubble-yes"))
             wait(lambda: session.pet.bubble is None, "action retired when the desktop locks")
+            wait(lambda: session.presentation._lock_state is False, "desktop observed the lock")
             assert session.window.views["menu-snooze"]["version"] == 1
             assert session.window.views["menu-snooze"]["acknowledged_at"] is None
 
             locked = False
-            wait(lambda: find_bubble("待确认提醒：检查门窗"), "ambiguous OS reminder without a delivery claim")
+            wait(lambda: session.presentation.can_present(), "desktop unlocked")
+            QTest.qWait(400)
+            assert session.pet.bubble is None
             assert session.window.views["menu-snooze"]["version"] == 1
         else:
             assert session.pet.bubble is None
@@ -202,7 +200,7 @@ def exercise_desktop(data_dir, run):
             assert not menu_button("menu-ack", "ack")
             assert session.pet.bubble is None
 
-        assert paints() == sorted((task_id, 1) for task_id, _, _ in REMINDERS if task_id != "cancel-before-paint")
+        assert paints() == [("menu-snooze", 1), ("popup-ack", 1), ("popup-snooze", 1)]
         assert all(view["displayed_at"] is None for view in session.window.views.values())
         assert query("SELECT count(*) FROM deliveries") == [(0,)]
         assert query("SELECT count(*) FROM events WHERE kind = 'sound.requested'") == [(0,)]

@@ -31,7 +31,7 @@ from .bailian import BailianTurn
 from .dsh_profile import isolated_environment, write_profile
 from .dsh_projection import project_input, project_tool_result
 from .gateway import ModelGateway, SendPolicy
-from .semantic_policy import semantic_background_enabled, semantic_chat_enabled
+from .semantic_policy import semantic_background_enabled, semantic_chat_enabled, text_sharing_allowed
 from .tool_schema import READ_TOOLS, canonical_tool_name
 
 _WIRE_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
@@ -367,8 +367,7 @@ class DSHEngine:
         if (getattr(turn, "observation_generation", None) not in (None, generation)
                 or getattr(turn, "observation_privacy_marker", None) not in (None, marker)):
             raise CloudRouteError("System 2 activity authorization changed")
-        share = (not preferences.observation_paused and marker[2] is not True
-                 and (not snapshot.route.is_cloud or snapshot.permission))
+        share = text_sharing_allowed(preferences, snapshot, marker[2])
         background = turn.source == "background" and semantic_background_enabled()
         semantic_chat = turn.source == "user" and semantic_chat_enabled()
         # Cloud document sharing is scoped to chat. A local background turn

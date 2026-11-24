@@ -413,7 +413,8 @@ class AdmissionStore:
                 result = recorded
                 if result is None or result["status"] == "timeout":
                     return True
-            if result and (result.get("original_status") or result["status"]) in {"applied", "accepted", "pending"}:
+            if (result and result.get("outcome") != "quiet"
+                    and (result.get("original_status") or result["status"]) in {"applied", "accepted", "pending"}):
                 return True
         return False
 

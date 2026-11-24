@@ -30,6 +30,14 @@ def test_draft_rejects_ambiguous_or_invalid_boundaries(kwargs):
         TaskDraft(content='test', **kwargs)
 
 
+def test_draft_accepts_only_a_timing_condition_as_a_soft_reminder():
+    draft = TaskDraft(content="收衣服", timing_context=" 等我开完会 ")
+    assert draft.timing_context == "等我开完会"
+    assert draft.mode == "soft" and draft.reminder_enabled and draft.hard_deadline is None
+    with pytest.raises(ValidationError):
+        TaskDraft(content="收衣服", timing_context=" ")
+
+
 def test_plan_cannot_mix_different_task_versions():
     env = DecisionEnvelope(request_id='r', task_id='t', task_version=1, context_revision=1,
                            created_at=NOW, expires_at=NOW+timedelta(seconds=30))

@@ -12,7 +12,7 @@ from deskpet.timezones import resolve_timezone
 
 RULE_FIELDS = (
     "remind_after", "target_at", "remind_by", "expires_at", "window_open_at", "window_close_at",
-    "urgency_until", "urgency_reason",
+    "urgency_until", "urgency_reason", "sound", "timing_context",
 )
 
 
@@ -191,13 +191,16 @@ class ItemService:
                 if "title" in patch:
                     updates["content"] = (patch["title"] or "").strip()
                 if "reminder_rule" in patch:
-                    kind = "configure"
-                    updates.update(self._rule_patch(patch["reminder_rule"], item_type=task.draft.item_type,
-                                                    timezone=task.draft.timezone))
+                    rule = patch["reminder_rule"]
+                    kind = "edit" if rule is not None and rule.keys() == {"sound"} else "configure"
+                    updates.update(self._rule_patch(rule, item_type=task.draft.item_type,
+                                                    timezone=task.draft.timezone, previous=task.draft))
                 payload["draft"] = TaskDraft.model_validate(task.draft.model_dump() | updates).model_dump(mode="json")
             elif function == "reminder.configure":
-                kind = "configure"
-                updates = self._rule_patch(args["rule"], item_type=task.draft.item_type, timezone=task.draft.timezone)
+                rule = args["rule"]
+                kind = "edit" if rule.keys() == {"sound"} else "configure"
+                updates = self._rule_patch(rule, item_type=task.draft.item_type,
+                                           timezone=task.draft.timezone, previous=task.draft)
                 payload["draft"] = TaskDraft.model_validate(task.draft.model_dump() | updates).model_dump(mode="json")
             elif function == "item.set_status":
                 kind = "set_status"
@@ -229,7 +232,10 @@ class ItemService:
             "view": self._item(result.view, db) if result.view else None,
         }
 
-    def _rule_patch(self, source, *, item_type, timezone):
+    def _rule_patch(self, source, *, item_type, timezone, previous=None):
+        if (previous is not None and source and source.keys() <= {"sound", "timing_context"}
+                and (previous.reminder_enabled or not source.get("timing_context"))):
+            return source
         enabled = source is not None or item_type == "reminder"
         fields = source or {}
         after = fields.get("remind_after")
@@ -240,6 +246,8 @@ class ItemService:
             "earliest_at": None, "latest_first_delivery_at": None,
             "timezone": fields.get("timezone", timezone),
             **{name: fields.get(name) for name in RULE_FIELDS},
+            "sound": fields.get("sound", previous.sound if enabled and previous is not None else None),
+            "timing_context": fields.get("timing_context", previous.timing_context if enabled and previous else None),
             "window_computed_at": self.tasks.clock.wall_now()
             if fields.get("window_open_at") or fields.get("window_close_at") else None,
         }
@@ -254,7 +262,8 @@ class ItemService:
             "rule": None, "occurrence": None,
         }
         if task.draft.reminder_enabled:
-            result["rule"] = {name: draft[name] for name in RULE_FIELDS} | {
+            result["rule"] = {name: draft[name] for name in RULE_FIELDS
+                              if name != "timing_context" or draft[name] is not None} | {
                 "id": f"rule:{task.task_id}", "item_id": task.task_id, "version": task.rule_version,
                 "timezone": draft["timezone"], "status": "active" if task.active_reminder else "inactive",
                 "remind_after": draft["remind_after"] or draft["earliest_at"],

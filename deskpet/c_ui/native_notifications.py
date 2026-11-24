@@ -3,23 +3,59 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from functools import lru_cache
-from hashlib import sha256
 import sys
+from threading import Lock, Timer
+
+from deskpet.task_service.presentation import notification_id
 
 
 MAC_BUNDLE_ID = "io.github.mochi.deskpet"
 GENERIC_TITLE = "Mochi 有一条提醒"
 GENERIC_BODY = "打开 Mochi 查看提醒。"
+SNOOZE_SECONDS = 300
+ACK_ACTION = "mochi.reminder.ack"
+SNOOZE_ACTION = "mochi.reminder.snooze.5m"
+REMINDER_CATEGORY = "mochi.reminder.ack.v1"
+SNOOZE_CATEGORY = "mochi.reminder.snooze.v1"
+REMINDER_CATEGORIES = frozenset({REMINDER_CATEGORY, SNOOZE_CATEGORY})
 
 
-def notification_id(delivery_id: str) -> str:
-    # Windows tags are limited to 64 characters. Never expose a task ID to the OS.
-    return sha256(delivery_id.encode()).hexdigest()
+def _valid_identifier(identifier: str) -> bool:
+    return len(identifier) == 64 and all(char in "0123456789abcdef" for char in identifier)
+
+
+def _foreground_decision(identifier, options, complete, handler):
+    """Keep the platform deadline covered if the UI cannot claim a first paint."""
+    mutex = Lock()
+    answered = False
+
+    def decide(suppress, *, permit=None):
+        nonlocal answered
+        with mutex:
+            if answered:
+                return False
+            answered = True
+            try:
+                suppress = bool(suppress and (permit is None or permit()))
+            except Exception:
+                suppress = False
+        timer.cancel()
+        complete(0 if suppress else options)
+        return suppress
+
+    timer = Timer(0.35, lambda: decide(False))
+    timer.daemon = True
+    timer.start()
+    try:
+        handler(identifier, decide)
+    except Exception:
+        decide(False)
 
 
 class UnavailableNotifications:
     can_schedule = False
     can_verify_removal = False
+    can_respond = False
 
     def __init__(self, reason="当前桌面环境不支持系统通知"):
         self.status = reason
@@ -42,6 +78,7 @@ class UnavailableNotifications:
 class MacNotifications:
     can_schedule = True
     can_verify_removal = False
+    can_respond = True
     # The two inventories can confirm an early handover while the original
     # scheduled fire time is still safely in the future.
     can_verify_early_transfer = True
@@ -60,28 +97,97 @@ class MacNotifications:
         self._refreshing = False
         self._request_pending = False
         self._authorizing = False
-        self.delegate = self._delegate()
+        self._response_lock = Lock()
+        self._queued_responses = []
+        self._response_handler = None
+        self.delegate = self._delegate_class().alloc().init()
+        self.delegate.response_handler = self._receive_response
+        self.delegate.foreground_handler = None
         self.center.setDelegate_(self.delegate)
+        self._register_categories()
         self.refresh()
+
+    def set_response_handler(self, handler):
+        with self._response_lock:
+            self._response_handler = handler
+            responses, self._queued_responses = self._queued_responses, []
+        for identifier, action in responses:
+            handler(identifier, action)
+
+    def _receive_response(self, identifier, action):
+        with self._response_lock:
+            handler = self._response_handler
+            if handler is None:
+                self._queued_responses.append((identifier, action))
+                return
+        handler(identifier, action)
+
+    def set_foreground_handler(self, handler):
+        self.delegate.foreground_handler = handler
+
+    def _register_categories(self):
+        from UserNotifications import (
+            UNNotificationAction, UNNotificationActionOptionAuthenticationRequired, UNNotificationCategory,
+        )
+
+        options = UNNotificationActionOptionAuthenticationRequired
+        acknowledge = UNNotificationAction.actionWithIdentifier_title_options_(ACK_ACTION, "确认收到", options)
+        snooze = UNNotificationAction.actionWithIdentifier_title_options_(SNOOZE_ACTION, "5 分钟后提醒", options)
+        categories = {
+            UNNotificationCategory.categoryWithIdentifier_actions_intentIdentifiers_options_(
+                REMINDER_CATEGORY, [acknowledge], [], 0,
+            ),
+            UNNotificationCategory.categoryWithIdentifier_actions_intentIdentifiers_options_(
+                SNOOZE_CATEGORY, [acknowledge, snooze], [], 0,
+            ),
+        }
+        self.center.setNotificationCategories_(categories)
 
     @staticmethod
     @lru_cache(maxsize=1)
-    def _delegate():
+    def _delegate_class():
         import objc
         from Foundation import NSObject
         from UserNotifications import (
+            UNNotificationDefaultActionIdentifier,
             UNNotificationPresentationOptionBanner, UNNotificationPresentationOptionList,
             UNNotificationPresentationOptionSound,
         )
 
         class MochiNotificationDelegate(NSObject, protocols=[objc.protocolNamed("UNUserNotificationCenterDelegate")]):
             def userNotificationCenter_willPresentNotification_withCompletionHandler_(self, center, notification, complete):
+                request = notification.request()
                 options = UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList
-                if notification.request().content().sound() is not None:
+                if request.content().sound() is not None:
                     options |= UNNotificationPresentationOptionSound
-                complete(options)
+                identifier = str(request.identifier())
+                handler = self.foreground_handler
+                if (handler is not None and _valid_identifier(identifier)
+                        and str(request.content().categoryIdentifier()) in REMINDER_CATEGORIES):
+                    _foreground_decision(identifier, options, complete, handler)
+                else:
+                    complete(options)
 
-        return MochiNotificationDelegate.alloc().init()
+            def userNotificationCenter_didReceiveNotificationResponse_withCompletionHandler_(
+                self, center, response, complete,
+            ):
+                try:
+                    request = response.notification().request()
+                    identifier = str(request.identifier())
+                    action = str(response.actionIdentifier())
+                    category = str(request.content().categoryIdentifier())
+                    if not _valid_identifier(identifier):
+                        return
+                    if action == UNNotificationDefaultActionIdentifier and category in REMINDER_CATEGORIES | {""}:
+                        self.response_handler(identifier, "open")
+                    elif action == ACK_ACTION and category in REMINDER_CATEGORIES:
+                        self.response_handler(identifier, "ack")
+                    elif action == SNOOZE_ACTION and category == SNOOZE_CATEGORY:
+                        self.response_handler(identifier, "snooze")
+                finally:
+                    complete()
+
+        return MochiNotificationDelegate
 
     def refresh(self, *, request=False):
         from UserNotifications import (
@@ -128,7 +234,7 @@ class MacNotifications:
 
         self.center.getNotificationSettingsWithCompletionHandler_(checked)
 
-    def submit(self, identifier, due_at, *, sound, complete):
+    def submit(self, identifier, due_at, *, sound, complete, snooze=True):
         from UserNotifications import (
             UNMutableNotificationContent, UNNotificationRequest, UNNotificationSound,
             UNTimeIntervalNotificationTrigger,
@@ -140,6 +246,9 @@ class MacNotifications:
         content = UNMutableNotificationContent.alloc().init()
         content.setTitle_(GENERIC_TITLE)
         content.setBody_(GENERIC_BODY)
+        content.setCategoryIdentifier_(SNOOZE_CATEGORY if snooze else REMINDER_CATEGORY)
+        if due_at is not None:
+            content.setThreadIdentifier_(notification_id(f"deadline:{due_at.astimezone(timezone.utc).isoformat()}"))
         if sound and self.sound_available:
             content.setSound_(UNNotificationSound.defaultSound())
         trigger = None
@@ -185,6 +294,7 @@ class WindowsNotifications:
     # A Start-menu AUMID gives a Win32 desktop process immediate toasts.
     can_schedule = False
     can_verify_removal = False
+    can_respond = False
     group = "mochi-reminders"
 
     def __init__(self):

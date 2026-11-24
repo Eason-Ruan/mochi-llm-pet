@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -399,6 +399,188 @@ def test_presentation_survives_new_sampling_and_expired_estimates(desktop):
     contact, = restarted.snapshot(desktop.now)["recent_contacts"]
     assert contact["kind"] == "reminder" and contact["delivery_id"] == command.delivery_id
     assert not ledger.permit_qt(command, desktop.now)
+
+
+def test_recent_contact_unifies_os_report_followup_and_snoozed_occurrence(desktop):
+    initial = desktop.now
+    due = initial + timedelta(minutes=1)
+    task = desktop.reminder("recurring-contact", target_at=due, remind_by=due)
+    delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    ledger = PresentationLedger(desktop.path)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    assert ledger.prepare_os(task, delivery_id, "prearmed-notification", initial)
+    assert ledger.update(delivery_id, {"submitting"}, "scheduled", initial)
+    assert desktop.scheduler.snapshot(initial)["recent_contacts"] == []
+
+    desktop.clock.advance(60)
+    unknown, = desktop.reopen_scheduler().snapshot(desktop.now)["recent_contacts"]
+    assert unknown["primary_channel"] == "os_notification" and unknown["exposure"] == "unknown"
+    assert unknown["response"] == "none" and unknown["passive_entry"] == "reminder_menu"
+    assert ledger.update(delivery_id, {"scheduled"}, "delivered", desktop.now)
+    followup = SimpleNamespace(delivery_id=delivery_id, task_id=task.task_id, task_version=task.version,
+                               occurrence=task.occurrence)
+    assert ledger.native_followup_current(followup, desktop.now, mark_painted=True)
+    assert ledger.record_reminder_dismissal(delivery_id, desktop.now)
+    assert not ledger.record_reminder_dismissal(delivery_id, desktop.now)
+
+    shown, = desktop.scheduler.snapshot(desktop.now)["recent_contacts"]
+    assert shown["delivery_id"] == delivery_id and shown["response"] == "dismissed"
+    assert shown["primary_channel"] == "os_notification" and shown["exposure"] == "reported_delivered"
+    assert shown["surfaces"] == [
+        {"channel": "os_notification", "exposure": "reported_delivered", "active": True},
+        {"channel": "pet_card", "exposure": "painted", "active": True},
+    ]
+    snoozed = desktop.tasks.apply(TaskCommand(command_id="snooze-known-contact", kind="snooze", task_id=task.task_id,
+                                               expected_version=task.version, payload={"seconds": 300}))
+    assert snoozed.status == "applied" and snoozed.view.occurrence != task.occurrence
+    contact, = desktop.reopen_scheduler().snapshot(desktop.now)["recent_contacts"]
+    assert contact["response"] == "snoozed" and contact["occurrence_id"] == task.occurrence_id
+    assert contact["sound_requested"] is False and contact["sound_heard"] == "none"
+
+
+def test_late_legacy_followup_keeps_actual_paint_in_the_recent_window(desktop):
+    initial = desktop.now
+    due = initial + timedelta(minutes=1)
+    task = desktop.reminder("late-followup", remind_by=due)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    ledger = PresentationLedger(desktop.path)
+    assert ledger.prepare_os(task, delivery_id, "legacy-delivery", initial)
+    assert ledger.update(delivery_id, {"submitting"}, "scheduled", initial)
+    desktop.clock.advance(60)
+    assert ledger.update(delivery_id, {"scheduled"}, "delivered", desktop.now)
+    desktop.clock.advance(3601)
+    assert desktop.scheduler.snapshot(desktop.now)["recent_contacts"] == []
+    followup = SimpleNamespace(delivery_id=delivery_id, task_id=task.task_id, task_version=task.version,
+                               occurrence=task.occurrence)
+    assert ledger.native_followup_current(followup, desktop.now, mark_painted=True)
+    contact, = desktop.reopen_scheduler().snapshot(desktop.now)["recent_contacts"]
+    assert contact["primary_channel"] == "os_notification" and contact["exposure"] == "reported_delivered"
+    assert any(surface["channel"] == "pet_card" and surface["exposure"] == "painted"
+               for surface in contact["surfaces"])
+
+
+def test_phase_and_reminder_share_one_durable_sound_request(desktop):
+    due = desktop.now + timedelta(minutes=1)
+    task = desktop.reminder("shared-audio", target_at=due, remind_by=due)
+    delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    desktop.clock.advance(60)
+    ledger = PresentationLedger(desktop.path)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    assert ledger.prepare_os(task, delivery_id, "immediate-notification", desktop.now)
+    assert ledger.request_attention_sound("phase-end:focus:2", "phase_end", "phase_end", desktop.now, batch_at=due)
+    desktop.clock.advance(2)
+    restarted = PresentationLedger(desktop.path)
+    assert not restarted.request_attention_sound(delivery_id, "reminder", "reminder", desktop.now, batch_at=due)
+    assert not restarted.request_attention_sound("phase-end:focus:2", "phase_end", "phase_end", desktop.now)
+    contacts = {contact["kind"]: contact for contact in desktop.reopen_scheduler().snapshot(desktop.now)["recent_contacts"]}
+    assert contacts["phase_end"]["sound_requested"] and contacts["phase_end"]["sound_heard"] == "unknown"
+    assert contacts["phase_end"]["exposure"] == "none"
+    assert contacts["reminder"]["exposure"] == "unknown" and not contacts["reminder"]["sound_requested"]
+
+
+def test_recent_contacts_limit_time_and_scope(desktop):
+    scheduler = desktop.scheduler
+    for index in range(10):
+        scheduler.record_contact(delivery_id=f"pet:{index}", kind="pet", channel="qt", at=desktop.now)
+        desktop.clock.advance(60)
+    scheduler.record_contact(delivery_id="future", kind="pet", channel="qt", at=desktop.now + timedelta(minutes=1))
+    other = Scheduler(desktop.path, clock=desktop.clock, user_scope="other")
+    other.record_contact(delivery_id="private", kind="pet", channel="qt", at=desktop.now)
+    contacts = scheduler.snapshot(desktop.now)["recent_contacts"]
+    assert [contact["delivery_id"] for contact in contacts] == [f"pet:{index}" for index in range(9, 1, -1)]
+    desktop.clock.advance(3661)
+    assert scheduler.snapshot(desktop.now)["recent_contacts"] == []
+
+
+@pytest.mark.parametrize(("action", "response"), [("ack", "acknowledged"), ("snooze", "snoozed"), ("dismiss", "dismissed")])
+def test_late_reminder_response_ranks_with_recent_contacts(desktop, action, response):
+    shown_at = desktop.now
+    task = desktop.reminder("late-response", remind_by=shown_at)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    delivery_id = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    ledger = PresentationLedger(desktop.path)
+    assert ledger.prepare_os(task, delivery_id, "legacy-late-response", shown_at)
+    assert ledger.update(delivery_id, {"submitting"}, "delivered", shown_at)
+    followup = SimpleNamespace(delivery_id=delivery_id, task_id=task.task_id, task_version=task.version,
+                               occurrence=task.occurrence)
+    assert ledger.native_followup_current(followup, shown_at, mark_painted=True)
+
+    desktop.clock.advance(3601)
+    assert desktop.scheduler.snapshot(desktop.now)["recent_contacts"] == []
+    for index in range(9):
+        desktop.scheduler.record_contact(delivery_id=f"newer:{index}", kind="pet", channel="qt", at=desktop.now)
+        desktop.clock.advance(1)
+    if action == "dismiss":
+        assert ledger.record_reminder_dismissal(delivery_id, desktop.now)
+    else:
+        payload = {"seconds": 300} if action == "snooze" else {}
+        assert desktop.tasks.apply(TaskCommand(command_id=f"late:{action}", kind=action, task_id=task.task_id,
+                                               expected_version=task.version, payload=payload)).status == "applied"
+
+    scheduler = desktop.reopen_scheduler()
+    contacts = scheduler.snapshot(desktop.now)["recent_contacts"]
+    assert len(contacts) == 8
+    contact = contacts[0]
+    assert contact["occurrence_id"] == task.occurrence_id and contact["response"] == response
+    assert datetime.fromisoformat(contact["at"]) == shown_at
+    assert datetime.fromisoformat(contact["response_at"]) == desktop.now
+    assert contact["primary_channel"] == "os_notification" and contact["exposure"] == "reported_delivered"
+    assert {surface["channel"] for surface in contact["surfaces"]} == {"os_notification", "pet_card"}
+    other = Scheduler(desktop.path, clock=desktop.clock, user_scope="other")
+    assert other.snapshot(desktop.now)["recent_contacts"] == []
+    desktop.clock.advance(3601)
+    assert scheduler.snapshot(desktop.now)["recent_contacts"] == []
+
+
+def test_late_stored_response_has_own_scope_and_is_not_displaced(desktop):
+    other = Scheduler(desktop.path, clock=desktop.clock, user_scope="other")
+    shown_at = desktop.now
+    proposal = {"delivery_id": "private-proposal", "kind": "proposal", "channel": "pet_card", "exposure": "painted"}
+    other.record_contact(**proposal, at=shown_at)
+    desktop.clock.advance(3601)
+    for index in range(10):
+        other.record_contact(delivery_id=f"private:{index}", kind="pet", channel="qt", at=desktop.now)
+        desktop.clock.advance(1)
+    response_at = desktop.now
+    other.record_contact(**proposal, response="refused", at=response_at)
+    assert desktop.scheduler.snapshot(response_at)["recent_contacts"] == []
+    contacts = other.snapshot(response_at)["recent_contacts"]
+    assert len(contacts) == 8 and contacts[0]["delivery_id"] == "private-proposal"
+    assert datetime.fromisoformat(contacts[0]["at"]) == shown_at
+    assert datetime.fromisoformat(contacts[0]["response_at"]) == response_at
+    assert contacts[0]["response"] == "refused"
+    assert all(contact["delivery_id"] != "private-proposal"
+               for contact in other.snapshot(response_at - timedelta(seconds=1))["recent_contacts"])
+    desktop.clock.advance(3601)
+    assert other.snapshot(desktop.now)["recent_contacts"] == []
+
+
+def test_unscoped_task_response_does_not_cross_conflicting_reminder_owners(desktop):
+    initial = desktop.now
+    task = desktop.reminder("grouped-owners", remind_by=initial)
+    desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
+    primary = f"delivery:{task.task_id}:{task.occurrence}:v{task.version}"
+    ledger = PresentationLedger(desktop.path)
+    assert ledger.prepare_os(task, primary, "default-notification", initial)
+    assert ledger.update(primary, {"submitting"}, "delivered", initial)
+    other = Scheduler(desktop.path, clock=desktop.clock, user_scope="other")
+    # Represent inconsistent historical ownership for the same task occurrence.
+    with other._transaction() as db:
+        db.execute("""INSERT INTO presentations
+            (delivery_id,task_id,task_version,occurrence,channel,state,owner_session,deadline,updated_at)
+            SELECT 'other-delivery',task_id,task_version,occurrence,'pet_card','painted',owner_session,deadline,updated_at
+            FROM presentations WHERE delivery_id=?""", (primary,))
+        db.execute("""INSERT INTO system2_reminder_authority
+            VALUES ('other-delivery','other',NULL,'producer',1,1,?,'test',NULL,0,'presented')""", (initial.isoformat(),))
+    assert desktop.tasks.apply(TaskCommand(command_id="ambiguous-ack", kind="ack", task_id=task.task_id,
+                                           expected_version=task.version)).status == "applied"
+    for scheduler, delivery in ((desktop.scheduler, primary), (other, "other-delivery")):
+        contact, = scheduler.snapshot(initial)["recent_contacts"]
+        assert contact["delivery_id"] == delivery and contact["response"] == "none"
+    desktop.clock.advance(3601)
+    assert desktop.scheduler.snapshot(desktop.now)["recent_contacts"] == []
+    assert other.snapshot(desktop.now)["recent_contacts"] == []
 
 
 def test_material_change_rechecks_once_and_lock_unknown_blocks_detail(desktop):

@@ -23,7 +23,7 @@ from deskpet.contracts import (
     Observation, ProposedPlan, TaskCommand, TaskView,
 )
 from deskpet.mocks.task_service import MemoryTaskService, _Attempt
-from .presentation import NATIVE_FOLLOWUP_TABLE, PRESENTATION_TABLE, running_focus
+from .presentation import ATTENTION_SOUND_INDEX, ATTENTION_SOUND_TABLE, NATIVE_FOLLOWUP_TABLE, PRESENTATION_TABLE, running_focus
 
 
 SCHEMA_VERSION = 2
@@ -159,6 +159,8 @@ class SQLiteTaskService:
                     "CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, task_id TEXT NOT NULL, task_version INTEGER NOT NULL, delivery_id TEXT, not_before TEXT NOT NULL)",
                     "CREATE UNIQUE INDEX IF NOT EXISTS one_queued_show ON outbox(delivery_id) WHERE kind='show'",
                     "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL, kind TEXT NOT NULL, fields TEXT NOT NULL, emitted INTEGER NOT NULL DEFAULT 0)",
+                    "CREATE INDEX IF NOT EXISTS recent_event_kind ON events(kind, julianday(recorded_at))",
+                    "CREATE INDEX IF NOT EXISTS event_delivery_kind ON events(json_extract(fields, '$.delivery_id'), kind)",
                     """CREATE TABLE IF NOT EXISTS item_occurrence_history (
                         task_id TEXT NOT NULL, ordinal INTEGER NOT NULL, prior_view TEXT NOT NULL,
                         closed_as TEXT NOT NULL, PRIMARY KEY(task_id,ordinal)
@@ -167,9 +169,18 @@ class SQLiteTaskService:
                         id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL
                     )""",
                     PRESENTATION_TABLE,
+                    "CREATE INDEX IF NOT EXISTS presentation_occurrence ON presentations(task_id, occurrence)",
                     NATIVE_FOLLOWUP_TABLE,
+                    ATTENTION_SOUND_TABLE,
+                    ATTENTION_SOUND_INDEX,
                 ):
                     self._db.execute(statement)
+                presentation_columns = {row[1] for row in self._db.execute("PRAGMA table_info(presentations)")}
+                for column in ("native_actions", "auto_followup_suppressed"):
+                    if column not in presentation_columns:
+                        self._db.execute(f"ALTER TABLE presentations ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+                if "os_requested_for" not in presentation_columns:
+                    self._db.execute("ALTER TABLE presentations ADD COLUMN os_requested_for TEXT")
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._db.execute("INSERT OR IGNORE INTO metadata VALUES ('database_id',?)", (uuid.uuid4().hex,))
                 self.database_id = self._db.execute("SELECT value FROM metadata WHERE key='database_id'").fetchone()[0]
@@ -217,8 +228,9 @@ class SQLiteTaskService:
         core._opportunity = json.loads(metadata.get("opportunity", "{}"))
         core._focus_running = running_focus(db) if self.enforce_opportunities else False
         core._external_owner = {(row['task_id'], row['occurrence']) for row in db.execute(
-            "SELECT task_id,occurrence FROM presentations WHERE channel='os_notification' "
-            "AND state NOT IN ('cancelled','failed','released','unavailable')"
+            "SELECT task_id,occurrence FROM presentations WHERE "
+            "(channel='os_notification' AND state NOT IN ('cancelled','failed','released','unavailable')) "
+            "OR state='passive' OR (channel='pet_card' AND os_id IS NOT NULL)"
         )}
         now, mono = self.clock.wall_now(), self.clock.monotonic_now()
         for row in db.execute("SELECT * FROM deliveries"):

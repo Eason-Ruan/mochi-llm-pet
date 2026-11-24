@@ -5,6 +5,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from PyQt6.QtCore import QCoreApplication
 from PyQt6.QtWidgets import QApplication
 
 from deskpet.c_ui.presentation import DesktopPresentation, NativeReminderFollowup
@@ -46,6 +47,13 @@ class NotificationProbe:
         self.removals.append(identifier)
         self.pending.discard(identifier)
         return self.confirm_removal
+
+
+class ActionableNotificationProbe(NotificationProbe):
+    can_respond = True
+
+    def submit(self, identifier, due_at, *, sound, complete, snooze=True):
+        super().submit(identifier, due_at, sound=sound, complete=complete)
 
 
 @pytest.fixture
@@ -343,7 +351,8 @@ def test_hidden_deadline_retries_known_failure_with_same_platform_id(business):
     assert notifications.submissions[0][0] == notifications.submissions[1][0]
 
 
-@pytest.mark.parametrize("result", ["paint", "restart", "unverified", "near_deadline"])
+@pytest.mark.parametrize("result", ["paint", "restart", "restart_inflight", "unverified", "near_deadline",
+                                    "exit", "exit_unverified", "exit_deferred"])
 def test_soft_latest_system_fallback_transfers_only_after_verified_removal(business, result):
     clock, delivery, tasks = business
     now = clock.wall_now()
@@ -355,7 +364,7 @@ def test_soft_latest_system_fallback_transfers_only_after_verified_removal(busin
     preferences.update(expected_version=preferences.read().version, allow_system_notifications=True)
     scheduler = Scheduler(tasks, clock=clock, lock_probe=lambda: False)
     notifications = NotificationProbe()
-    notifications.confirm_removal = result != "unverified"
+    notifications.confirm_removal = result not in {"unverified", "exit_unverified"}
     settings = {"allow_system_notifications": True, "reminder_sound": True}
 
     def presentation():
@@ -387,6 +396,40 @@ def test_soft_latest_system_fallback_transfers_only_after_verified_removal(busin
     assert notifications.removals == [identifier]
     assert not presenter.permit(queued)
     clock.advance(2)
+    if result == "restart_inflight":
+        assert presenter.ledger.rows()[0]["state"] == "cancelling"
+        presenter = presentation()
+        assert presenter.ledger.rows()[0]["state"] == "scheduled"
+        assert notifications.submissions == [(identifier, due, False)] * 2
+        assert not presenter.permit(queued)
+        return
+    if result == "exit_deferred":
+        app = QCoreApplication.instance() or QCoreApplication([])
+        inventory, rearm, finished = [], [], []
+        notifications.inventory = inventory.append
+        submit = notifications.submit
+        notifications.submit = lambda *args, **kwargs: rearm.append((args, kwargs))
+        presenter.restore_fallbacks(finished=lambda: finished.append(True))
+        assert len(inventory) == 1 and not finished
+        inventory[0](frozenset(), frozenset())
+        assert len(rearm) == 1 and not finished
+        args, kwargs = rearm[0]
+        submit(*args, **kwargs)
+        app.processEvents()
+        presenter._restore_tick()
+        assert finished == [True]
+        assert notifications.submissions == [(identifier, due, False)] * 2
+        return
+    if result in {"exit", "exit_unverified"}:
+        finished = []
+        presenter.restore_fallbacks(finished=lambda: finished.append(True))
+        assert finished == [True]
+        row, = presenter.ledger.rows()
+        assert row["state"] == ("scheduled" if result == "exit" else "unknown")
+        assert len(notifications.submissions) == (2 if result == "exit" else 1)
+        assert notifications.pending == ({identifier} if result == "exit" else set())
+        assert not presenter.permit(queued)
+        return
     presenter.observe(snapshot(clock, tasks, **settings))
     row, = presenter.ledger.rows()
     if result == "unverified":
@@ -406,7 +449,8 @@ def test_soft_latest_system_fallback_transfers_only_after_verified_removal(busin
             assert len(notifications.submissions) == 1
 
 
-def test_semantic_system_channel_respects_newer_sound_preference(business):
+@pytest.mark.parametrize("sound_blocked_by", ["preference", "platform_permission"])
+def test_semantic_system_channel_respects_sound_preference_and_permission(business, sound_blocked_by):
     clock, delivery, tasks = business
     now = clock.wall_now()
     draft = TaskDraft(content="Private reminder", mode="soft", remind_after=now)
@@ -424,17 +468,40 @@ def test_semantic_system_channel_respects_newer_sound_preference(business):
     queued = delivery.commands[-1]
     assert queued.sound == "reminder"
     notifications = NotificationProbe()
+    notifications.sound_available = sound_blocked_by != "platform_permission"
     presenter = DesktopPresentation(path=tasks.path, notifications=notifications,
                                     lock_probe=lambda: None, synthetic=True)
     presenter.ledger.authorize_early = scheduler.authorize_qt
     presenter.observe(snapshot(clock, tasks, allow_system_notifications=True, reminder_sound=True))
-    preferences.update(expected_version=preferences.read().version, reminder_sound=False)
+    if sound_blocked_by == "preference":
+        preferences.update(expected_version=preferences.read().version, reminder_sound=False)
     presenter.route_hidden(queued)
     presenter.route_hidden(queued)
     assert len(notifications.submissions) == 1
     assert notifications.submissions[0][1:] == (None, False)
     assert presenter.ledger.rows()[0]["state"] == "submitted"
     assert not tasks.get(task.task_id).displayed_at
+    contact, = scheduler.snapshot(now)["recent_contacts"]
+    assert not contact["sound_requested"]
+
+
+def test_resume_does_not_request_sound_for_a_phase_elapsed_while_asleep(business, monkeypatch):
+    clock, _, tasks = business
+    presenter = DesktopPresentation(path=tasks.path, lock_probe=lambda: False, synthetic=True)
+    presenter.native = True
+    beeps = []
+    monkeypatch.setattr(QApplication, "beep", lambda: beeps.append(True))
+    previous = {"id": "sleeping-focus", "version": 1, "state": "running"}
+    presenter.observe(snapshot(clock, tasks, phase_end_sound=True) | {"active_phase": previous})
+    presenter.power_event("system_sleep")
+    clock.advance(120)
+    ended = (clock.wall_now() - timedelta(seconds=30)).isoformat()
+    presenter.power_event("system_wake")
+    presenter.observe(snapshot(clock, tasks, phase_end_sound=True) | {
+        "phases": [previous | {"state": "elapsed", "ended_at": ended, "version": 2}],
+    })
+    assert not beeps
+    assert Scheduler(tasks, clock=clock).snapshot(clock.wall_now())["recent_contacts"] == []
 
 
 def test_estimated_target_does_not_create_a_hard_fallback(business):
@@ -454,3 +521,105 @@ def test_estimated_target_does_not_create_a_hard_fallback(business):
     tasks.pump()
     assert len(delivery.commands) == 1
     assert delivery.commands[0].reason == "hard_due"
+
+
+@pytest.mark.parametrize("mode, width", [("hard", 0), ("soft", 10)])
+def test_scheduled_native_deadline_transfers_at_foreground_delivery_only(business, mode, width):
+    clock, delivery, tasks = business
+    task = register(tasks, clock, mode=mode, due=20, width=width)
+    notifications = ActionableNotificationProbe()
+    settings = {"allow_system_notifications": True}
+
+    def start():
+        presenter = DesktopPresentation(path=tasks.path, notifications=notifications, synthetic=True)
+        presenter.observe(snapshot(clock, tasks, **settings))
+        return presenter
+
+    presenter = start()
+    identifier, due, _ = notifications.submissions[0]
+    assert due == task.draft.hard_deadline
+    row, = presenter.ledger.rows()
+    assert row["native_actions"] and row["state"] == "scheduled"
+    assert not presenter.claim_foreground_pet(row)
+    assert notifications.pending == {identifier}
+    presenter.restore_fallbacks()
+    presenter = start()
+    assert notifications.removals == [] and len(notifications.submissions) == 1
+
+    clock.advance((due - clock.wall_now()).total_seconds())
+    notifications.pending.remove(identifier)
+    notifications.delivered.add(identifier)
+    presenter.observe(snapshot(clock, tasks, **settings))
+    tasks.pump()
+    assert not delivery.commands
+    assert not presenter.native_followups(automatic=True)
+    assert len(presenter.native_followups()) == 1
+    row, current = presenter.foreground_target(identifier)
+    assert current == task
+    assert presenter.claim_foreground_pet(row) == "claimed"
+    assert presenter.paint_foreground_pet(row)
+    assert not presenter.claim_foreground_pet(row)
+    tasks.pump()
+    assert not delivery.commands and not tasks.get(task.task_id).acknowledged_at
+    row, = presenter.rows
+    assert (row["channel"], row["state"]) == ("pet_card", "painted")
+
+
+def test_wake_passivates_only_missed_occurrences_and_keeps_future_deadlines(business):
+    clock, delivery, tasks = business
+    presenter = DesktopPresentation(path=tasks.path, synthetic=True)
+    missed = register(tasks, clock, mode="hard", due=5, task_id="missed")
+    upcoming = register(tasks, clock, mode="hard", due=20, task_id="upcoming")
+    presenter.observe(snapshot(clock, tasks))
+    presenter.power_event("system_sleep")
+    assert not presenter.can_present()
+    clock.advance(10)
+    tasks.pump()
+    presenter.power_event("system_wake")
+    assert not presenter.can_present()
+    notes = presenter.observe(snapshot(clock, tasks))
+    assert presenter.can_present()
+    assert notes[missed.task_id] == "待查看" and upcoming.task_id not in notes
+    row, = presenter.rows
+    assert (row["task_id"], row["state"], row["reason"]) == (missed.task_id, "passive", "resume_catchup")
+    assert not presenter.permit(delivery.commands[-1])
+    clock.advance(10)
+    tasks.pump()
+    presenter.observe(snapshot(clock, tasks))
+    assert delivery.commands[-1].task_id == upcoming.task_id
+    assert presenter.permit(delivery.commands[-1])
+
+
+@pytest.mark.parametrize("early_surface", ["pet", "os", "legacy_os", "menu"])
+def test_earlier_or_passive_exposure_does_not_claim_a_later_deadline_batch(business, early_surface):
+    clock, _, tasks = business
+    now = clock.wall_now()
+    soft = register(tasks, clock, due=0, width=20, task_id="soft")
+    hard = register(tasks, clock, mode="hard", due=20, task_id="hard")
+    deadline = hard.draft.hard_deadline
+    assert soft.draft.hard_deadline == deadline
+    presenter = DesktopPresentation(path=tasks.path, synthetic=True)
+    ledger = presenter.ledger
+    soft_id = presenter._delivery_id(soft)
+    hard_id = presenter._delivery_id(hard)
+    if early_surface in {"os", "legacy_os"}:
+        requested_for = now if early_surface == "os" else None
+        assert ledger.prepare_os(soft, soft_id, "early-system", now, requested_for=requested_for)
+        assert ledger.update(soft_id, {"submitting"}, "submitted", now)
+    else:
+        shown_at = now if early_surface == "pet" else deadline
+        reason = "menu_painted" if early_surface == "menu" else None
+        with ledger._transaction() as db:
+            ledger._write_owner(db, soft_id, soft, "pet_card", "painted", shown_at, reason=reason)
+
+    clock.advance(21)
+    if early_surface in {"os", "legacy_os"}:
+        assert ledger.update(soft_id, {"submitted"}, "delivered", clock.wall_now())
+    presenter.observe(snapshot(clock, tasks))
+    assert not presenter.deadline_has_primary(deadline)
+
+    assert ledger.prepare_os(hard, hard_id, "native-at-deadline", now)
+    assert ledger.update(hard_id, {"submitting"}, "scheduled", now)
+    assert ledger.update(hard_id, {"scheduled"}, "delivered", clock.wall_now())
+    presenter.observe(snapshot(clock, tasks))
+    assert presenter.deadline_has_primary(deadline)

@@ -43,6 +43,8 @@ def schedule_text(draft, reference=None, *, zone=None):
         parts.append("柔性提醒窗口 " + show_time(start) + " 至 " + show_time(deadline))
     else:
         parts.append("择机提醒")
+        if timing_context := draft.get("timing_context"):
+            parts.append("时机条件：" + timing_context)
         for title, value in (("最早", draft.get("remind_after")), ("目标", draft.get("target_at")), ("最迟", deadline)):
             if value:
                 parts.append(title + " " + show_time(value))
@@ -222,6 +224,16 @@ class ReminderPanel(QGroupBox):
             self.mode.setFixedWidth(148)
             mode.addWidget(self.mode)
             time_layout.addLayout(mode)
+            sound_row = QHBoxLayout()
+            sound_row.addWidget(_text("提醒声音", size=12), 1)
+            self.sound = MenuField()
+            self.sound.setAccessibleName("提醒声音")
+            self.sound.addItem("跟随默认设置", None)
+            self.sound.addItem("仅无声提示", False)
+            self.sound.addItem("允许提示音", True)
+            self.sound.setFixedWidth(148)
+            sound_row.addWidget(self.sound)
+            time_layout.addLayout(sound_row)
             for key, title in (("exact", "准点时间"), ("remind_after", "最早提醒"), ("target_at", "目标时间"),
                                ("remind_by", "最迟提醒"), ("expires_at", "提醒失效"), ("due_at", "事项截止")):
                 editor = OptionalTime(required=key == "exact", timezone=self.timezone)
@@ -242,6 +254,7 @@ class ReminderPanel(QGroupBox):
             form.addRow("柔性窗口宽度", self.window)
             layout.addLayout(form)
         self.preview = _text("等待服务时间…", size=12, color=GREEN, bold=True, wrap=True) if advanced else label("等待服务时间…")
+        self.preview.setTextFormat(Qt.TextFormat.PlainText)
         if advanced:
             preview = QVBoxLayout()
             preview.setSpacing(2)
@@ -287,6 +300,7 @@ class ReminderPanel(QGroupBox):
         management.addWidget(self.detail_title)
         self.detail_title.hide()
         self.details = label("尚无事项。创建草稿后，请核对时间并确认。")
+        self.details.setTextFormat(Qt.TextFormat.PlainText)
         management.addWidget(self.details)
         row = QGridLayout() if advanced else QHBoxLayout()
         self.buttons = {}
@@ -333,6 +347,8 @@ class ReminderPanel(QGroupBox):
         layout.addWidget(self.result)
         self.content.textChanged.connect(self._refresh_controls)
         self.mode.currentIndexChanged.connect(self._refresh_controls)
+        if advanced:
+            self.sound.currentIndexChanged.connect(self._refresh_controls)
         self.delay.valueChanged.connect(self._refresh_controls)
         self.window.valueChanged.connect(self._refresh_controls)
         self.snooze_seconds.valueChanged.connect(self._refresh_controls)
@@ -359,7 +375,7 @@ class ReminderPanel(QGroupBox):
         content = self.content.text().strip()
         timing = self._timing_input()
         if self._edit_original is not None and self._edit_timing is not None:
-            editable_fields = {"due_at"} if self.advanced else set()
+            editable_fields = {"due_at", "sound"} if self.advanced else set()
             if all(timing[key] == self._edit_timing.get(key) for key in timing.keys() - editable_fields):
                 updates = {key: timing[key] for key in editable_fields if timing[key] != self._edit_timing.get(key)}
                 if self.advanced:
@@ -377,8 +393,10 @@ class ReminderPanel(QGroupBox):
         item_type = self.item_type.currentData()
         timezone = (self._edit_original or {}).get("timezone", self.timezone or ZONE_NAME)
         draft = {"mode": "hard" if mode == "hard" else "soft", "item_type": item_type, "timezone": timezone,
-                 "reminder_enabled": mode != "none",
+                 "reminder_enabled": mode != "none", "sound": self.sound.currentData() if mode != "none" else None,
                  "due_at": values["due_at"] if item_type == "issue" else None}
+        if mode != "none" and (timing_context := (self._edit_original or {}).get("timing_context")):
+            draft["timing_context"] = timing_context
         if mode == "hard":
             draft.update(remind_after=values["exact"], target_at=values["exact"], remind_by=values["exact"],
                          expires_at=values["expires_at"])
@@ -435,6 +453,7 @@ class ReminderPanel(QGroupBox):
         self.content.setText(draft["content"])
         if self.advanced:
             self.description.setText(draft.get("description") or "")
+            self.sound.setCurrentIndex(self.sound.findData(draft.get("sound")))
         mode = draft["mode"] if draft.get("reminder_enabled", True) else "none"
         self.mode.setCurrentIndex(max(0, self.mode.findData(mode)))
         now = datetime.fromisoformat(self.snapshot["now"])
@@ -470,6 +489,8 @@ class ReminderPanel(QGroupBox):
         self._editing = None
         self._edit_original = None
         self._edit_timing = None
+        if self.advanced:
+            self.sound.setCurrentIndex(0)
         for editor in self.times.values():
             editor.set_timezone(self.timezone)
         self.edit_note.setText("")
@@ -599,6 +620,7 @@ class ReminderPanel(QGroupBox):
             self.edit_note.setVisible(bool(self.edit_note.text()))
             self.result.setVisible(self.result.text() != "草稿确认前不会调度提醒。")
             mode = self.mode.currentData()
+            self.sound.setEnabled(mode != "none")
             issue = self.item_type.currentData() == "issue"
             self.item_type.setEnabled(self._editing is None)
             for key, editor in self.times.items():

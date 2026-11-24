@@ -8,7 +8,7 @@ import unicodedata
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .semantic_policy import semantic_background_enabled, semantic_background_grants
+from .semantic_policy import semantic_background_enabled, semantic_background_grants, timing_context_unavailable
 from .tool_schema import PROPOSABLE_ACTIONS, RELATIVE_TIME_FIELDS, canonical_tool_name
 
 
@@ -247,9 +247,14 @@ def describe_grants(user: dict | None, context: dict, *, requested_at: datetime)
     if user is None:
         if semantic_background_enabled():
             return semantic_background_grants(context)
-        eligible = [ref_id(item["occurrence_id"]) for item in context["eligible_items"] if item.get("occurrence_id")]
-        rechecks = [ref_id(item["occurrence_id"]) for item in context.get("recheck_items", ()) if item.get("occurrence_id")]
-        reviewable = list(dict.fromkeys(eligible + rechecks))
+        candidates = context["eligible_items"]
+        rechecks = context.get("recheck_items", ())
+        eligible = [ref_id(item["occurrence_id"]) for item in candidates
+                    if item.get("occurrence_id") and not timing_context_unavailable(item)]
+        reviewable = list(dict.fromkeys(ref_id(item["occurrence_id"]) for item in (*candidates, *rechecks)
+                                        if item.get("occurrence_id")))
+        withheld = [ref_id(item["occurrence_id"]) for item in (*candidates, *rechecks)
+                    if item.get("occurrence_id") and timing_context_unavailable(item)]
         focus = context["enabled_settings"].get("auto_adjust", False)
         state = (context.get("current") or {}).get("state") if context["current_status"] == "fresh" else None
         grants = {}
@@ -261,6 +266,8 @@ def describe_grants(user: dict | None, context: dict, *, requested_at: datetime)
             grants["reminder.present"] = {"occurrences": eligible}
         if reviewable:
             grants["reminder.recheck"] = {"occurrences": reviewable}
+            if withheld:
+                grants["reminder.recheck"]["timing_context_unavailable"] = withheld
         if focus and state in {"working", "available"}:
             phase = ref_id((context.get("current_phase") or {}).get("id"))
             grants["proposal.offer"] = {"target": phase, "background": True}
@@ -608,7 +615,7 @@ def materialize_chat_times(function: str, args: dict, requested_at: datetime, ti
     result = resolve(args)
     if (function == "item.create" and result.get("type") == "reminder"
             and not any((result.get("reminder_rule") or {}).get(key) for key in (
-                "remind_after", "remind_by", "target_at", "expires_at",
+                "remind_after", "remind_by", "target_at", "expires_at", "timing_context",
             ))):
         raise ValueError("a new reminder needs a requested time")
     if function == "item.create" and (rule := result.get("reminder_rule")):
@@ -789,7 +796,11 @@ def allows(grants: dict[str, dict], function: str, args: dict, *, versions=None)
         return bool(ids) and isinstance(ids, list) and all(ref_id(identity) in binding["occurrences"] for identity in ids)
     if function in {"reminder.recheck", "observation.wait_fresh"}:
         if occurrence := args.get("occurrence_id"):
-            return ref_id(occurrence) in binding["occurrences"]
+            identity = ref_id(occurrence)
+            if (function == "reminder.recheck" and identity in binding.get("timing_context_unavailable", ())
+                    and any(args.get(key) is not None for key in ("window_open_at", "window_close_at"))):
+                return False
+            return identity in binding["occurrences"]
         return function == "observation.wait_fresh" and binding.get("focus") and args.get("purpose") == "focus_suggestion"
     if function == "proposal.offer":
         name, payload = canonical_tool_name(args.get("function")), args.get("args")

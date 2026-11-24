@@ -264,7 +264,92 @@ def test_semantic_proposal_works_without_observation_or_slot_and_records_paint(b
     }
     contact, = business.scheduler.snapshot(business.clock.wall_now())["recent_contacts"]
     assert contact["subject_ref"] == offer.view["id"]
+    assert contact["exposure"] == "painted" and contact["response"] == "none"
+    assert gateway.dismiss_presentation(offer.delivery_id)
+    dismissed, = business.scheduler.snapshot(business.clock.wall_now())["recent_contacts"]
+    assert dismissed["response"] == "dismissed"
+    assert dismissed["at"] == contact["at"]
+    decision = business.command("proposal.resolve", {"id": offer.view["id"], "answer": "reject",
+                                                       "expected_version": offer.view["version"]}, "refuse-shown")
+    assert decision.status == "applied"
+    refused, = business.scheduler.snapshot(business.clock.wall_now())["recent_contacts"]
+    assert refused["response"] == "refused" and refused["primary_channel"] == "pet_card"
+    assert not gateway.dismiss_presentation(offer.delivery_id)
     assert business.phases.current_phase() is None
+
+
+def test_quiet_proposals_leave_badge_and_panel_unchanged(business):
+    business.auto_adjust()
+    offer = business.command("proposal.offer", _offer() | {"presentation": {"level": "quiet", "sound": True}},
+                             "quiet-offer", origin="agent")
+    assert offer.outcome == "quiet" and offer.interruption_level == "quiet"
+    assert not business.tools.pending_proposals() and not business.tools.pending_presentations()
+
+    offer = business.command("proposal.offer", _offer() | {"presentation": {"level": "passive", "sound": True}},
+                             "passive-offer", origin="agent")
+    pending, = business.tools.pending_presentations()
+    assert (pending["delivery_id"], pending["channel"], pending["request_sound"]) == (offer.delivery_id, "pet_badge", 0)
+    repeated = business.command("proposal.offer", _offer() | {"presentation": {"level": "quiet"}},
+                                "awaiting-response", origin="agent")
+    assert repeated.outcome == "quiet"
+    assert business.tools.pending_presentations() == [pending]
+
+
+@pytest.mark.parametrize("snooze_first", [False, True])
+def test_passive_menu_update_preserves_hard_deadline_and_invalidates_on_snooze(business, snooze_first):
+    now = business.clock.wall_now()
+    latest = now + timedelta(seconds=15)
+    created = business.command("item.create", {
+        "type": "reminder", "title": "提交报告", "reminder_rule": {"remind_by": latest.isoformat(), "sound": False},
+    }, "deadline").view
+    occurrence = created["occurrence"]
+    for index in range(2):
+        receipt = business.command("reminder.present", {
+            "occurrence_ids": [occurrence["id"]], "expected_version": occurrence["version"],
+            "reason_code": "busy", "presentation": {"level": "passive", "sound": True},
+        }, f"passive-{index}", origin="agent")
+        assert receipt.presentation_receipt == {"channel": "reminder_menu", "state": "available"}
+        assert receipt.delivery_id is None
+
+    assert business.scheduler.passive_reminders(now) == [{"task_id": created["id"], "occurrence": occurrence["ordinal"]}]
+    immediate, = business.scheduler.snapshot(now)["eligible_items"]
+    assert immediate["passive_available"] is True
+    business.tasks.pump()
+    assert not business.tasks.delivery.commands
+
+    if snooze_first:
+        snoozed = business.command("reminder.snooze", {
+            "occurrence_id": occurrence["id"], "expected_version": occurrence["version"],
+            "delay_s": 60, "mode": "exact",
+        }, "snooze-before-deadline")
+        assert snoozed.status == "applied"
+        assert not business.scheduler.passive_reminders(now)
+
+    business.clock.advance(15)
+    business.tasks.pump()
+    if snooze_first:
+        assert not business.tasks.delivery.commands
+    else:
+        delivery, = business.tasks.delivery.commands
+        assert (delivery.occurrence, delivery.reason, delivery.sound) == (occurrence["ordinal"], "deadline_fallback", None)
+
+
+@pytest.mark.parametrize(("level", "muted", "expected"), [
+    ("actionable", False, None), ("enhanced", False, "reminder"), ("enhanced", True, None),
+])
+def test_reminder_level_requests_sound_only_with_permission(business, level, muted, expected):
+    if muted:
+        business.settings.update(expected_version=business.settings.read().version, reminder_sound=False)
+    created = business.command("item.create", {"type": "reminder", "title": "喝水"}, "reminder").view
+    occurrence = created["occurrence"]
+    result = business.command("reminder.present", {
+        "occurrence_ids": [occurrence["id"]], "expected_version": occurrence["version"],
+        "reason_code": "available", "presentation": {"level": level, "sound": True},
+    }, "present", origin="agent")
+    assert result.interruption_level == level
+    business.tasks.pump()
+    command, = business.tasks.delivery.commands
+    assert command.sound == expected
 
 
 def test_local_widget_reuses_original_ids_and_fences_only_applied_writes(business):

@@ -270,6 +270,42 @@ try:
     wait_for(lambda: active() and active()["kind"] == "short_break", "manual break")
     QTest.mouseClick(buttons["skip_break"], left)
     wait_for(lambda: active() is None, "manual skip")
+
+    section("reminders")
+    panel = session.reminders
+    condition_id = "condition-only-work-item"
+    condition = "等我开完会"
+    session._action("reminder.create", task_id=condition_id, version=0, payload={"draft": {
+        "content": "提交组会记录", "mode": "soft", "item_type": "issue", "timing_context": condition,
+    }})
+    wait_for(lambda: panel.view(condition_id), "condition-only reminder loaded")
+    panel.select_task(condition_id)
+    QTest.mouseClick(panel.buttons["confirm"], left)
+    wait_for(lambda: panel.view(condition_id)["status"] == "registered", "condition-only reminder confirmed")
+    QTest.mouseClick(panel.buttons["edit"], left)
+    wait_for(panel.save_edit.isVisible, "condition-only reminder editor")
+    assert panel.mode.currentData() == "soft"
+    assert condition in panel.preview.text() and condition in panel.details.text()
+    assert not any(panel.times[key].enabled.isChecked() for key in ("remind_after", "target_at", "remind_by"))
+    latest = target + timedelta(days=1)
+    panel.times["remind_by"].load(latest, latest)
+    previous = panel.view(condition_id)
+    QTest.mouseClick(panel.save_edit, left)
+    wait_for(lambda: panel.view(condition_id)["version"] > previous["version"], "condition and latest time saved")
+    updated = panel.view(condition_id)
+    assert updated["draft"]["timing_context"] == condition
+    assert datetime.fromisoformat(updated["draft"]["remind_by"]) == latest
+    assert updated["draft"]["target_at"] is None and updated["draft"]["remind_after"] is None
+    wait_for(lambda: not panel.save_edit.isVisible(), "condition and latest save acknowledged")
+
+    QTest.mouseClick(panel.buttons["edit"], left)
+    wait_for(panel.save_edit.isVisible, "reopen reminder editor")
+    panel.mode.setCurrentIndex(panel.mode.findData("none"))
+    QTest.mouseClick(panel.save_edit, left)
+    wait_for(lambda: panel.view(condition_id)["version"] > updated["version"], "work reminder disabled")
+    disabled = panel.view(condition_id)["draft"]
+    assert not disabled["reminder_enabled"] and disabled["timing_context"] is None
+    assert disabled["remind_by"] is None
     assert not session.window.errors
 finally:
     session.quit()

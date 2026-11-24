@@ -15,6 +15,17 @@ def semantic_background_enabled() -> bool:
     return _enabled("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND")
 
 
+def text_sharing_allowed(settings, route_snapshot, lock_state):
+    route = route_snapshot.route
+    return (not settings.observation_paused and lock_state is not True
+            and (route is None or not route.is_cloud or route_snapshot.permission))
+
+
+def timing_context_unavailable(item):
+    rule = item.get("rule") or {}
+    return rule.get("has_timing_context") is True and not rule.get("timing_context")
+
+
 def semantic_background_grants(context: dict) -> dict[str, dict]:
     """Grant candidate subjects and opt-in effects, never inferred availability."""
     from .intent import ref_id
@@ -22,8 +33,11 @@ def semantic_background_grants(context: dict) -> dict[str, dict]:
     def occurrences(items):
         return list(dict.fromkeys(identity for item in items if (identity := ref_id(item.get("occurrence_id")))))
 
-    eligible = occurrences(context.get("eligible_items", ()))
-    reviewable = list(dict.fromkeys(eligible + occurrences(context.get("recheck_items", ()))))
+    candidates = context.get("eligible_items", ())
+    rechecks = context.get("recheck_items", ())
+    eligible = occurrences(item for item in candidates if not timing_context_unavailable(item))
+    reviewable = occurrences((*candidates, *rechecks))
+    withheld = occurrences(item for item in (*candidates, *rechecks) if timing_context_unavailable(item))
     focus = context["enabled_settings"].get("auto_adjust", False)
     purposes = ["pet_presentation"]
     grants = {"pet.present": {"semantic_background": True}}
@@ -41,6 +55,8 @@ def semantic_background_grants(context: dict) -> dict[str, dict]:
     if reviewable:
         purposes.append("reminder_recheck")
         grants["reminder.recheck"] = {"semantic_background": True, "occurrences": reviewable}
+        if withheld:
+            grants["reminder.recheck"]["timing_context_unavailable"] = withheld
     if eligible:
         grants["reminder.present"] = {"semantic_background": True, "occurrences": eligible}
     grants["observation.wait_fresh"] = {"semantic_background": True, "occurrences": reviewable,

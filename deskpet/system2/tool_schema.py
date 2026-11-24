@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Union
 
 from pydantic import AwareDatetime, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, create_model
 
-from deskpet.contracts.models import Model
+from deskpet.contracts.models import Model, ReminderTimingContext
 from deskpet.settings import HabitBehavior
 from deskpet.work_sessions.models import AdjustInput, ReviewInput
 
@@ -24,6 +24,7 @@ RELATIVE_TIME_FIELDS = {
 }
 Scope = Literal["default", "habit", "current"]
 PhaseKind = Literal["focus", "short_break", "long_break"]
+InterruptionLevel = Literal["quiet", "passive", "actionable", "enhanced"]
 Status = Literal["created", "in_progress", "paused", "completed", "cancelled", "finished", "expired", "postponing"]
 VersionFields = {"expected_version": (Version | None, None)}
 Identified = {"id": (Identifier, ...)}
@@ -49,6 +50,13 @@ class ReminderRuleInput(Model):
     expires_at: AwareDatetime | None = None
     window_open_at: AwareDatetime | None = None
     window_close_at: AwareDatetime | None = None
+    timing_context: ReminderTimingContext | None = Field(default=None, description=(
+        "A short verbatim clause from the current user's message specifying a situational timing constraint. "
+        "Use null to remove a previous constraint. Omit when the user has supplied no change to it."
+    ))
+    sound: StrictBool | None = Field(default=None, description=(
+        "Explicit sound preference for this reminder. Omit when unspecified. Global mute always wins."
+    ))
     urgency_until: AwareDatetime | None = None
     urgency_reason: str | None = None
     remind_after_offset_s: RelativeSeconds | None = None
@@ -73,7 +81,18 @@ class ItemPatch(Model):
 
 
 class ProposalPresentation(Model):
-    channel: Literal["pet_card", "pet_badge"] = "pet_card"
+    channel: Literal["pet_card", "pet_badge"] | None = None
+    level: InterruptionLevel | None = None
+    sound: StrictBool | None = None
+
+
+class ReminderPresentation(Model):
+    channel: Literal["pet_card", "pet_badge", "os_notification"] | None = None
+    level: InterruptionLevel | None = None
+    interruption: Literal["low", "ordinary"] | None = None
+    sound: StrictBool | Literal["reminder"] | None = None
+    position_hint: Literal["stay", "home", "screen_edge"] | None = None
+    animation: Literal["idle", "look_up", "wave", "approach"] | None = None
 
 
 class ProposalAmendments(Model):
@@ -154,9 +173,10 @@ _register("reminder.snooze", "Reschedule the current occurrence from the time of
           window_before_s=(Seconds | None, None), window_after_s=(Seconds | None, None), **VersionFields)
 _register("reminder.ack", "Acknowledge a reminder. An issue keeps its existing status.",
           occurrence_id=(Identifier, ...), **VersionFields)
-_register("reminder.present", "Submit one eligible reminder for an authorized early presentation.",
+_register("reminder.present", "Present one eligible soft reminder. Passive makes it actionable in the reminder menu. "
+          "Actionable offers a silent primary prompt. Enhanced can request an allowed sound.",
           occurrence_ids=(Annotated[list[Identifier], Field(min_length=1)], ...),
-          presentation=(str | dict, ...), reason_code=(Identifier, ...), **VersionFields)
+          presentation=(ReminderPresentation | str, ...), reason_code=(Identifier, ...), **VersionFields)
 _register("reminder.recheck", "Recheck an occurrence later or estimate its soft window when missing or elapsed.",
           occurrence_id=(Identifier, ...), run_at=(AwareDatetime | None, None),
           on_next_fresh=(StrictBool, False), window_open_at=(AwareDatetime | None, None),
@@ -214,10 +234,12 @@ _register("settings.get", "Read default preferences, a named habit, or the curre
 _register("settings.update", "Change default preferences, a named habit, or the current phase.",
           scope=(Scope, ...), id=(Identifier | None, None),
           patch=(SettingsPatch | HabitPatch | AdjustInput, ...), **VersionFields)
-_register("pet.present", "Request a temporary desktop pet presentation.",
+_register("pet.present", "Request a temporary desktop pet presentation. Use actionable for a silent hint, or "
+          "enhanced for an allowed sound. Passive cues require an actual reminder or proposal.",
           intent=(Identifier, ...), text=(Annotated[str, Field(min_length=1, max_length=200)] | None, None),
           position_hint=(Literal["stay", "home", "screen_edge"] | None, None),
-          animation=(Literal["idle", "look_up", "wave", "approach"] | None, None), sound=(StrictBool | None, None))
+          animation=(Literal["idle", "look_up", "wave", "approach"] | None, None), sound=(StrictBool | None, None),
+          level=(InterruptionLevel | None, None))
 _register("command.get_result", "Look up a previous command receipt before attempting a fresh command.",
           command_id=(Identifier, ...))
 
@@ -239,7 +261,8 @@ _proposal_adapter = TypeAdapter(Annotated[
     Union[_proposal_variants], Field(discriminator="function"),
 ])
 _DEFINITIONS.append(ToolDefinition(
-    "proposal_offer", "proposal.offer", "Ask the user before making an inferred domain change.",
+    "proposal_offer", "proposal.offer", "Ask the user before making an inferred domain change. Passive updates "
+    "the proposal badge and panel. Actionable offers a silent card. Enhanced can request an allowed sound.",
     {"type": "object", **_proposal_adapter.json_schema()},
 ))
 

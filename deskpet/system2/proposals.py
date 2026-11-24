@@ -50,6 +50,10 @@ def create_tables(db):
         db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN channel TEXT NOT NULL DEFAULT 'pet_card'")
     if "route_binding" not in columns:
         db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN route_binding TEXT")
+    if "interruption_level" not in columns:
+        db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN interruption_level TEXT")
+    if "request_sound" not in columns:
+        db.execute("ALTER TABLE system2_proposal_presentations ADD COLUMN request_sound INTEGER NOT NULL DEFAULT 0")
 
 
 def _decode(row):
@@ -93,19 +97,21 @@ def save(db, scope, proposal, *, key=None, resolution=None):
 
 
 def enqueue(db, scope, proposal, *, delivery_id, opportunity_id, context_revision, valid_until,
-            observation_cursor, observation_generation, channel="pet_card", route_binding=None):
+            observation_cursor, observation_generation, channel="pet_card", route_binding=None,
+            interruption_level=None, request_sound=False):
     db.execute("""INSERT INTO system2_proposal_presentations
         (delivery_id, user_scope, proposal_id, proposal_version, opportunity_id, context_revision, valid_until,
-         observation_cursor, observation_generation, channel, route_binding, state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+         observation_cursor, observation_generation, channel, route_binding, interruption_level, request_sound, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
         ON CONFLICT(delivery_id) DO UPDATE SET context_revision=excluded.context_revision,
         valid_until=excluded.valid_until, observation_cursor=excluded.observation_cursor,
         observation_generation=excluded.observation_generation, channel=excluded.channel,
-        route_binding=excluded.route_binding, state='queued',
+        route_binding=excluded.route_binding, interruption_level=excluded.interruption_level,
+        request_sound=excluded.request_sound, state='queued',
         presentation_generation=system2_proposal_presentations.presentation_generation + 1
         WHERE system2_proposal_presentations.state='revoked'""", (
         delivery_id, scope, proposal.id, proposal.version, opportunity_id, context_revision, valid_until.isoformat(),
-        observation_cursor, observation_generation, channel, route_binding,
+        observation_cursor, observation_generation, channel, route_binding, interruption_level, request_sound,
     ))
 
 

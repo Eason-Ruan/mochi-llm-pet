@@ -5,10 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 import math
 
+from deskpet.contracts.models import REMINDER_TIMING_CONTEXT_LIMIT
 from deskpet.observation_v2.context import CAPTURE_HEALTH_REASONS, CAPTURE_HEALTH_STATUSES, CAPTURE_HEALTH_TIMES
 from deskpet.observation_v2.documents import document_source_allowed, sanitize_document_name
 from deskpet.observation_v2.state import _KINDS, _REASONS
 from deskpet.observation_v2.vision import validated_scene_elements, validated_visible_changes
+
+from .contact_history import CONTACT_LIMIT
 
 _CONTEXT_FIELDS = {
     "as_of", "timezone", "trigger_reasons", "items", "habits", "eligible_items", "current_phase",
@@ -27,7 +30,7 @@ _PRIVATE_FIELDS = {
     "transcription", "raw_input", "raw_keys", "keystrokes", "window_title",
     "window_title_redacted", "app_name", "domain", "foreground", "current_foreground",
     "previous_foreground", "credential_ref", "api_key", "authorization", "notes", "note",
-    "description", "review", "confirmed_outcomes", "next_steps", "password", "access_token",
+    "description", "timing_context", "review", "confirmed_outcomes", "next_steps", "password", "access_token",
     "document_name", "document_source", "document_local_sources", "document_cloud_sources", "document_change",
     "scene_elements", "visible_changes", "current_context", "last_observed_activity", "history_1h", "capture_health",
 }
@@ -164,24 +167,56 @@ def _document_names(value) -> set[str]:
 
 
 def _contact(value: dict) -> dict:
+    channels = {"pet_card", "pet_badge", "os_notification", "qt", "reminder_menu", "proposal_panel"}
+    exposures = {"painted", "reported_delivered", "unknown", "none"}
     identifiers = ("delivery_id", "subject_ref", "occurrence_id")
     result = {key: value[key] for key in identifiers if isinstance(value.get(key), str)}
     for key, choices in (
-        ("kind", {"reminder", "proposal", "pet"}),
-        ("channel", {"pet_card", "pet_badge", "os_notification", "qt"}),
-        ("response", {"acknowledged", "accepted", "rejected"}),
+        ("kind", {"reminder", "proposal", "pet", "phase_end"}),
+        ("channel", channels),
+        ("primary_channel", channels | {"none"}),
+        ("exposure", exposures),
+        ("passive_entry", {"reminder_menu", "proposal_panel", "none"}),
+        ("sound_heard", {"unknown", "none"}),
+        ("response", {"none", "dismissed", "refused", "snoozed", "acknowledged", "accepted", "rejected"}),
     ):
         if choice := _enum(value.get(key), choices, None):
             result[key] = choice
-    if at := _stamp(value.get("at")):
-        result["at"] = at
+    if type(value.get("sound_requested")) is bool:
+        result["sound_requested"] = value["sound_requested"]
+    if "surfaces" in value:
+        result["surfaces"] = [
+            {"channel": item["channel"], "exposure": item["exposure"], "active": item["active"]}
+            for item in _items(value["surfaces"], len(channels))
+            if _enum(item.get("channel"), channels, None) and _enum(item.get("exposure"), exposures, None)
+            and type(item.get("active")) is bool
+        ]
+    for key in ("at", "response_at"):
+        if at := _stamp(value.get(key)):
+            result[key] = at
     return result
+
+
+def include_candidate_timing_context(value: dict, result: dict, *, share: bool) -> None:
+    for field in ("eligible_items", "recheck_items"):
+        candidates, projected = value.get(field), result.get(field)
+        if not isinstance(candidates, (list, tuple)) or not isinstance(projected, list):
+            continue
+        for original, sanitized in zip(candidates, projected):
+            rule = original.get("rule") if isinstance(original, dict) else None
+            target = sanitized.get("rule") if isinstance(sanitized, dict) else None
+            if isinstance(rule, dict) and isinstance(target, dict) and isinstance(text := rule.get("timing_context"), str):
+                if text.strip() and len(text) <= REMINDER_TIMING_CONTEXT_LIMIT:
+                    target["has_timing_context"] = True
+                    if share:
+                        target["timing_context"] = text.strip()
 
 
 def project_context(value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
     result = {key: _clean(data) for key, data in value.items() if key in _CONTEXT_FIELDS}
+    include_candidate_timing_context(value, result, share=share)
     if "recent_contacts" in value:
-        result["recent_contacts"] = [_contact(item) for item in _items(value["recent_contacts"], 12)]
+        result["recent_contacts"] = [_contact(item) for item in _items(value["recent_contacts"], CONTACT_LIMIT)]
     current = value.get("current")
     history = value.get("history")
     result["current_status"] = _enum(value.get("current_status"), _CURRENT_STATUSES, "no_data")

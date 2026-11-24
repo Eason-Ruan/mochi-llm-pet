@@ -224,10 +224,14 @@ def test_semantic_projection_preserves_decision_evidence_and_separates_user_inte
     transition = {"phase_id": "focus-1", "phase_version": 3, "elapsed_at": at,
                   "successor": {"id": "break-1", "kind": "short_break", "version": 1}}
     contact = {"kind": "proposal", "delivery_id": "proposal-ui-1", "at": at,
-               "channel": "pet_card", "response": "rejected", "subject_ref": "proposal:1"}
+               "channel": "pet_card", "response": "refused", "response_at": at, "subject_ref": "proposal:1",
+               "primary_channel": "pet_card", "exposure": "painted", "passive_entry": "proposal_panel",
+               "sound_requested": True, "sound_heard": "unknown",
+               "surfaces": [{"channel": "pet_card", "exposure": "painted", "active": True}]}
     context = snapshot() | {
         "timezone": "Asia/Shanghai", "phase_elapsed": [transition],
-        "recent_contacts": [contact | {"screen_text": FRAME}],
+        "recent_contacts": [contact | {"screen_text": FRAME,
+                                        "surfaces": [contact["surfaces"][0] | {"summary": FRAME}]}],
         "recent_user_actions": [{"subject_ref": "reminder:1", "at": at}],
         "candidate_items_truncated": True,
         "last_observed_activity": {"observed_at": at, "summary_observed_at": at,

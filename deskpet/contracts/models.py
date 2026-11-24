@@ -3,12 +3,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 SCHEMA_VERSION = 1
+REMINDER_TIMING_CONTEXT_LIMIT = 280
+ReminderTimingContext = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=REMINDER_TIMING_CONTEXT_LIMIT),
+]
 
 
 class Model(BaseModel):
@@ -140,6 +144,8 @@ class TaskDraft(Model):
     window_open_at: datetime | None = None
     window_close_at: datetime | None = None
     window_computed_at: datetime | None = None
+    sound: bool | None = Field(default=None, strict=True)
+    timing_context: ReminderTimingContext | None = None
     urgency_until: datetime | None = None
     urgency_reason: str | None = Field(default=None, min_length=1, max_length=500)
 
@@ -178,9 +184,10 @@ class TaskDraft(Model):
     @model_validator(mode="after")
     def window_valid(self):
         start, deadline = self.opens_at, self.hard_deadline
-        if not self.model_fields_set.intersection({"mode", "earliest_at", "latest_first_delivery_at", "item_type",
-                                                   "reminder_enabled", "remind_after", "target_at", "remind_by",
-                                                   "expires_at", "due_at"}):
+        if not self.timing_context and not self.model_fields_set.intersection({
+            "mode", "earliest_at", "latest_first_delivery_at", "item_type", "reminder_enabled",
+            "remind_after", "target_at", "remind_by", "expires_at", "due_at",
+        }):
             raise ValueError("specify reminder timing or an untimed item type")
         if start is not None and deadline is not None and deadline < start:
             raise ValueError("remind_by precedes the opening time")

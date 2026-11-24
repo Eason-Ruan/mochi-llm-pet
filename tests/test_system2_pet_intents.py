@@ -128,3 +128,31 @@ def test_semantic_pet_bubble_survives_revision_and_observation_expiry(pet):
     assert store.claim(delivery_id, clock.wall_now()) is None
     contact, = scheduler.snapshot(clock.wall_now())["recent_contacts"]
     assert (contact["delivery_id"], contact["kind"]) == (delivery_id, "pet")
+    assert contact["primary_channel"] == "qt" and contact["exposure"] == "painted"
+    assert store.dismiss(delivery_id, clock.wall_now())
+    dismissed, = scheduler.snapshot(clock.wall_now())["recent_contacts"]
+    assert dismissed["response"] == "dismissed"
+
+
+def test_semantic_pet_sound_receipt_does_not_imply_a_paint(pet):
+    clock, _, _, _, scheduler, store = pet
+    delivery_id, _ = offer(pet, level="enhanced", intent="idle", position_hint="stay", sound=True)
+    assert store.claim(delivery_id, clock.wall_now())["sound"]
+    assert store.receipt(delivery_id, sound_requested=True, now=clock.wall_now())
+    contact, = scheduler.snapshot(clock.wall_now())["recent_contacts"]
+    assert contact["primary_channel"] == "qt" and contact["exposure"] == "none"
+    assert contact["surfaces"] == [] and contact["sound_requested"] and contact["sound_heard"] == "unknown"
+
+
+@pytest.mark.parametrize("level", ["actionable", "enhanced"])
+def test_pet_levels_recheck_visibility_and_live_preferences(pet, level):
+    clock, _, settings, lock, _, store = pet
+    delivery_id, _ = offer(pet, level=level, text="有空休息一下")
+    lock["active"] = None
+    assert not store.claim(delivery_id, clock.wall_now())
+    lock["active"] = False
+    settings.update(expected_version=settings.read().version, reminder_sound=False,
+                    reduce_motion=True, allow_proactive_movement=False)
+    assert store.claim(delivery_id, clock.wall_now()) == {
+        "position_hint": "stay", "animation": "idle", "sound": False, "text": "有空休息一下",
+    }

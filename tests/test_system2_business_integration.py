@@ -10,6 +10,7 @@ import pytest
 from deskpet.c_ui.desktop_system2 import DesktopSystem2
 from deskpet.c_ui.presentation import DesktopPresentation
 from deskpet.c_ui.refine_conversation_store import ConversationStore
+from deskpet.observation_v2.routes import SYSTEM2, CloudRoute
 from deskpet.system2.host import System2Host
 from deskpet.system2.intent import describe_grants
 from deskpet.system2.protocol import EngineReply
@@ -72,6 +73,94 @@ def presenter_for(business, *, notifications=None):
 
 def refresh_presenter(presenter, business):
     presenter.observe(snapshot(business.clock, business.tasks, **business.settings.read().to_dict()))
+
+
+def test_user_timing_condition_is_stored_and_shared_only_with_candidate_context(business):
+    from deskpet.system2.dsh_projection import project_input
+
+    condition = "等我开完会"
+    attempts = []
+    background = []
+
+    def turn(data, invoke):
+        if data["origin"] == "background":
+            background.append(data)
+            return
+        for identity, timing in [("invented", "会议开始前"), ("actual", condition)]:
+            attempts.append(invoke("item_create", identity, {
+                "type": "reminder", "title": "收衣服", "reminder_rule": {"timing_context": timing},
+            }))
+
+    host = host_for(business, turn)
+    try:
+        host.submit_user(condition + "提醒我收衣服", event_id="condition-reminder")
+        assert host.pump()
+        assert [result["status"] for result in attempts] == ["rejected", "applied"]
+        item, = business.items.list()
+        rule = item["rule"]
+        assert rule["timing_context"] == condition
+        assert all(rule[key] is None for key in ("remind_after", "target_at", "remind_by", "expires_at"))
+        assert "timing_context" not in attempts[1]["view"]["rule"]
+        business.clock.advance(60)
+        business.scheduler.poll()
+        assert host.pump()
+        payload, = background
+        for shared in [False, True]:
+            _, projected = project_input(payload, share=shared, origin="background")
+            candidate, = projected["context"]["eligible_items"]
+            assert candidate["rule"]["has_timing_context"] is True
+            assert candidate["rule"].get("timing_context") == (condition if shared else None)
+            assert all("timing_context" not in item["rule"] for item in projected["context"]["items"])
+        assert not business.tasks.delivery.commands
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("withdraw_during_turn", [False, True])
+def test_withheld_condition_blocks_model_judgment_and_keeps_deadline(business, withdraw_during_turn):
+    route = business.settings.routes.configure(
+        SYSTEM2, CloudRoute("openai_compatible", "https://test.example/v1", "test-model", "Test"),
+    )
+    if withdraw_during_turn:
+        route = business.settings.routes.set_permission(SYSTEM2, True, expected=route)
+    now = business.clock.wall_now()
+    condition = "等我开完会"
+    item = create_reminder(business, "提交组会记录", target_at=(now + timedelta(seconds=90)).isoformat(),
+                           remind_by=(now + timedelta(seconds=120)).isoformat(), timing_context=condition)
+    occurrence = item["occurrence"]["id"]
+    results = []
+
+    def turn(data, invoke):
+        candidate, = data["context"]["eligible_items"]
+        assert candidate["rule"]["has_timing_context"] is True
+        assert candidate["rule"].get("timing_context") == (condition if withdraw_during_turn else None)
+        if withdraw_during_turn:
+            business.settings.routes.set_permission(SYSTEM2, False, expected=route)
+        else:
+            assert "reminder.present" not in data["grants"]
+        results.append(invoke("reminder_present", "try-paint", present_args(item)))
+        results.append(invoke("reminder_recheck", "try-estimate", {
+            "occurrence_id": occurrence, "window_open_at": (now + timedelta(seconds=30)).isoformat(),
+            "window_close_at": (now + timedelta(seconds=85)).isoformat(),
+        }))
+        results.append(invoke("reminder_recheck", "wait-safely", {
+            "occurrence_id": occurrence, "run_at": (now + timedelta(seconds=80)).isoformat(),
+        }))
+
+    host = host_for(business, turn)
+    try:
+        business.scheduler.poll()
+        assert host.pump()
+        assert [result.get("error_code") for result in results[:2]] == ["NOT_AUTHORIZED", "NOT_AUTHORIZED"]
+        assert results[2]["outcome"] == "deferred"
+        business.tasks.pump()
+        assert not business.tasks.delivery.commands
+        business.clock.advance(120)
+        business.tasks.pump()
+        delivery, = business.tasks.delivery.commands
+        assert delivery.reason == "deadline_fallback"
+    finally:
+        host.close()
 
 
 @pytest.mark.parametrize("invalidated_at", ["tool", "paint", "sound"])

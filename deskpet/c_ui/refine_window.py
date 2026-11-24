@@ -239,6 +239,12 @@ class _Bubble(QFrame):
                 button.clicked.connect(lambda _checked=False, answer=value: self._answer(answer))
                 row.addWidget(button)
             row.addStretch()
+            if on_dismiss is not None:
+                close = _button(self, "refine-bubble-close", "×", 29, 29)
+                close.setAccessibleName("关闭提示")
+                close.setToolTip("关闭提示")
+                close.clicked.connect(self._dismiss)
+                row.addWidget(close)
             layout.addLayout(row)
         else:
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -252,7 +258,7 @@ class _Bubble(QFrame):
             handler(value)
 
     def _dismiss(self):
-        if self._pet.bubble is self and self._on_answer is None:
+        if self._pet.bubble is self:
             handler = self._on_dismiss
             self._pet.clear_bubble()
             if handler is not None:
@@ -266,12 +272,13 @@ class _Bubble(QFrame):
         return super().eventFilter(watched, event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and self._on_answer is None:
             self._dismiss()
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Space, Qt.Key.Key_Return) and self._on_answer is None:
+        if (event.key() == Qt.Key.Key_Escape and self._on_dismiss is not None
+                or (event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return) and self._on_answer is None)):
             self._dismiss()
             event.accept()
         else:

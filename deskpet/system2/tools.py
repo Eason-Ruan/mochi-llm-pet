@@ -20,7 +20,8 @@ from . import proposals
 from .protocol import ToolAuthority
 from .semantic_policy import semantic_background_enabled
 from .tool_schema import (
-    HabitPatch, PROPOSABLE_ACTIONS, READ_TOOLS, SettingsPatch, canonical_tool_name, tool_definitions, validate_tool_args,
+    HabitPatch, InterruptionLevel, PROPOSABLE_ACTIONS, READ_TOOLS, SettingsPatch, canonical_tool_name, tool_definitions,
+    validate_tool_args,
 )
 
 _MESSAGES = {
@@ -76,6 +77,7 @@ class ToolResult:
     retryable: bool | None = None
     presentation_receipt: dict | None = None
     resolved_function: str | None = None
+    interruption_level: InterruptionLevel | None = None
 
     def to_dict(self):
         return {field: getattr(self, field) for field in self.__slots__ if getattr(self, field) is not None}
@@ -370,6 +372,8 @@ class System2ToolExecutor:
         if function in ("reminder.recheck", "observation.wait_fresh", "decision.recheck"):
             return self._wait_or_recheck(db, function, args, authority, now)
         if function == "pet.present":
+            if args.get("level") == "quiet":
+                return ToolResult(call_id, "applied", outcome="quiet", interruption_level="quiet")
             if self.pet is None:
                 return _rejected(call_id, "UNSUPPORTED_CHANNEL")
             return self._from_outcome(call_id, function, self.pet.present(**args, authority=authority, now=now, db=db))
@@ -391,7 +395,7 @@ class System2ToolExecutor:
         if not fields.get("message"):
             if fields["error_code"]:
                 fields["message"] = _MESSAGES.get(fields["error_code"], "这次操作未完成。")
-            elif fields.get("status") == "applied":
+            elif fields.get("status") == "applied" and fields.get("outcome") != "quiet":
                 fields["message"] = _APPLIED.get(function, "已更新。")
         return ToolResult(call_id, **fields)
 
@@ -751,6 +755,18 @@ class System2ToolExecutor:
     def _offer_proposal(self, db, args, authority, now):
         scope = authority.user_scope
         call_id = authority.call_id
+        presentation = args.get("presentation") or {}
+        level = presentation.get("level")
+        if level == "quiet":
+            return ToolResult(call_id, "applied", outcome="quiet", interruption_level=level)
+        semantic = semantic_background_enabled() and authority.origin != "user"
+        if level == "passive" and (not semantic or presentation.get("channel") not in (None, "pet_badge")):
+            return _rejected(call_id, "UNSUPPORTED_CHANNEL")
+        if level in ("actionable", "enhanced") and presentation.get("channel") == "pet_badge":
+            return _rejected(call_id, "UNSUPPORTED_CHANNEL")
+        channel = ((presentation.get("channel") or ("pet_badge" if level == "passive" else "pet_card"))
+                   if semantic else "pet_card")
+        request_sound = semantic and level == "enhanced" and presentation.get("sound") is not False
         function = canonical_tool_name(args["function"])
         if function not in _PROPOSABLE:
             return _rejected(call_id, "INVALID_ARGUMENT")
@@ -767,7 +783,6 @@ class System2ToolExecutor:
             if versions[targets[0]] != payload["expected_version"]:
                 return _rejected(call_id, "STALE_TASK")
         payload.pop("expected_version", None)
-        semantic = semantic_background_enabled() and authority.origin != "user"
         opportunity = None if semantic else self.scheduler.get_opportunity(db=db)
         if (not semantic and not function.startswith("phase.") and authority.opportunity_id
                 and authority.opportunity_id != opportunity):
@@ -814,8 +829,9 @@ class System2ToolExecutor:
             if not new:
                 self._release_proposal_delivery(db, scope, previous.id)
             proposals.save(db, scope, proposal, key=business_key if new else None)
-        channel = (args.get("presentation") or {}).get("channel", "pet_card") if semantic else "pet_card"
-        delivery_id, denial = self._queue_proposal(db, scope, proposal, authority, now, opportunity, semantic, channel)
+        delivery_id, denial = self._queue_proposal(
+            db, scope, proposal, authority, now, opportunity, semantic, channel, level, request_sound,
+        )
         if semantic and denial:
             locked = self.scheduler._lock_state()
             reason = ("desktop_locked" if locked is True else "lock_state_unknown" if locked is None else
@@ -824,9 +840,13 @@ class System2ToolExecutor:
                               actual_version=proposal.version, view=_model_view(proposal),
                               error_code=denial, outcome="deferred", retryable=denial == "STALE_CONTEXT",
                               presentation_receipt={"channel": channel, "state": "deferred", "reason": reason},
+                              interruption_level=level,
                               message="建议已加入待确认列表，当前无法显示提示。")
+        if delivery_id:
+            level = proposals.delivery(db, scope, delivery_id)["interruption_level"]
         return ToolResult(call_id, "pending", subject_ref=f"proposal:{proposal.id}",
                           actual_version=proposal.version, delivery_id=delivery_id, view=_model_view(proposal),
+                          interruption_level=level,
                           message="等待你确认。")
 
     def _current_proposal(self, db, scope, business_key, now, authority, semantic):
@@ -841,7 +861,8 @@ class System2ToolExecutor:
                     return previous
         return None
 
-    def _queue_proposal(self, db, scope, proposal, authority, now, opportunity, semantic, channel):
+    def _queue_proposal(self, db, scope, proposal, authority, now, opportunity, semantic, channel, level,
+                        request_sound):
         if authority.origin == "user" or (not semantic and authority.context_revision is None):
             return None, None
         valid_until = min(proposal.valid_until, authority.expires_at)
@@ -864,7 +885,8 @@ class System2ToolExecutor:
                           context_revision=authority.context_revision or 0, valid_until=valid_until,
                           observation_cursor=authority.observation_cursor,
                           observation_generation=authority.observation_generation,
-                          channel=channel, route_binding=route_binding)
+                          channel=channel, route_binding=route_binding, interruption_level=level,
+                          request_sound=request_sound)
         return delivery_id, None
 
     def _proposal_route_binding(self, db):
@@ -873,10 +895,19 @@ class System2ToolExecutor:
 
     def _proposal_response(self, db, scope, proposal, answer, now):
         delivery = proposals.latest_delivery(db, scope, proposal.id)
-        if delivery and delivery["route_binding"] is not None:
-            self.scheduler.record_contact(delivery_id=delivery["delivery_id"], kind="proposal", at=now,
-                                          channel=delivery["channel"], subject_ref=proposal.id,
-                                          response=answer, db=db)
+        if delivery:
+            self._proposal_contact(db, delivery, now, response=answer,
+                                   exposure={"displayed": "painted", "unknown": "unknown",
+                                             "permitted": "unknown"}.get(delivery["state"], "none"))
+
+    def _proposal_contact(self, db, delivery, at, *, exposure=None, response=None):
+        if delivery["route_binding"] is not None:
+            self.scheduler.record_contact(
+                delivery_id=delivery["delivery_id"], kind="proposal", at=at, channel=delivery["channel"],
+                subject_ref=delivery["proposal_id"],
+                occurrence_id=f"proposal:{delivery['proposal_id']}:{delivery['proposal_version']}",
+                exposure=exposure, response=response, db=db,
+            )
 
     def _resolve_proposal(self, db, args, authority, now):
         scope, call_id = authority.user_scope, authority.call_id
@@ -905,7 +936,7 @@ class System2ToolExecutor:
             result = ToolResult(call_id, "applied", subject_ref=ref, actual_version=proposal.version + 1,
                                 message="已拒绝建议。" if args["answer"] == "reject" else "已取消建议。")
             self._retire_proposal(db, scope, proposal, "rejected", resolution=result.to_dict())
-            self._proposal_response(db, scope, proposal, "rejected", now)
+            self._proposal_response(db, scope, proposal, "refused" if args["answer"] == "reject" else "dismissed", now)
             return result
 
         if not self._proposal_enabled(self.settings.read(db=db), proposal):
@@ -974,6 +1005,7 @@ class System2ToolExecutor:
             for row in proposals.deliveries(db, scope, state="permitted"):
                 if now >= _when(row["valid_until"]):
                     proposals.set_delivery(db, scope, row["delivery_id"], "unknown")
+                    self._proposal_contact(db, row, _when(row["valid_until"]), exposure="unknown")
             return queued
 
     def _revoke_presentation(self, db, scope, delivery_id):
@@ -1040,9 +1072,21 @@ class System2ToolExecutor:
                 return False
             if displayed:
                 proposals.set_delivery(db, scope, delivery_id, "displayed")
-                if row["route_binding"] is not None:
-                    self.scheduler.record_contact(delivery_id=delivery_id, kind="proposal", at=self.now(),
-                                                  channel=row["channel"], subject_ref=row["proposal_id"], db=db)
+                self._proposal_contact(db, row, self.now(), exposure="painted")
             else:
                 self._revoke_presentation(db, scope, delivery_id)
+            return True
+
+    def dismiss_presentation(self, delivery_id, user_scope=None, *, generation=None):
+        scope = user_scope or self.user_scope
+        if scope != self.user_scope:
+            return False
+        with self._transaction(timeout=_QT_BUSY_TIMEOUT) as db:
+            row = proposals.delivery(db, scope, delivery_id)
+            if not self._matching_lease(row, generation) or row["state"] != "displayed":
+                return False
+            proposal, _ = proposals.get(db, scope, row["proposal_id"])
+            if proposal is None or proposal.state != "pending" or proposal.version != row["proposal_version"]:
+                return False
+            self._proposal_contact(db, row, self.now(), response="dismissed", exposure="painted")
             return True

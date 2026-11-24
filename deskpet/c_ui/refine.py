@@ -10,7 +10,7 @@ import sys
 from types import SimpleNamespace
 from uuid import uuid4
 
-from PyQt6.QtCore import QLockFile, QPoint, QSettings, QStandardPaths, QTimer
+from PyQt6.QtCore import QLockFile, QPoint, QSettings, QStandardPaths, Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
@@ -21,6 +21,7 @@ from deskpet.timezones import resolve_timezone
 
 from .desktop import DesktopWorkbench
 from .desktop_power import DesktopPower
+from .native_notifications import SNOOZE_SECONDS, platform_notifications
 from .refine_chat import RefineChat
 from .refine_conversation_store import ConversationStore
 from .refine_delivery import Prompt, RefineDeliveryMixin
@@ -58,6 +59,8 @@ class RefineSession(RefineDeliveryMixin):
         self._pending_settings = None
         self._reminder_response_events = {}
         self._reminder_response_versions = {}
+        self._native_responses = {}
+        self._native_notifications = getattr(args, "native_notifications", None)
         self._invite_waiting = False
         self._closing = False
         self._last_service_error = None
@@ -102,6 +105,11 @@ class RefineSession(RefineDeliveryMixin):
             self.work = RefineWork()
         self._init_reminder_delivery()
         if self.production:
+            self.presentation.notification_response.connect(
+                self._receive_native_reminder_response, Qt.ConnectionType.QueuedConnection,
+            )
+            if getattr(self.presentation.notifications, "can_respond", False):
+                self.presentation.notifications.set_response_handler(self.presentation.notification_response.emit)
             from deskpet.settings import SettingsStore
             from .settings import SettingsPanel
 
@@ -229,10 +237,10 @@ class RefineSession(RefineDeliveryMixin):
             self.presentation.ledger.authorize_early = self._system2.scheduler.authorize_qt
         if self.chat.recovered_event:
             self.window.action.emit({"kind": "recover_chat_result", "event_id": self.chat.recovered_event})
+        self._drain_native_reminder_responses()
 
     def _desktop_power_event(self, action):
-        if action["kind"] == "system_sleep":
-            self.presentation.restore_fallbacks()
+        self.presentation.power_event(action["kind"])
         self.window.action.emit(action)
 
     def _queue_chat_message(self, message_id, text, *, proposal=None, supersedes_message_id=None):
@@ -279,11 +287,55 @@ class RefineSession(RefineDeliveryMixin):
         if self._current_reminder_occurrence(task_id, occurrence) is None:
             self.overviews["reminders"].set_feedback("这次提醒已更新，请查看当前安排。")
             return
+        self._show_reminder_details(task_id, self.reminders.snooze_controls)
+
+    def _show_reminder_details(self, task_id, target):
         self._show_section("reminders")
         self.reminders.open_delivery_group(None)
         self.reminders.select_task(task_id)
-        self.detail_panels["reminders"].reveal_on_show(self.reminders.snooze_controls)
+        self.detail_panels["reminders"].reveal_on_show(target)
         self._panel_details("reminders", True)
+
+    def _receive_native_reminder_response(self, identifier, action):
+        if self._closing:
+            return
+        self._native_responses[identifier, action] = None
+        self._drain_native_reminder_responses()
+
+    def _drain_native_reminder_responses(self):
+        if (not self._native_responses or self._closing or not self.snapshot.get("now")
+                or not self.window.ready_for_actions):
+            return
+        if not self.presentation.unlocked():
+            self._native_responses.clear()
+            return
+        for identifier, action in tuple(self._native_responses):
+            try:
+                task = self.presentation.ledger.native_response_target(
+                    identifier, action, self.presentation.now(), record_exposure=True,
+                )
+            except sqlite3.OperationalError:
+                # A snapshot after the active writer commits can retry the response.
+                return
+            if task is not None:
+                shown = self._current_reminder_occurrence(task.task_id, task.occurrence)
+                if (shown is None or shown["version"] != task.version
+                        or self._reminder_response_busy(task.task_id)):
+                    continue
+            self._native_responses.pop((identifier, action))
+            if task is None:
+                continue
+            if action == "open":
+                self._show_reminder_details(task.task_id, self.reminders.detail_title)
+            elif action == "snooze" and (task.draft.expires_at is not None
+                    and self.presentation.now() + timedelta(seconds=SNOOZE_SECONDS) >= task.draft.expires_at):
+                self._customize_reminder_snooze(task.task_id, task.occurrence)
+            else:
+                self._respond_to_reminder(action, task.task_id, task.occurrence, seconds=SNOOZE_SECONDS)
+                continue
+            if self.pet.isHidden() or self.pet.isMinimized():
+                self.pet.showNormal()
+            self.pet.activate_for_input()
 
     def _open_model_settings(self):
         self._show_section("settings")
@@ -433,6 +485,8 @@ class RefineSession(RefineDeliveryMixin):
             self.pet.set_proactive_movement(settings["allow_proactive_movement"])
             self._render_system2(snapshot)
         self._render_toolbar()
+        if self.production:
+            self._drain_native_reminder_responses()
 
     def _render_reminder_overview(self, snapshot):
         now = self.presentation.now(snapshot)
@@ -443,8 +497,9 @@ class RefineSession(RefineDeliveryMixin):
                 self._reminder_response_versions.pop(task_id)
         pending = snapshot.get("pending_deliveries", {})
         presented = {(row["task_id"], row["occurrence"]) for row in self.presentation.rows
-                     if row["state"] in {"painted", "badge_shown", "grouped"}}
+                     if row["state"] in {"painted", "badge_shown", "grouped", "passive"}}
         presented.update((item.task_id, item.occurrence) for item in self.presentation.native_followups())
+        presented.update((item["task_id"], item["occurrence"]) for item in snapshot.get("system2_passive_reminders", ()))
         actionable = set()
         for task in active_reminders(snapshot):
             draft = task["draft"]
@@ -487,6 +542,7 @@ class RefineSession(RefineDeliveryMixin):
             delivery_id = delivery["delivery_id"]
             proposal = indexed.get(delivery["proposal_id"])
             if (delivery_id in self._presented_proposals or delivery_id in queued or not proposal
+                    or self.presentation.catchup_effect(delivery_id)
                     or delivery["proposal_version"] != proposal["version"]):
                 continue
             prompt = self._proposal_prompt(delivery, proposal)
@@ -542,7 +598,15 @@ class RefineSession(RefineDeliveryMixin):
                 return False
             if result:
                 self._presented_proposals.add(delivery_id)
+                if delivery.get("request_sound"):
+                    self.presentation.request_attention_sound("reminder", delivery_id, contact_kind="proposal")
             return result
+
+        def dismissed():
+            try:
+                gateway.dismiss_presentation(delivery_id, scope, generation=generation)
+            except sqlite3.OperationalError:
+                pass
 
         def open_proposal(yes):
             if not current():
@@ -554,20 +618,23 @@ class RefineSession(RefineDeliveryMixin):
                 self._show_section("input")
 
         return Prompt("proposal", proposal["display_text"], open_proposal,
-                      delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted, direct_focus=direct_focus)
+                      delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted,
+                      direct_focus=direct_focus, on_dismiss=dismissed)
 
     def _render_pet_intents(self, snapshot):
         if self.prompt is not None or self.pet._press is not None or self._pet_motion_delivery is not None:
             return
         for delivery in snapshot.get("system2_pet_intents", ()):
             delivery_id = delivery["delivery_id"] if isinstance(delivery, dict) else delivery
+            if self.presentation.catchup_effect(delivery_id):
+                continue
             if isinstance(delivery, dict) and delivery.get("text"):
                 self._queue_pet_bubble(delivery)
                 break
             intent = self._system2.pet.claim(delivery_id, self.presentation.now())
             if intent is None:
                 continue
-            motion, sound = self._apply_pet_effect(intent)
+            motion, sound = self._apply_pet_effect(intent, delivery_id)
             if isinstance(delivery, dict) and (motion or sound):
                 self._report_pet_motion(delivery_id, motion, sound)
             else:
@@ -575,11 +642,10 @@ class RefineSession(RefineDeliveryMixin):
                 QTimer.singleShot(1000, self.pet.end_temporary_motion)
             break
 
-    def _apply_pet_effect(self, intent):
+    def _apply_pet_effect(self, intent, delivery_id):
         motion = self.pet.apply_motion_intent(intent["position_hint"], intent["animation"])
-        sound = bool(intent["sound"] and self.presentation.native and self.presentation.lock_probe() is False)
-        if sound:
-            self.app.beep()
+        sound = bool(intent["sound"] and self.presentation.request_attention_sound("reminder", delivery_id,
+                                                                                   contact_kind="pet"))
         return motion, sound
 
     def _report_pet_motion(self, delivery_id, motion, sound):
@@ -626,12 +692,14 @@ class RefineSession(RefineDeliveryMixin):
             if claimed is None:
                 return False
             if sound is None:
-                _, sound = self._apply_pet_effect(claimed)
+                _, sound = self._apply_pet_effect(claimed, delivery_id)
             return self._system2.pet.receipt(delivery_id, displayed=True, sound_requested=sound,
                                              now=self.presentation.now())
 
         self.waiting_prompts.append(Prompt("pet", delivery["text"], delivery_id=delivery_id, valid=current,
-                                           before_paint=permit, on_painted=painted))
+                                           before_paint=permit, on_painted=painted,
+                                           on_dismiss=lambda: self._system2.pet.dismiss(delivery_id,
+                                                                                        self.presentation.now())))
         self._show_next_prompt()
 
     def _render_toolbar(self):
@@ -741,7 +809,9 @@ class RefineSession(RefineDeliveryMixin):
             self._closing = False
 
     def _finished(self):
-        self.presentation.restore_fallbacks()
+        self.presentation.restore_fallbacks(finished=self._finish_desktop)
+
+    def _finish_desktop(self):
         if self._power is not None:
             self._power.close()
         if self._observer_timer is not None:
@@ -832,8 +902,11 @@ def run_desktop(data_dir=None):
         return 1
     session = None
     try:
+        # Register the macOS delegate before constructing the service host. The
+        # platform can launch Mochi to deliver a notification response.
+        notifications = platform_notifications(native=True) if app.platformName() == "cocoa" else None
         session = RefineSession(app, SimpleNamespace(
-            profile="realtime", scenario="desktop", output=None, data_dir=data_dir,
+            profile="realtime", scenario="desktop", output=None, data_dir=data_dir, native_notifications=notifications,
         ))
         return app.exec()
     finally:

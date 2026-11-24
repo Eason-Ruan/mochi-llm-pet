@@ -33,6 +33,7 @@ from deskpet.task_service.presentation import PresentationLedger
 from deskpet.task_service.sqlite import SQLiteTaskService
 from deskpet.work_sessions.models import PhaseView
 from deskpet.work_sessions.persistent import PersistentWorkSessionService
+from evaluation.interruption_replay import SimulatedNotifications, score_interruption_case, summarize_interruptions
 
 
 FIXTURES = Path(__file__).with_name("data") / "system2-semantic-replay.json"
@@ -154,6 +155,14 @@ class Runtime:
         self.locked = False
         self.aliases = {}
         self.delivered = set()
+        self.prompt_responses = []
+        self.proposal_buttons = []
+        self.primary_by_occurrence = {}
+        self.synthetic_sound_requests = []
+        self.last_sound_event = 0
+        self.native_projection = {}
+        self.passive_reminders = set()
+        self.rendered_channels = set()
         self.observation_path = directory / "observation.sqlite3"
         self.observation = ObservationStore(self.observation_path, live=True, boot_id="offline-replay")
         self.observation.begin_live_run(self.now, monotonic_s=0, poll_interval_s=30)
@@ -180,6 +189,17 @@ class Runtime:
         self.gateway = System2ToolExecutor(self.path, items=self.items, phases=self.phases, settings=self.settings,
                                            scheduler=self.scheduler, pet=self.pet, context_reader=reader)
         self.ledger = PresentationLedger(self.path, source="simulated", authorize_early=self.scheduler.authorize_qt)
+        self.surface = None
+        if "interruption" in case:
+            from deskpet.c_ui.presentation import DesktopPresentation
+
+            self.notifications = SimulatedNotifications(self.clock)
+            self.notifications.available = case["interruption"].get("native", False)
+            self.surface = DesktopPresentation(path=self.path, synthetic=True, notifications=self.notifications,
+                                               lock_probe=lambda: self.locked)
+            self.surface.ledger = self.ledger
+            # The isolated transport and patched beep exercise the actual routing and audio gates.
+            self.surface.native = True
         self.engine = ReplayEngine(self, recordings)
         self.directory = directory
         self.reader = reader
@@ -190,7 +210,7 @@ class Runtime:
                                settings_store=self.settings, clock=self.clock, manage_scheduler=False,
                                context_reader=self.reader, timezone=self.timezone, display_capabilities=lambda: {
                                    "pet_card": self.locked is False, "pet_badge": self.locked is False,
-                                   "os_notification": False,
+                                   "os_notification": bool(self.surface and self.notifications.available),
                                })
         self.gateway.after_local_commit = self.host.fence_local
 
@@ -278,6 +298,10 @@ class Runtime:
             if cards:
                 card = cards[0]
                 self.host.resolve_proposal(card["id"], payload, version=card["version"], event_id=identity)
+                if self.surface:
+                    self.proposal_buttons.append((card["id"], payload))
+        elif kind in {"reminder_action", "native_action"}:
+            self.reminder_action(payload, identity, native=kind == "native_action")
         elif kind == "cancel_reminder":
             item = self.aliases[payload]
             self.tasks.apply(TaskCommand(command_id=identity, kind="cancel", task_id=item["id"],
@@ -287,6 +311,44 @@ class Runtime:
             self.open_host()
         else:
             raise ValueError(f"Unknown replay event {kind}")
+
+    def reminder_action(self, payload, identity, *, native):
+        item = self.aliases.get(payload["reminder"], {})
+        occurrence = item.get("occurrence_id")
+        display = self.primary_by_occurrence.get(occurrence, {})
+        action = payload["action"]
+        target = None
+        status, error = "no_prompt", None
+        if native and (identifier := display.get("os_id")):
+            target = self.ledger.native_response_target(identifier, action, self.now)
+            status, error = "rejected", "STALE_PRESENTATION"
+        elif not native and display.get("channel") == "pet_card":
+            target = self.tasks.get(item["id"])
+            status, error = "rejected", "STALE_PRESENTATION"
+        if target and (native or target.occurrence_id == occurrence):
+            args = {"occurrence_id": target.occurrence_id, "expected_version": target.version}
+            if action == "snooze":
+                args.update(delay_s=payload.get("delay_s", 300), mode="exact")
+            result = self.gateway.execute_local(f"reminder.{action}", args, event_id=identity)
+            status, error = result.status, result.error_code
+            if status == "applied" and (alias := payload.get("save_as")):
+                self.save_alias(alias, result.view)
+        self.prompt_responses.append({"occurrence": occurrence, "subject": occurrence, "delivery_id": display.get("id"),
+                                      "action": action, "status": status, "error_code": error})
+
+    def resolve_proposal_buttons(self):
+        if not self.proposal_buttons:
+            return
+        with closing(sqlite3.connect(self.path)) as db:
+            proposals = db.execute("SELECT id,business_key,json_extract(view, '$.state') FROM system2_proposals")
+            by_id = {identity: (key, state) for identity, key, state in proposals}
+        for identity, action in self.proposal_buttons:
+            subject, state = by_id[identity]
+            applied = state == {"accept": "accepted", "reject": "rejected", "cancel": "cancelled"}[action]
+            display = self.primary_by_occurrence.get(identity, {})
+            self.prompt_responses.append({"occurrence": identity, "subject": subject, "delivery_id": display.get("id"),
+                                          "action": action, "status": "applied" if applied else "rejected"})
+        self.proposal_buttons.clear()
 
     def state(self):
         items = {task.task_id: task for task in self.tasks.list_tasks()}
@@ -301,7 +363,11 @@ class Runtime:
         self.tasks.pump()
         results = []
         foreground_used = False
-        for command in self.port.commands:
+        if self.surface:
+            results = self.interruption_displays()
+            foreground_used = any(display["status"] == "shown" and display["channel"] == "pet_card"
+                                  for display in results)
+        for command in (self.port.commands if self.surface is None else ()):
             if command.delivery_id in self.delivered:
                 continue
             if command.channel == "os_notification":
@@ -335,17 +401,139 @@ class Runtime:
             if permitted:
                 shown = self.gateway.ack_presentation(key, displayed=shown, generation=generation) and shown
             foreground_used = foreground_used or (shown and channel == "pet_card")
-            results.append(self.display("proposal", key, shown, channel=channel))
+            fields = {}
+            if self.surface:
+                with closing(sqlite3.connect(self.path)) as db:
+                    subject, = db.execute("SELECT business_key FROM system2_proposals WHERE id=?",
+                                          (row["proposal_id"],)).fetchone()
+                fields = {"occurrence": row["proposal_id"], "subject": subject, "primary": channel == "pet_card",
+                          "actionable": channel == "pet_card"}
+                if shown and row.get("request_sound"):
+                    self.request_simulated_sound(key, "proposal")
+            results.append(self.display("proposal", key, shown, channel=channel, **fields))
         for delivery in self.pet.pending(self.now):
             if foreground_used:
                 break
             key = delivery["delivery_id"] if isinstance(delivery, dict) else delivery
             if effect := self.pet.claim(key, self.now):
-                shown = self.pet.receipt(key, displayed=True, sound_requested=effect["sound"], now=self.now)
-                results.append(self.display("pet", key, shown, sound=effect["sound"], channel="qt",
+                sound = effect["sound"]
+                if self.surface and sound:
+                    sound = self.request_simulated_sound(key, "pet")
+                shown = self.pet.receipt(key, displayed=True, sound_requested=sound, now=self.now)
+                results.append(self.display("pet", key, shown, sound=sound, channel="qt",
                                             position_hint=effect["position_hint"], animation=effect["animation"]))
                 foreground_used = shown
+        for display in results:
+            if display["status"] == "shown" and display.get("primary"):
+                self.primary_by_occurrence.setdefault(display["occurrence"], display)
+            if display["kind"] == "reminder" and display["status"] == "shown":
+                self.rendered_channels.add((display["channel"], display["id"]))
         self.record_revoked_displays(results)
+        if self.surface:
+            self.collect_sounds()
+            self.passive_reminders = {f"{entry['task_id']}:{entry['occurrence']}"
+                                      for entry in self.scheduler.passive_reminders(self.now)}
+        return results
+
+    def request_simulated_sound(self, delivery_id, contact_kind):
+        with patch("deskpet.c_ui.presentation.QApplication"):
+            return self.surface.request_attention_sound("reminder", delivery_id, contact_kind=contact_kind)
+
+    def collect_sounds(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute("""SELECT e.id, json_extract(e.fields, '$.delivery_id'), r.contact_kind,
+                                         p.task_id, p.occurrence
+                                  FROM events e LEFT JOIN attention_sound_requests r
+                                  ON json_extract(e.fields, '$.delivery_id')=r.delivery_id
+                                  LEFT JOIN presentations p
+                                  ON json_extract(e.fields, '$.delivery_id')=p.delivery_id
+                                  WHERE e.kind='sound.requested' AND e.id > ? ORDER BY e.id""",
+                              (self.last_sound_event,)).fetchall()
+        for position, identity, kind, task, ordinal in rows:
+            occurrence = f"{task}:{ordinal}" if task else identity
+            if kind == "phase_end":
+                occurrence = identity.rsplit(":", 1)[0]
+            self.synthetic_sound_requests.append({"kind": kind, "occurrence": occurrence, "delivery_id": identity})
+            self.last_sound_event = position
+
+    def interruption_displays(self):
+        state = self.state()
+        phases = [phase.model_dump(mode="json") for phase in state.phases.values()]
+        active = next((phase for phase in phases if phase["state"] in {"running", "paused"}), None)
+        snapshot = {"now": _stamp(self.now), "tasks": [task.model_dump(mode="json") for task in state.items.values()],
+                    "settings": state.settings, "active_phase": active, "phases": phases,
+                    "pending_deliveries": self.tasks.pending_deliveries()}
+        with patch("deskpet.c_ui.presentation.QApplication"):
+            self.surface.observe(snapshot)
+        results = []
+        commands = sorted(self.port.commands, key=lambda cmd: cmd.reason not in {"hard_due", "deadline_fallback"})
+        for command in commands:
+            if (command.channel, command.delivery_id) in self.rendered_channels:
+                continue
+            if self.locked is not False or command.channel == "os_notification":
+                self.surface.route_hidden(command)
+                continue
+            if command.channel == "pet_badge":
+                if self.surface.permit_badge(command):
+                    results.extend(self.paint_reminders([command]))
+                continue
+            if any(display["channel"] == "pet_card" for display in results):
+                continue
+            if self.surface.permit(command):
+                if command.reason in {"hard_due", "deadline_fallback"}:
+                    due = state.items[command.task_id].draft.hard_deadline
+                    others = [other for other in commands if other != command
+                              and (other.channel, other.delivery_id) not in self.rendered_channels
+                              and other.reason in {"hard_due", "deadline_fallback"}
+                              and state.items[other.task_id].draft.hard_deadline == due
+                              and self.surface.can_group(other)]
+                    group = [command, *others]
+                    for other in group[1:2]:
+                        self.surface.permit(other)
+                    results.extend(self.paint_reminders(group[:2]))
+                    self.surface.remember_group(group[2:])
+                    self.rendered_channels.update((other.channel, other.delivery_id) for other in group[2:])
+                else:
+                    results.extend(self.paint_reminders([command]))
+        rows = self.ledger.rows()
+        by_os = {row["os_id"]: row for row in rows if row["channel"] == "os_notification"}
+        for identifier, at in self.notifications.delivered.items():
+            row = by_os[identifier]
+            if ("os_notification", row["delivery_id"]) not in self.rendered_channels:
+                results.append(self.display("reminder", row["delivery_id"], True, channel="os_notification",
+                                            occurrence=f"{row['task_id']}:{row['occurrence']}", primary=True,
+                                            actionable=bool(row.get("native_actions")), reason="hard_due",
+                                            os_id=identifier) | {"at": _stamp(at)})
+        self.surface.rows = rows
+        self.native_projection = self.surface.pending_projection(self.now)
+        if self.locked is False and not any(display["channel"] == "pet_card" for display in results):
+            for followup in self.surface.native_followups(include_painted=False, automatic=True)[:1]:
+                if self.surface.native_followup_current(followup, mark_painted=True):
+                    occurrence = f"{followup.task_id}:{followup.occurrence}"
+                    results.append(self.display("reminder", f"followup:{followup.delivery_id}", True,
+                                                channel="pet_card", occurrence=occurrence, primary=True,
+                                                actionable=True, reason="native_followup"))
+        return results
+
+    def paint_reminders(self, commands):
+        with patch("deskpet.c_ui.presentation.QApplication"):
+            painted = self.surface.painted(commands)
+        with closing(sqlite3.connect(self.path)) as db:
+            sound_ids = {identity for identity, in db.execute(
+                "SELECT json_extract(fields, '$.delivery_id') FROM events WHERE kind='sound.requested'"
+            )}
+        results = []
+        for command in painted:
+            occurrence = f"{command.task_id}:{command.occurrence}"
+            sound = command.delivery_id in sound_ids
+            self.tasks.record_receipt(DisplayReceipt(
+                delivery_id=command.delivery_id, task_id=command.task_id, task_version=command.task_version,
+                rendered_at=self.now, outcome="displayed", source="simulated",
+            ))
+            actionable = command.channel == "pet_card"
+            results.append(self.display("reminder", command.delivery_id, True, reason=command.reason,
+                                        occurrence=occurrence, sound=sound, channel=command.channel,
+                                        primary=actionable, actionable=actionable))
         return results
 
     def record_revoked_displays(self, displays):
@@ -500,6 +688,9 @@ def run_case(case, recordings=None):
                 at = runtime.start + timedelta(seconds=step["offset_s"])
                 runtime.clock.advance((at - runtime.now).total_seconds())
                 before = runtime.state()
+                prior_projection = (set(runtime.native_projection), runtime.passive_reminders.copy())
+                runtime.prompt_responses.clear()
+                runtime.synthetic_sound_requests.clear()
                 for index, event in enumerate(step.get("events", ())):
                     runtime.action(event, f"{step['id']}-{index}")
                 runtime.engine.step = step
@@ -527,6 +718,7 @@ def run_case(case, recordings=None):
                     turn.pop("_admission_id", None)
                 displays = runtime.displays() if step.get("render", True) else []
                 state = runtime.state()
+                runtime.resolve_proposal_buttons()
                 effects = _changed(before, state, displays)
                 proposal_responses = [response for identity, response in state.proposals.items()
                                       if response in {"accepted", "rejected", "cancelled"}
@@ -553,11 +745,48 @@ def run_case(case, recordings=None):
                                      for phase in state.phases.values()]}
                 if "expect" in step:
                     report["score"] = _evaluate(step["expect"], effects, decisions, replies, runtime.engine.turns, runtime.resolve)
+                if runtime.surface:
+                    _record_interruption_step(runtime, step, before, state, report, prior_projection)
                 reports.append(report)
-            return {"id": case["id"], "timezone": runtime.timezone, "started_at": _stamp(runtime.start),
-                    "ended_at": _stamp(runtime.now), "steps": reports}
+            report = {"id": case["id"], "timezone": runtime.timezone, "started_at": _stamp(runtime.start),
+                      "ended_at": _stamp(runtime.now), "steps": reports}
+            if runtime.surface:
+                deadlines = {(runtime.resolve(occurrence)
+                              if occurrence[1:].split(".", 1)[0] in runtime.aliases else occurrence): runtime.resolve(at)
+                             for occurrence, at in case["interruption"].get("deadlines", {}).items()
+                             }
+                report["interruption"] = score_interruption_case(report, deadlines)
+            return report
         finally:
             runtime.close()
+
+
+def _record_interruption_step(runtime, step, before, state, report, prior_projection):
+    invalidated = [{"occurrence": task.occurrence_id, "reason": "expired"} for task in state.items.values()
+                   if task.expired_at and (previous := before.items.get(task.task_id)) and not previous.expired_at]
+    invalidated.extend({"occurrence": identity, "reason": "expired"} for identity, status in state.proposals.items()
+                       if status == "expired" and before.proposals.get(identity) != "expired")
+    report.update(prompt_responses=runtime.prompt_responses.copy(), invalidated_occurrences=invalidated,
+                  synthetic_sound_requests=runtime.synthetic_sound_requests.copy(),
+                  native_pending=runtime.native_projection.copy(), passive_reminders=sorted(runtime.passive_reminders))
+    expected = step.get("expect", {})
+    checks = report.get("score", {}).get("checks", {})
+    if "action_status" in expected:
+        checks["prompt_action_status"] = [response["status"] for response in runtime.prompt_responses] == expected["action_status"]
+    if "menu_contains" in expected:
+        checks["expected_menu_entries"] = all(runtime.resolve(item) in runtime.native_projection for item in expected["menu_contains"])
+    if "menu_excludes" in expected:
+        checks["hidden_menu_entries"] = all(runtime.resolve(item) not in runtime.native_projection for item in expected["menu_excludes"])
+    if step.get("same_batch"):
+        report["same_batch"] = True
+        checks["coalesced_sound"] = len(runtime.synthetic_sound_requests) == 1
+    if step.get("quiet"):
+        previous_native, previous_passive = prior_projection
+        report["quiet_check"] = (not any(display["status"] == "shown" for display in report["simulated_deliveries"])
+                                 and not runtime.synthetic_sound_requests
+                                 and set(runtime.native_projection) <= previous_native
+                                 and runtime.passive_reminders <= previous_passive)
+        checks["quiet_preserves_badge_and_surface"] = report["quiet_check"]
 
 
 def _latency(values):
@@ -622,6 +851,7 @@ def summarize(cases, mode):
             turn.get("source_error") in {"missing_recorded_model_turn", "recorded_model_trigger_mismatch"}
             for turn in turns),
         "engine_behavior_source": mode,
+        "interruption": summarize_interruptions(cases),
     }
 
 
@@ -650,7 +880,8 @@ def blind_review(cases, report, seed):
             "steps": [{"id": step["id"], "events": deepcopy(step.get("events", []))} for step in case["steps"]],
             "outputs": {
                 label: [{"id": step["id"], "at": step["at"], "effects": [
-                    {k: v for k, v in effect.items() if k not in {"id", "occurrence"}} for effect in step["effects"]],
+                    {k: v for k, v in effect.items() if k not in {"id", "occurrence", "subject", "os_id"}}
+                    for effect in step["effects"]],
                     "reply_statuses": [reply["status"] for reply in step["replies"]],
                     "proposed": [proposal["action"] for turn in step["turns"] for proposal in turn["proposed"]],
                 } for step in report["variants"][variant]["scenarios"][index]["steps"]]

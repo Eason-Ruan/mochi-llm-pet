@@ -4,18 +4,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import sys
+from time import monotonic
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication
 
 from deskpet.contracts import TaskView
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.system2.semantic_policy import semantic_background_enabled
-from deskpet.task_service.presentation import EARLY_OS_TRANSFER, PresentationLedger, native_followup_due
+from deskpet.task_service.presentation import EARLY_OS_TRANSFER, RELEASED_STATES, PresentationLedger, native_followup_due
 
-from .native_notifications import notification_id, platform_notifications
+from .native_notifications import SNOOZE_SECONDS, notification_id, platform_notifications
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,8 @@ def _session_locked():
 
 class DesktopPresentation(QObject):
     changed = pyqtSignal()
+    foreground_notification = pyqtSignal(str, object)
+    notification_response = pyqtSignal(str, str)
     _callback = pyqtSignal(object)
 
     def __init__(self, *, path=None, observation=None, notifications=None, lock_probe=None, synthetic=False):
@@ -62,7 +66,95 @@ class DesktopPresentation(QObject):
         self._in_progress = False
         self._last_notification_status = None
         self._early_transfers = {}
+        self._sleeping = False
+        self._lock_state = None
+        self._catchup_at = None
+        self._capture_catchup_effects = False
+        self._quiet_effects = set()
+        self._restore_timer = QTimer(self)
+        self._restore_timer.setInterval(100)
+        self._restore_timer.timeout.connect(self._restore_tick)
+        self._exit_restore = None
         self._callback.connect(self._run_callback)
+
+    def bind_foreground(self, handler):
+        setter = getattr(self.notifications, "set_foreground_handler", None)
+        if setter is not None:
+            self.foreground_notification.connect(handler, Qt.ConnectionType.QueuedConnection)
+            setter(self.foreground_notification.emit)
+
+    def unlocked(self):
+        return not self._sleeping and self.lock_probe() is False
+
+    def can_present(self):
+        return self.unlocked() and self._lock_state is not False and not self._capture_catchup_effects
+
+    def power_event(self, kind):
+        if kind == "system_sleep":
+            self._sleeping = True
+            self.restore_fallbacks()
+        elif kind == "system_wake":
+            self._sleeping = False
+            self._capture_catchup_effects = True
+            if self.snapshot.get("now"):
+                self._catchup_at = self.now()
+
+    def catchup_delivery(self, command):
+        if self._catchup_at is None:
+            return False
+        edge = command.requested_at
+        if command.reason in {"hard_due", "deadline_fallback"}:
+            task = next((item for item in self.snapshot.get("tasks", ()) if item["task_id"] == command.task_id), None)
+            draft = task["draft"] if task else {}
+            deadline = draft.get("remind_by") or draft.get("latest_first_delivery_at")
+            if deadline is not None:
+                edge = datetime.fromisoformat(deadline)
+        return edge <= self._catchup_at
+
+    def catchup_effect(self, delivery_id):
+        return delivery_id in self._quiet_effects
+
+    def _capture_desktop_state(self, snapshot, now):
+        unlocked = self.unlocked()
+        effects = {row["delivery_id"] for row in snapshot.get("system2_proposal_presentations", ())}
+        effects.update(item["delivery_id"] if isinstance(item, dict) else item
+                       for item in snapshot.get("system2_pet_intents", ()))
+        self._quiet_effects.intersection_update(effects)
+        if unlocked and (self._lock_state is False or self._capture_catchup_effects):
+            self._catchup_at = now
+            self._capture_catchup_effects = False
+            for task in self._active_tasks():
+                deadline = task.draft.hard_deadline
+                if deadline is None or deadline <= now:
+                    self.ledger.record_passive(task, self._delivery_id(task), now)
+            self._quiet_effects.update(effects)
+        elif not unlocked:
+            if self._lock_state is True:
+                self.restore_fallbacks()
+            self._quiet_effects.update(effects)
+        self._lock_state = unlocked
+
+    def foreground_target(self, identifier):
+        if self.ledger is None or not self.snapshot.get("now"):
+            return None, None
+        try:
+            return self.ledger.foreground_target(identifier, self.now())
+        except sqlite3.OperationalError:
+            return None, None
+
+    def claim_foreground_pet(self, row, *, grouped=False):
+        return self.can_present() and self.ledger.claim_foreground_pet(row, self.now(), grouped=grouped)
+
+    def is_catchup_deadline(self, deadline):
+        return self._catchup_at is not None and deadline <= self._catchup_at
+
+    def paint_foreground_pet(self, row):
+        now = self.now()
+        if not self.ledger.update(row["delivery_id"], {"permitted"}, "painted", now,
+                                  "foreground_takeover", current_session=True):
+            return False
+        self.rows = self.ledger.rows()
+        return True
 
     def _run_callback(self, callback):
         callback()
@@ -94,16 +186,28 @@ class DesktopPresentation(QObject):
         setting = {"reminder": "reminder_sound", "phase_end": "phase_end_sound"}.get(kind)
         return bool(setting and self.settings.get(setting))
 
+    def request_attention_sound(self, kind, delivery_id, *, contact_kind, batch_at=None):
+        if not self.native or not self.can_present() or not self._sound_enabled(kind):
+            return False
+        if self.ledger is not None and not self.ledger.request_attention_sound(
+            delivery_id, contact_kind, kind, self.now(), batch_at=batch_at, origin="qt",
+        ):
+            return False
+        QApplication.beep()
+        return True
+
     def observe(self, snapshot):
         self.snapshot = snapshot
         old_settings = self.settings
         self.settings = snapshot.get("settings", {})
         if self.settings.get("allow_system_notifications") and not old_settings.get("allow_system_notifications"):
             self.refresh_notification_permission()
-        self._phase_ended(snapshot)
         if self.ledger is None or not snapshot.get("now"):
+            self._phase_ended(snapshot)
             return {}
         now = self.now(snapshot)
+        self._capture_desktop_state(snapshot, now)
+        self._phase_ended(snapshot)
         self.rows = self.ledger.rows()
         if self._last_inventory_at is None or abs((now - self._last_inventory_at).total_seconds()) >= 2:
             self._last_inventory_at = now
@@ -123,21 +227,61 @@ class DesktopPresentation(QObject):
         if (not self.settings.get("allow_system_notifications")
                 or not self.notifications.can_schedule or not self.notifications.available):
             return
+        transfers = {(command.task_id, command.occurrence): (owner_id, command)
+                     for owner_id, command in self._early_transfers.items()}
         for task in self._active_tasks():
             deadline = task.draft.hard_deadline
             if deadline is None or deadline <= now + timedelta(seconds=2) or task.draft.expires_at is not None:
                 continue
-            delivery_id = self._delivery_id(task)
-            if transfer := self._early_transfers.get(delivery_id):
-                if self.ledger.can_finish_early_transfer(transfer, now):
+            if transfer := transfers.get((task.task_id, task.occurrence)):
+                owner_id, command = transfer
+                if self.ledger.can_finish_early_transfer(owner_id, command, now):
                     continue
-                self._early_transfers.pop(delivery_id, None)
+                self._early_transfers.pop(owner_id, None)
             self._submit_os(task, deadline, sound=False)
 
-    def restore_fallbacks(self):
-        if self._early_transfers and self.ledger is not None and self.snapshot.get("now"):
-            self._early_transfers.clear()
-            self._schedule_fallbacks(self.now())
+    def restore_fallbacks(self, *, finished=None):
+        if self.ledger is None or not self.snapshot.get("now"):
+            if finished is not None:
+                finished()
+            return
+        ids = set(self._early_transfers)
+        self._early_transfers.clear()
+        self.rows = self.ledger.rows()
+        ids.update(row["delivery_id"] for row in self.rows if row["reason"] == EARLY_OS_TRANSFER
+                   and row["state"] in {"submitting", "cancel_intent", "cancelling", "cancelled"})
+        if not ids:
+            if finished is not None:
+                finished()
+            return
+        if finished is not None:
+            self._exit_restore = ids, monotonic() + 1, finished
+        self._restore_tick()
+
+    def _restore_tick(self):
+        now = self.now()
+        self._schedule_fallbacks(now)
+        self.rows = self.ledger.rows()
+        self._reconcile(now)
+        self._restore_progress()
+
+    def _restore_progress(self):
+        if self._exit_restore is None:
+            return
+        ids, until, finished = self._exit_restore
+        rows = self.ledger.rows()
+        affected = {(row["task_id"], row["occurrence"]) for row in rows if row["delivery_id"] in ids}
+        active = {(task.task_id, task.occurrence) for task in self._active_tasks()}
+        settled = {(row["task_id"], row["occurrence"]) for row in rows if row["state"] not in
+                   RELEASED_STATES | {"submitting", "cancel_intent", "cancelling", "grouped"}}
+        pending = bool((affected & active) - settled)
+        if pending and monotonic() < until and self.settings.get("allow_system_notifications"):
+            if not self._restore_timer.isActive():
+                self._restore_timer.start()
+            return
+        self._restore_timer.stop()
+        self._exit_restore = None
+        finished()
 
     def _phase_ended(self, snapshot):
         previous = self._active_phase
@@ -147,8 +291,12 @@ class DesktopPresentation(QObject):
         current_id = previous.get("phase_id") or previous.get("id")
         candidate = next((item for item in snapshot.get("phases", [])
                           if (item.get("phase_id") or item.get("id")) == current_id), None)
-        if candidate and candidate.get("state") == "elapsed" and self.native and self.lock_probe() is False:
-            QApplication.beep()
+        if candidate and candidate.get("state") == "elapsed":
+            ended_at = datetime.fromisoformat(candidate["ended_at"]) if candidate.get("ended_at") else None
+            if self._catchup_at is not None and (ended_at is None or ended_at <= self._catchup_at):
+                return
+            self.request_attention_sound("phase_end", f"phase-end:{current_id}:{candidate.get('version', 1)}",
+                                         contact_kind="phase_end", batch_at=ended_at)
 
     def _active_tasks(self):
         return [TaskView.model_validate(item) for item in self.snapshot.get("tasks", [])
@@ -156,7 +304,7 @@ class DesktopPresentation(QObject):
                 and not item.get("displayed_at") and not item.get("expired_at") and not item.get("archived_at")
                 and item["draft"].get("reminder_enabled", True)]
 
-    def native_followups(self, *, include_painted=True):
+    def native_followups(self, *, include_painted=True, automatic=False):
         if not self.snapshot.get("now") or not self.rows:
             return []
         now = self.now()
@@ -168,7 +316,9 @@ class DesktopPresentation(QObject):
             if task is None or (row["followup_painted"] and not include_painted):
                 continue
             due = native_followup_due(task, row, now)
-            if due is None:
+            catchup_edge = datetime.fromisoformat(row["deadline"] or row["updated_at"])
+            if (due is None or (automatic and (row["native_actions"] or row["auto_followup_suppressed"] or
+                    (self._catchup_at is not None and catchup_edge <= self._catchup_at)))):
                 continue
             followup = NativeReminderFollowup(row["delivery_id"], task.task_id, task.version,
                                               task.occurrence, task.draft.content, row["state"] == "delivered",
@@ -177,7 +327,7 @@ class DesktopPresentation(QObject):
         return [followup for _, followup in sorted(due_followups.values(), key=lambda item: (item[0], item[1].task_id))]
 
     def native_followup_current(self, followup, *, include_painted=False, mark_painted=False):
-        current = (self.ledger is not None and self.lock_probe() is False
+        current = (self.ledger is not None and self.unlocked()
                    and self.ledger.native_followup_current(followup, self.now(), include_painted=include_painted,
                                                           mark_painted=mark_painted))
         if current and mark_painted:
@@ -191,25 +341,27 @@ class DesktopPresentation(QObject):
     def _submit_os(self, task, due_at, *, sound, command=None):
         now = self.now()
         delivery_id = self._delivery_id(task)
-        identifier = notification_id(delivery_id)
-        if sound:
-            deadline = task.draft.hard_deadline
-            sound = not any(
-                row["delivery_id"] != delivery_id and row["deadline"] and deadline is not None
-                and datetime.fromisoformat(row["deadline"]) == deadline
-                and row["state"] in {"submitting", "scheduled", "submitted", "delivered", "unknown",
-                                     "cancel_intent", "cancelling", "painted", "grouped"}
-                for row in self.ledger.rows()
-            )
-        if not self.ledger.prepare_os(task, delivery_id, identifier, now, command=command):
+        actionable = getattr(self.notifications, "can_respond", False)
+        identifier = (notification_id(delivery_id, scope=self.ledger.path.as_uri())
+                      if actionable else notification_id(delivery_id))
+        if not self.ledger.prepare_os(task, delivery_id, identifier, now, command=command,
+                                      native_actions=actionable, requested_for=due_at or now):
             return
-        sound = sound and self.ledger.os_sound_enabled()
+        sound = (sound and task.draft.sound is not False and getattr(self.notifications, "sound_available", True)
+                 and self.ledger.request_attention_sound(
+                     delivery_id, "reminder", "reminder", now,
+                     batch_at=task.draft.hard_deadline if command is None else None, origin="os_notification",
+                 ))
 
         def complete(state, reason):
             self._callback.emit(lambda: self.ledger.update(delivery_id, {"submitting"}, state, self.now(), reason))
 
         try:
-            self.notifications.submit(identifier, due_at, sound=sound, complete=complete)
+            options = {}
+            if actionable:
+                expiry = task.draft.expires_at
+                options["snooze"] = expiry is None or (due_at or now) + timedelta(seconds=SNOOZE_SECONDS) < expiry
+            self.notifications.submit(identifier, due_at, sound=sound, complete=complete, **options)
         except (OSError, RuntimeError, ValueError) as exc:
             complete("unknown", type(exc).__name__)
 
@@ -226,7 +378,27 @@ class DesktopPresentation(QObject):
                                     command=command if requested_os else None)
                 else:
                     self.ledger.record_unavailable(task, command.delivery_id, self.now(), self.notifications.status)
+                self.rows = self.ledger.rows()
                 return
+
+    def deadline_has_primary(self, deadline, *, pet_only=False):
+        for row in self.rows:
+            if not row["deadline"] or datetime.fromisoformat(row["deadline"]) != deadline:
+                continue
+            if (row["channel"] == "pet_card" and row["state"] == "painted" and row["reason"] != "menu_painted"
+                    and datetime.fromisoformat(row["updated_at"]) >= deadline):
+                return True
+            if (pet_only or row["channel"] != "os_notification"
+                    or row["state"] not in {"scheduled", "submitted", "delivered"}):
+                continue
+            if row["state"] == "scheduled":
+                return True
+            if requested_for := row["os_requested_for"]:
+                if datetime.fromisoformat(requested_for) >= deadline:
+                    return True
+            elif self.ledger.legacy_os_deadline_intent(row["delivery_id"], deadline):
+                return True
+        return False
 
     def soft_valid(self, command):
         if command.reason not in {"opportunity", "tool"} or self.ledger is None:
@@ -245,10 +417,11 @@ class DesktopPresentation(QObject):
         if self.ledger is None:
             return True
         now = self.now()
-        return self.lock_probe() is False and self.soft_valid(command) and self.ledger.permit_qt(command, now)
+        return (self.can_present() and not self.catchup_delivery(command)
+                and self.soft_valid(command) and self.ledger.permit_qt(command, now))
 
     def permit_badge(self, command):
-        return (self.ledger is not None and self.lock_probe() is False and self.soft_valid(command)
+        return (self.ledger is not None and self.can_present() and not self.catchup_delivery(command) and self.soft_valid(command)
                 and self.ledger.permit_badge(command, self.now()))
 
     def transfer_early(self, command):
@@ -258,14 +431,15 @@ class DesktopPresentation(QObject):
         now = self.now()
         row = self.ledger.begin_early_transfer(command, now)
         if row is not None:
-            self._early_transfers[command.delivery_id] = command
+            self._early_transfers[row["delivery_id"]] = command
             self._remove_os(now, row, reason=EARLY_OS_TRANSFER)
 
     def _can_verify_early_transfer(self):
         return getattr(self.notifications, "can_verify_early_transfer", self.notifications.can_verify_removal)
 
     def can_group(self, command):
-        return self.ledger is None or (self.lock_probe() is False and self.ledger.can_group(command, self.now()))
+        return self.ledger is None or (self.can_present() and not self.catchup_delivery(command)
+                                       and self.ledger.can_group(command, self.now()))
 
     def remember_group(self, commands):
         if self.ledger is not None:
@@ -276,13 +450,13 @@ class DesktopPresentation(QObject):
             self.ledger.update(command.delivery_id, {"permitted"}, "released", self.now(),
                                "group_rebuilt_before_paint", current_session=True)
 
-    def painted(self, commands, *, allow_sound=True):
+    def painted(self, commands, *, allow_sound=True, passive=False):
         if self.ledger is None:
             return list(commands)
         now = self.now()
-        painted = [command for command in commands if self.ledger.mark_painted(command, now)]
-        ringing = next((command for command in painted if allow_sound and self._sound_enabled(command.sound)
-                        and self.native and self.lock_probe() is False and self.soft_valid(command)
+        painted = [command for command in commands if self.ledger.mark_painted(command, now, passive=passive)]
+        ringing = next((command for command in painted if allow_sound and not passive and self._sound_enabled(command.sound)
+                        and self.native and self.unlocked() and self.soft_valid(command)
                         and self.ledger.sound_event(command, self.now(), True, None)), None)
         if ringing is not None:
             QApplication.beep()
@@ -290,6 +464,9 @@ class DesktopPresentation(QObject):
             if command is not ringing:
                 self.ledger.sound_event(command, now, False, "silent_or_grouped")
         return painted
+
+    def dismiss_contact(self, delivery_id):
+        return self.ledger is not None and self.ledger.record_reminder_dismissal(delivery_id, self.now())
 
     def _reconcile(self, now):
         os_rows = [row for row in self.rows if row["channel"] == "os_notification" and row["state"] in
@@ -314,6 +491,7 @@ class DesktopPresentation(QObject):
         active = {(item.task_id, item.occurrence, item.draft.hard_deadline) for item in self._active_tasks()
                   if item.draft.expires_at is None or now < item.draft.expires_at}
         enabled = bool(self.settings.get("allow_system_notifications"))
+        rearm = False
         for row in rows:
             delivery, identifier, state = row["delivery_id"], row["os_id"], row["state"]
             due = datetime.fromisoformat(row["deadline"]) if row["deadline"] else None
@@ -333,11 +511,15 @@ class DesktopPresentation(QObject):
                             and now + timedelta(seconds=1) < due and can_verify)
                 self.ledger.update(delivery, {state}, "cancelled" if verified else "unknown", now,
                                    row["reason"] if verified else "retraction_unconfirmed")
+                rearm |= early and verified and delivery not in self._early_transfers
             elif state == "cancel_intent":
                 self.ledger.update(delivery, {state}, "unknown", now, "retraction_unconfirmed")
             elif state in {"scheduled", "submitted"} or (state == "submitting" and row["owner_session"] != self.ledger.session):
                 self.ledger.update(delivery, {state}, "unknown", now, "no_confirmed_platform_record")
         self.rows = self.ledger.rows()
+        if rearm:
+            self._schedule_fallbacks(now)
+        self._restore_progress()
 
     def _cancel_os(self, now, row):
         delivery_id = row["delivery_id"]
@@ -360,7 +542,7 @@ class DesktopPresentation(QObject):
                         "failed": "系统通知未提交", "unavailable": "系统通知不可用", "cancelling": "等待系统撤回",
                         "cancel_intent": "等待系统撤回", "painted": "桌宠已展示，等待确认",
                         "badge_shown": "已显示轻提醒，打开列表查看",
-                        "grouped": "同批到期 · 待查看"}
+                        "grouped": "同批到期 · 待查看", "passive": "待查看"}
         for task in self._active_tasks():
             if task.draft.expires_at and now >= task.draft.expires_at:
                 notes[task.task_id] = "提醒已失效"

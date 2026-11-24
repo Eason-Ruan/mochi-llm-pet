@@ -96,6 +96,60 @@ def test_item_edit_reuses_the_semantic_window_and_keeps_hard_deadlines_independe
         assert [item.reason for item in display.commands] == ["hard_due"]
 
 
+@pytest.mark.parametrize("function", ["item.update", "reminder.configure"])
+def test_condition_only_rule_enables_a_work_item_reminder(tmp_path, function):
+    clock = FakeClock()
+    with _items(tmp_path / "business.sqlite3", clock, DisplayProbe(clock)) as tasks:
+        items = ItemService(tasks)
+        issue = _write(items, "item.create", "create", type="issue", title="提交组会记录")["view"]
+
+        def update(event, rule, issue):
+            args = ({"id": issue["id"], "patch": {"reminder_rule": rule}} if function == "item.update"
+                    else {"item_id": issue["id"], "rule": rule})
+            outcome = _write(items, function, event, issue["version"], **args)
+            assert outcome["status"] == "applied"
+            return outcome["view"]
+
+        issue = update("sound-only", {"sound": False}, issue)
+        issue = update("clear-condition", {"timing_context": None}, issue)
+        assert issue["rule"] is None and issue["occurrence"] is None
+        enabled = update("enable-condition", {"timing_context": "等我开完会"}, issue)
+        assert enabled["rule"]["timing_context"] == "等我开完会" and enabled["occurrence"] is not None
+        for field in ("remind_after", "target_at", "remind_by", "expires_at"):
+            assert enabled["rule"][field] is None
+        draft = tasks.get(issue["id"]).draft
+        assert draft.mode == "soft" and draft.reminder_enabled
+
+
+def test_silent_deadline_survives_snooze_restart_and_sound_only_edits(tmp_path):
+    clock = FakeClock()
+    display = DisplayProbe(clock)
+    path = tmp_path / "business.sqlite3"
+    due = clock.wall_now() + timedelta(seconds=30)
+    with _items(path, clock, display) as tasks:
+        items = ItemService(tasks)
+        item = _write(items, "item.create", "silent", type="reminder", title="交表",
+                      reminder_rule={"remind_after": due, "remind_by": due, "sound": False})["view"]
+        moved = _write(items, "reminder.snooze", "later", item["version"],
+                       occurrence_id=item["occurrence"]["id"], delay_s=60, mode="exact")["view"]
+        assert moved["rule"]["sound"] is False
+
+    clock.advance(60)
+    with _items(path, clock, display) as tasks:
+        items = ItemService(tasks)
+        tasks.pump()
+        assert [(command.reason, command.sound) for command in display.commands] == [("hard_due", None)]
+        current = items.get(item["id"])
+        changed = _write(items, "reminder.configure", "audio-only", current["version"],
+                         item_id=current["id"], rule={"sound": True})["view"]
+        assert changed["rule"]["sound"] is True
+        assert changed["rule"]["remind_by"] == moved["rule"]["remind_by"]
+        assert changed["occurrence"]["id"] == moved["occurrence"]["id"]
+        assert changed["occurrence"]["status"] == "delivered"
+        tasks.pump()
+        assert len(display.commands) == 1
+
+
 def test_snooze_modes_rotate_the_occurrence_and_keep_issue_due_at(tmp_path):
     clock = FakeClock()
     display = DisplayProbe(clock)
@@ -270,6 +324,15 @@ def test_refine_editor_commits_content_patch_and_explicit_exact_change(tmp_path,
         assert edited["rule"] == model["rule"]
         assert edited["occurrence"]["id"] == model["occurrence"]["id"]
         panel.open_edit(model["id"])
+        assert panel.sound.currentIndex() == 0
+        panel.sound.setCurrentIndex(1)
+        panel.save_edit.click()
+        worker.act(actions.pop())
+        quiet = items.get(model["id"])
+        assert quiet["rule"] == edited["rule"] | {"sound": False}
+        assert quiet["occurrence"]["id"] == edited["occurrence"]["id"]
+        panel.open_edit(model["id"])
+        assert panel.sound.currentText() == "仅无声提示"
         panel.mode.setCurrentIndex(panel.mode.findData("hard"))
         panel.save_edit.click()
         worker.act(actions.pop())

@@ -138,13 +138,15 @@ class DesktopSystem2:
 
     def snapshot_fields(self):
         route = self.settings.routes.snapshot(SYSTEM2)
+        now = self.env.clock.wall_now()
         return {
             "system2_route_status": ("verified" if route.verified else "unverified") if route.route else "not_configured",
             "system2_chat_version": self.chat.projection_version(),
             "system2_habits_version": tuple((habit.id, habit.version) for habit in self.settings.list_habits()),
             "system2_proposals": self.host.pending_proposals(),
             "system2_proposal_presentations": self.gateway.pending_presentations(self.settings.user_scope),
-            "system2_pet_intents": self.pet.pending(self.env.clock.wall_now()),
+            "system2_pet_intents": self.pet.pending(now),
+            "system2_passive_reminders": self.scheduler.passive_reminders(now),
         }
 
     def fence_task(self, db, command, previous):
@@ -180,7 +182,8 @@ class PetIntentStore:
                 expires_at TEXT NOT NULL, state TEXT NOT NULL
             )""")
 
-    def present(self, *, intent, position_hint=None, animation=None, sound=None, text=None, authority, now, db):
+    def present(self, *, intent, position_hint=None, animation=None, sound=None, text=None, level=None,
+                authority, now, db):
         poses = {"idle", "look_up", "wave", "approach"}
         positions = {"stay", "home", "screen_edge"}
         if not isinstance(position_hint, (str, type(None))) or (
@@ -188,6 +191,14 @@ class PetIntentStore:
         ) or (animation is not None and animation not in poses):
             return {"status": "rejected", "error_code": "INVALID_ARGUMENT"}
         semantic = semantic_background_enabled()
+        if level == "quiet":
+            return {"status": "applied", "outcome": "quiet", "interruption_level": level}
+        if level == "passive":
+            return {"status": "rejected", "error_code": "UNSUPPORTED_CHANNEL"}
+        if level == "actionable":
+            sound = False
+        elif level == "enhanced":
+            sound = sound is not False
         if text and not semantic:
             return {"status": "rejected", "error_code": "UNSUPPORTED_CHANNEL"}
         pose = animation or (intent if intent in poses else None)
@@ -231,7 +242,8 @@ class PetIntentStore:
                    "route": self._route_version(db), "semantic": semantic}
         db.execute("INSERT OR IGNORE INTO system2_pet_intents VALUES (?,?,?,?,?)",
                    (delivery_id, authority.user_scope, json.dumps(payload), expires_at.isoformat(), "queued"))
-        return {"status": "pending", "delivery_id": delivery_id, "view": {"channel": "qt", **effect}}
+        return {"status": "pending", "delivery_id": delivery_id, "view": {"channel": "qt", **effect},
+                **({"interruption_level": level} if level else {})}
 
     def _route_version(self, db):
         route = self.routes._get(db, SYSTEM2)
@@ -269,6 +281,12 @@ class PetIntentStore:
                           (self.routes.user_scope, now.isoformat())).fetchone() is None:
                 return ()
             db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("""SELECT delivery_id, expires_at FROM system2_pet_intents
+                WHERE user_scope=? AND state='claimed' AND julianday(expires_at)<=julianday(?)
+                AND json_extract(payload, '$.semantic')=1""", (self.routes.user_scope, now.isoformat())):
+                self.scheduler.record_contact(delivery_id=row["delivery_id"], kind="pet",
+                                              at=datetime.fromisoformat(row["expires_at"]), channel="qt",
+                                              exposure="unknown", db=db)
             db.execute("""UPDATE system2_pet_intents SET state='unknown'
                 WHERE user_scope=? AND state='claimed' AND julianday(expires_at)<=julianday(?)""",
                        (self.routes.user_scope, now.isoformat()))
@@ -326,13 +344,29 @@ class PetIntentStore:
                     return False
                 if json.loads(row[0]).get("semantic"):
                     state = "displayed" if displayed else "sound_requested" if sound_requested else "failed"
-                    if displayed:
+                    if displayed or sound_requested:
                         self.scheduler.record_contact(delivery_id=delivery_id, kind="pet", at=now,
-                                                      channel="qt", db=db)
+                                                      channel="qt", exposure="painted" if displayed else "none",
+                                                      sound_requested=sound_requested, db=db)
                 else:
                     state = "motion_and_sound_requested" if sound_requested else "motion_requested"
                 db.execute("UPDATE system2_pet_intents SET state=? WHERE delivery_id=? AND user_scope=?",
                            (state, delivery_id, self.routes.user_scope))
+                return True
+        except sqlite3.OperationalError:
+            return False
+
+    def dismiss(self, delivery_id, now):
+        try:
+            with closing(sqlite3.connect(self.path, timeout=0.025)) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("""SELECT 1 FROM system2_pet_intents
+                    WHERE delivery_id=? AND user_scope=? AND state='displayed'
+                    AND json_extract(payload, '$.semantic')=1""", (delivery_id, self.routes.user_scope)).fetchone()
+                if row is None:
+                    return False
+                self.scheduler.record_contact(delivery_id=delivery_id, kind="pet", at=now,
+                                              channel="qt", exposure="painted", response="dismissed", db=db)
                 return True
         except sqlite3.OperationalError:
             return False

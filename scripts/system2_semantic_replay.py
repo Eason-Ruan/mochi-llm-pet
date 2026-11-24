@@ -42,10 +42,19 @@ def main():
     print(json.dumps({variant: data["metrics"] for variant, data in report["variants"].items()},
                      ensure_ascii=False, indent=2))
     semantic = report["variants"]["semantic"]["metrics"]
-    if args.check_semantic and any(semantic[key] for key in (
+    interruption = semantic["interruption"]
+    failed_steps = any(semantic[key] for key in (
         "false_actions", "missed_actions", "failed_checks", "duplicate_reminder_displays",
         "missing_or_mismatched_recorded_turns",
-    )):
+    ))
+    failed_interruption = (
+        any(interruption["hard_timing"][key] for key in ("early", "late", "missing"))
+        or any(interruption["stale_displays"].values())
+        or any(interruption[key] for key in (
+            "duplicate_primary_displays", "repeat_sound_requests", "extra_same_batch_sound_requests", "quiet_failures",
+        ))
+    )
+    if args.check_semantic and (failed_steps or failed_interruption):
         parser.exit(1, "Semantic replay failed one or more checks. See report.json.\n")
 
 

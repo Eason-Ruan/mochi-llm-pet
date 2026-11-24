@@ -18,11 +18,12 @@ from pydantic import ValidationError
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import RealClock
 from deskpet.observation_v2.context import OBSERVATION_CONTEXT_FIELDS, ObservationContext, project_observation_context
+from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 from deskpet.timezones import resolve_timezone
 
 from .admission import AdmissionStore, json_text, stable_id, timestamp
-from .dsh_projection import project_business_result
+from .dsh_projection import include_candidate_timing_context, project_business_result
 from .intent import (
     READ_TOOLS, bind_tool_args, chat_grants, describe_grants, deterministic_command, independent_intents,
     literal_chat_reminder, literal_start_cancellation, materialize_chat_times, normalized, ref_id, ref_kind, start_request,
@@ -30,7 +31,7 @@ from .intent import (
 )
 from .prompt import PROMPT_VERSION, SYSTEM_PROMPT
 from .protocol import EngineReply, ToolAuthority, TurnRequest
-from .semantic_policy import semantic_background_enabled, semantic_chat_enabled
+from .semantic_policy import semantic_background_enabled, semantic_chat_enabled, text_sharing_allowed
 from .tool_schema import canonical_tool_name, validate_tool_args
 
 
@@ -65,6 +66,10 @@ _REASONS = {
     "focus_active": "当时正在专注，普通提醒继续等待。",
     "not_fresh": "当时没有可用于判断打扰时机的新观测。",
     "no_eligible_items": "当时没有符合时间条件的提醒。",
+    "no_meaningful_change": "没有需要再次提示的新进展。",
+    "awaiting_response": "相关事项已提示，正在等待处理。",
+    "recent_refusal": "这项建议近期已被拒绝。",
+    "habit_successor_started": "习惯已按设定开始下一阶段。",
     "meeting_preparation": "该事项有临近的准备时限。",
     "time_sensitive": "继续等待会影响事项所需的时间。",
     "available": "当时符合提醒的空档条件。",
@@ -194,6 +199,30 @@ def _result_reply(function: str, result: dict, timezone: str | None = None) -> d
 def _with_reply_source(reply: dict, source: str) -> dict:
     text = reply["text"]
     return {**reply, "parts": [{"source": source, "text": text}] if text.strip() else []}
+
+
+def _validate_timing_context(args: dict, utterance: str) -> None:
+    for key in ("reminder_rule", "rule"):
+        rule = args.get(key)
+        if isinstance(rule, dict) and (clause := rule.get("timing_context")) and clause not in utterance:
+            raise ValueError("timing_context must quote the user's current request")
+    for key in ("args", "patch", "amendments"):
+        if isinstance(value := args.get(key), dict):
+            _validate_timing_context(value, utterance)
+
+
+def _acts_on_timing_context(name: str, args: dict, context: dict) -> bool:
+    if name == "reminder.present":
+        if isinstance(presentation := args.get("presentation"), dict) and presentation.get("level") == "quiet":
+            return False
+        targets = args["occurrence_ids"]
+    elif name == "reminder.recheck" and any(args.get(key) is not None for key in ("window_open_at", "window_close_at")):
+        targets = [args["occurrence_id"]]
+    else:
+        return False
+    targets = {ref_id(target) for target in targets}
+    return any((item.get("rule") or {}).get("has_timing_context") is True and ref_id(item.get("occurrence_id")) in targets
+               for key in ("eligible_items", "recheck_items") for item in context[key])
 
 
 def _chat_attempt_target(function: str, args: dict) -> str | None:
@@ -583,6 +612,11 @@ class System2Host:
             include_capture_health=include_capture_health, restrict_legacy_summaries=self._trusted_projection,
         )
 
+    def _shares_timing_context(self):
+        return semantic_background_enabled() and text_sharing_allowed(
+            self.settings.read(), self.settings.routes.snapshot(SYSTEM2), self._observation_privacy_marker()[2],
+        )
+
     def _snapshot(self, admission, as_of, **observation_options):
         schedule = self.scheduler.snapshot(as_of) if self.scheduler is not None else {}
         observation = self._observation(as_of, **observation_options)
@@ -626,7 +660,10 @@ class System2Host:
             context["current"], context["current_status"] = None, "context_changed"
             context["interruptibility"] = {"status": "context_changed", "current": None}
         observed_fields = {key: context[key] for key in OBSERVATION_CONTEXT_FIELDS if key in context}
-        return project_business_result(context) | observed_fields, schedule
+        projected = project_business_result(context) | observed_fields
+        if admission.source == "background":
+            include_candidate_timing_context(context, projected, share=self._shares_timing_context())
+        return projected, schedule
 
     @staticmethod
     def _authority_context(context, schedule):
@@ -672,6 +709,7 @@ class System2Host:
         try:
             if name != "decision.list":
                 args = validate_tool_args(name, args, relative_time=semantic)
+                _validate_timing_context(args, (admission.user_intent or {}).get("utterance") or "")
                 if semantic:
                     args = materialize_chat_times(name, args, admission.created_at,
                                                   admission.event.get("timezone", self.timezone))
@@ -683,6 +721,9 @@ class System2Host:
             invalid_fields = [{"field": "timing", "code": str(exc)}] if semantic else []
         if invalid_fields is not None and not semantic:
             return {"call_id": native_call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
+        if (admission.source == "background" and _acts_on_timing_context(name, args, context)
+                and not self._shares_timing_context()):
+            return {"call_id": native_call_id, "status": "rejected", "error_code": "NOT_AUTHORIZED"}
         attempt_target = _chat_attempt_target(name, args) if semantic else None
         command_id, prior = self._store.register_call(
             admission, step_id, native_call_id, name, args, now, validation_error=invalid_fields,
@@ -805,11 +846,13 @@ class System2Host:
         code = failure or "quiet"
         action = "quiet"
         result_ref = next_check = None
+        level = None
         if receipts:
             name, result = receipts[-1]
-            action = name
+            action = "quiet" if result.get("outcome") == "quiet" else name
+            level = result.get("interruption_level")
             code = result.get("decision_reason") if _original_status(result) in _SUCCESS else None
-            code = code or _reason(result)
+            code = code or ("quiet" if action == "quiet" else _reason(result))
             result_ref = result.get("delivery_id") or result.get("subject_ref") or result.get("call_id")
             if result.get("subject_ref"):
                 refs.append(result["subject_ref"])
@@ -833,13 +876,17 @@ class System2Host:
             elif admission.source == "user":
                 action = "reply"
             explanation = _REASONS[code]
+        if admission.source == "background" and semantic_background_enabled() and not failure:
+            if action == "quiet" or action in {"reminder.recheck", "observation.wait_fresh", "decision.recheck"}:
+                level = "quiet"
         return {"decision_id": admission.admission_id, "trigger_ids": admission.event["trigger_ids"],
                 "as_of": timestamp(now), "context_revision": (context.get("current") or {}).get("context_revision"),
                 "action": action, "reason_code": code, "explanation": explanation,
                 "subject_refs": refs, "next_check_at": next_check, "result_ref": result_ref,
+                **({"interruption_level": level} if level else {}),
                 "action_results": [
                     {key: result[key] for key in ("subject_ref", "delivery_id", "call_id", "error_code",
-                                                  "retryable", "presentation_receipt") if key in result}
+                                                  "retryable", "presentation_receipt", "interruption_level") if key in result}
                     | {"action": name, "outcome": _tool_outcome(name, result)} for name, result in receipts
                 ]}
 
