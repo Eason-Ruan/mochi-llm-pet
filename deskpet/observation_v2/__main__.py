@@ -209,8 +209,12 @@ def main(*, stop_event: Event | None = None) -> None:
     capture.add_argument("--capture-screen", action="store_true", help="opt into screen image capture")
     capture.add_argument("--capture-screen-from-settings", action="store_true",
                          help="use the live desktop's stored screenshot permission and scope")
-    live.add_argument("--screen-scope", choices=("foreground-window", "all-displays"),
-                      help="multimodal scope for --capture-screen (foreground-window by default, all-displays needs macOS 14.2+)")
+    live.add_argument(
+        "--screen-scope", choices=("foreground-window", "all-displays", "all-displays-unfiltered"),
+        help=("scope for --capture-screen (default: foreground-window; both all-display scopes need macOS 14.2+). "
+              "Experimental all-displays-unfiltered sends raw screenshots, including excluded apps and private windows, "
+              "to the authorized Alibaba Cloud Qwen model. The model attempts to redact its output."),
+    )
     context = commands.add_parser("context", help="read the System 2 Observation snapshot")
     context.add_argument("--database", type=Path, required=True)
     context.add_argument("--as-of", type=datetime.fromisoformat, help="ISO timestamp with UTC offset")
@@ -265,6 +269,11 @@ def main(*, stop_event: Event | None = None) -> None:
                 )
             except ValueError as exc:
                 parser.exit(2, f"Observation could not start ({exc}).\n")
+        if screen_scope == "all_displays_unfiltered":
+            if platform != "darwin":
+                parser.error("all-displays-unfiltered requires macOS 14.2 or later")
+            if arguments.cloud_settings is None:
+                parser.error("all-displays-unfiltered requires --cloud-settings for the authorized Qwen route")
     if arguments.mode == "replay" and arguments.cloud_settings and arguments.database.resolve() == arguments.cloud_settings.resolve():
         parser.error("replay requires a database separate from model settings")
 

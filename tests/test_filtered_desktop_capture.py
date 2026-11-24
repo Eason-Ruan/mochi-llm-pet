@@ -10,7 +10,7 @@ import pytest
 
 from deskpet.observation_v2 import desktop_capture
 from deskpet.observation_v2.activity import ActivitySample
-from deskpet.observation_v2.media import DesktopCaptureRestricted, capture_filtered_desktop
+from deskpet.observation_v2.media import DesktopCaptureRestricted, capture_filtered_desktop, capture_unfiltered_desktop
 
 
 def _native_window(window_id, pid, x, *, name="Editor", bundle="app.editor", title=None,
@@ -59,7 +59,7 @@ def native_capture(monkeypatch):
     state = SimpleNamespace(windows=[], requested=[], inventory_calls=0, deny_permission=False, fail_image=False,
                             session=(False, "console"), display_ids=(1, 2), after_capture=None, front_pid=80,
                             applications={}, quartz_only=set(), sck_only=set(),
-                            single_requested=[], dock_image=None,
+                            single_requested=[], dock_image=None, raw_requested=[],
                             screens={1: (0, 0, 1200, 800, 2400, 1600), 2: (1200, 0, 1200, 800, 2400, 1600)})
     displays = {index: SimpleNamespace(displayID=lambda index=index: index) for index in (1, 2)}
     workspace = SimpleNamespace(frontmostApplication=lambda: SimpleNamespace(processIdentifier=lambda: state.front_pid))
@@ -79,29 +79,36 @@ def native_capture(monkeypatch):
     )
 
     def get_content(exclude_desktop, on_screen_only, complete):
-        assert exclude_desktop and on_screen_only
+        assert on_screen_only
         state.inventory_calls += 1
         if state.inventory_calls == 2 and state.after_capture is not None:
             state.after_capture()
-        complete(SimpleNamespace(displays=lambda: list(displays.values()),
-                                 windows=lambda: [window for window, _ in state.windows
-                                                  if window.windowID() not in state.quartz_only]), None)
+        content = SimpleNamespace(displays=lambda: list(displays.values()))
+        if exclude_desktop:
+            content.windows = lambda: [window for window, _ in state.windows if window.windowID() not in state.quartz_only]
+        complete(content, None)
 
     def capture(filter_, config, complete):
         display_id, window_ids = filter_.display_id, filter_.window_ids
         assert config.cursor is False
-        assert config.children is False
         assert config.aspect is False
         size = (config.width, config.height)
         if display_id is None:
+            assert config.children is False
             assert config.ignore_single_window_shadows is True
             assert config.opaque is False
             assert config.scales_to_fit is True
             state.single_requested.append((window_ids, size))
             output = state.dock_image(size) if state.dock_image is not None else None
         else:
-            assert config.ignore_shadows is True
-            state.requested.append((display_id, window_ids, size))
+            if window_ids is None:
+                assert not hasattr(config, "children")
+                assert not hasattr(config, "ignore_shadows")
+                state.raw_requested.append((display_id, size))
+            else:
+                assert config.children is False
+                assert config.ignore_shadows is True
+                state.requested.append((display_id, window_ids, size))
             color = (20, 90, 180) if display_id == 1 else (90, 160, 20)
             output = Image.new("RGB", size, color) if not state.fail_image else None
         if output is None:
@@ -139,6 +146,10 @@ def native_capture(monkeypatch):
         def setScalesToFit_(self, scales_to_fit):
             self.scales_to_fit = scales_to_fit
 
+    def whole_display_filter(display, exclusions):
+        assert not exclusions
+        return SimpleNamespace(display_id=display.displayID(), window_ids=None)
+
     appkit = SimpleNamespace(
         NSRunningApplication=SimpleNamespace(runningApplicationWithProcessIdentifier_=state.applications.get),
         NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace),
@@ -152,6 +163,7 @@ def native_capture(monkeypatch):
             getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_=get_content,
         ),
         SCContentFilter=SimpleNamespace(alloc=lambda: SimpleNamespace(
+            initWithDisplay_excludingWindows_=whole_display_filter,
             initWithDisplay_includingWindows_=lambda display, windows: SimpleNamespace(
                 display_id=display.displayID(), window_ids=tuple(window.windowID() for window in windows),
             ),
@@ -494,3 +506,62 @@ def test_never_uses_unfiltered_fallback(native_capture, monkeypatch, condition, 
         capture_filtered_desktop(_sample(), platform="darwin")
     assert error.value.reason == reason
     assert len(native_capture.requested) == int(condition == "acquisition")
+    assert not native_capture.raw_requested
+
+
+def test_unfiltered_capture_uses_only_display_metadata(native_capture, monkeypatch):
+    def forbidden(*args):
+        pytest.fail("Unfiltered display capture must not inspect windows or foreground applications")
+
+    monkeypatch.setattr(sys.modules["Quartz"], "CGWindowListCopyWindowInfo", forbidden)
+    monkeypatch.setattr(sys.modules["AppKit"].NSWorkspace, "sharedWorkspace", forbidden)
+    result = capture_unfiltered_desktop(_sample(app_name=None, window_id=None, private_window=True), platform="darwin")
+    assert result.captured_at.tzinfo is UTC
+    assert not result.foreground_excluded
+    assert native_capture.inventory_calls == 2
+    assert not native_capture.requested
+    assert [display for display, _ in native_capture.raw_requested] == [1, 2]
+    with Image.open(BytesIO(result.jpeg)) as frame:
+        assert frame.format == "JPEG"
+        assert frame.width <= 2048
+        assert frame.getpixel((100, 100))[2] > frame.getpixel((100, 100))[1]
+        assert frame.getpixel((frame.width - 100, 100))[1] > frame.getpixel((frame.width - 100, 100))[2]
+
+
+@pytest.mark.parametrize("attribute, value, reason", [
+    ("session", (True, "console"), "desktop_session_unverified"),
+    ("session", (False, "other console"), "desktop_session_unverified"),
+    ("display_ids", (1,), "desktop_inventory_changed"),
+    ("deny_permission", True, "screen_recording_permission_denied"),
+])
+def test_unfiltered_capture_discards_frame_when_native_state_changes(native_capture, attribute, value, reason):
+    native_capture.after_capture = lambda: setattr(native_capture, attribute, value)
+    with pytest.raises(DesktopCaptureRestricted) as error:
+        capture_unfiltered_desktop(_sample(), platform="darwin")
+    assert error.value.reason == reason
+    assert [display for display, _ in native_capture.raw_requested] == [1, 2]
+
+
+@pytest.mark.parametrize("platform, changes, native_changes, reason", [
+    ("win32", {}, {}, "unfiltered_desktop_unavailable"),
+    ("darwin", {"screen_locked": True}, {}, "desktop_session_unverified"),
+    ("darwin", {"session_id": None}, {}, "desktop_session_unverified"),
+    ("darwin", {}, {"deny_permission": True}, "screen_recording_permission_denied"),
+    ("darwin", {}, {"display_ids": (1, 2, 3)}, "desktop_display_inventory_unverified"),
+])
+def test_unfiltered_capture_skips_acquisition_without_valid_native_state(native_capture, platform, changes, native_changes, reason):
+    for attribute, value in native_changes.items():
+        setattr(native_capture, attribute, value)
+    with pytest.raises(DesktopCaptureRestricted) as error:
+        capture_unfiltered_desktop(_sample(**changes), platform=platform)
+    assert error.value.reason == reason
+    assert not native_capture.raw_requested
+
+
+def test_unfiltered_capture_fails_if_a_native_capture_fails(native_capture):
+    native_capture.fail_image = True
+    with pytest.raises(DesktopCaptureRestricted) as error:
+        capture_unfiltered_desktop(_sample(), platform="darwin")
+    assert error.value.reason == "unfiltered_desktop_unavailable"
+    assert native_capture.inventory_calls == 1
+    assert not native_capture.requested

@@ -1,4 +1,4 @@
-"""Build one in-memory frame from audited windows on active macOS displays."""
+"""Build in-memory frames from active macOS displays."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .activity import (
 from .documents import is_mochi_app
 
 _NATIVE_TIMEOUT_S = 1.2
+_UNFILTERED_UNAVAILABLE = "unfiltered_desktop_unavailable"
 _DISPLAY_LIMIT = 64
 _BACKGROUND = (23, 25, 28)
 _BROWSER_BUNDLES = (
@@ -97,9 +98,9 @@ class _NativeResult:
             self.value = value
         self.done.set()
 
-    def result(self, deadline: float):
+    def result(self, deadline: float, *, reason: str = "filtered_desktop_unavailable"):
         if not self.done.wait(timeout=max(0, deadline - time.monotonic())) or self.value is None:
-            raise DesktopCaptureRestricted("macOS filtered capture did not complete", reason="filtered_desktop_unavailable")
+            raise DesktopCaptureRestricted("macOS desktop capture did not complete", reason=reason)
         return self.value
 
 
@@ -397,12 +398,16 @@ def _window_inventory(content, Quartz, workspace, displays: tuple[_Display, ...]
     return windows, front_pid, foreground_window, _occlusion_masks(rows, windows, screenshot_overlays, dock_occlusions)
 
 
-def _inventory(shareable, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded):
+def _shareable_content(shareable, *, exclude_desktop: bool, reason: str = "filtered_desktop_unavailable"):
     callback = _NativeResult()
     shareable.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
-        True, True, callback.complete,
+        exclude_desktop, True, callback.complete,
     )
-    content = callback.result(time.monotonic() + _NATIVE_TIMEOUT_S)
+    return callback.result(time.monotonic() + _NATIVE_TIMEOUT_S, reason=reason)
+
+
+def _inventory(shareable, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded):
+    content = _shareable_content(shareable, exclude_desktop=True)
     displays = _display_inventory(content, Quartz)
     windows, front_pid, foreground, masks = _window_inventory(
         content, Quartz, workspace, displays, sample, app_rules, domain_rules, foreground_excluded,
@@ -468,15 +473,19 @@ def _visible_after_mask(size: tuple[int, int], allowed: list[_PixelBox], masks: 
     return occupancy.getbbox() is not None
 
 
-def _native_png(AppKit, image) -> bytes:
+def _native_png(AppKit, image, *, reason: str = "filtered_desktop_unavailable") -> bytes:
     representation = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(image)
     data = representation.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
     if data is None:
-        raise DesktopCaptureRestricted("macOS filtered frame could not be encoded", reason="filtered_desktop_unavailable")
+        raise DesktopCaptureRestricted("macOS desktop frame could not be encoded", reason=reason)
     return bytes(data)
 
 
-def _encode_montage(AppKit, images, sizes, columns: int, first_label: str, masks: list[tuple[_PixelBox, ...]]) -> bytes:
+def _encode_montage(AppKit, images, sizes, columns: int, first_label: str,
+                    masks: list[tuple[_PixelBox, ...]] | None = None, *,
+                    reason: str = "filtered_desktop_unavailable") -> bytes:
+    if masks is None:
+        masks = [()] * len(images)
     label_height = 24 if len(images) > 1 or first_label != "Active display" else 0
     gap = 8
     cell_width = max(width for width, _ in sizes)
@@ -494,16 +503,34 @@ def _encode_montage(AppKit, images, sizes, columns: int, first_label: str, masks
             draw.text((x + 5, y + 3), label, fill=(255, 255, 255), font=font)
         if image is None:
             continue
-        with Image.open(BytesIO(_native_png(AppKit, image))) as captured:
+        with Image.open(BytesIO(_native_png(AppKit, image, reason=reason))) as captured:
             rgba = captured.convert("RGBA")
         if rgba.size != size:
-            raise DesktopCaptureRestricted("macOS returned unexpected display dimensions", reason="filtered_desktop_unavailable")
+            raise DesktopCaptureRestricted("macOS returned unexpected display dimensions", reason=reason)
         for box in redactions:
             rgba.paste((*_BACKGROUND, 255), box)
         canvas.paste(rgba, (x, y + label_height), rgba.getchannel("A"))
     with BytesIO() as buffer:
         canvas.save(buffer, format="JPEG", quality=88)
         return buffer.getvalue()
+
+
+def _display_configuration(configuration, size: tuple[int, int]):
+    config = configuration.alloc().init()
+    config.setWidth_(size[0])
+    config.setHeight_(size[1])
+    config.setShowsCursor_(False)
+    config.setPreservesAspectRatio_(False)
+    return config
+
+
+def _request_images(manager, requests, *, reason: str = "filtered_desktop_unavailable"):
+    deadline = time.monotonic() + _NATIVE_TIMEOUT_S
+    for request in requests:
+        if request is not None:
+            filter_, config, callback = request
+            manager.captureImageWithFilter_configuration_completionHandler_(filter_, config, callback.complete)
+    return [request[2].result(deadline, reason=reason) if request is not None else None for request in requests]
 
 
 def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_rules: tuple[str, ...],
@@ -538,11 +565,7 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
         filter_ = SCContentFilter.alloc().initWithDisplay_includingWindows_(display.native, [window for window, _ in allowed])
         if filter_ is None:
             raise DesktopCaptureRestricted("The display filter could not be created", reason="filtered_desktop_unavailable")
-        config = SCStreamConfiguration.alloc().init()
-        config.setWidth_(size[0])
-        config.setHeight_(size[1])
-        config.setShowsCursor_(False)
-        config.setPreservesAspectRatio_(False)
+        config = _display_configuration(SCStreamConfiguration, size)
         config.setIgnoreShadowsDisplay_(True)
         # Child windows are included by default. macOS 14.2 added this selector.
         config.setIncludeChildWindows_(False)
@@ -554,12 +577,7 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
         focus = _pixel_box(ordered[0], sizes[0], foreground.bounds)
         if focus is None or not _visible_after_mask(sizes[0], [focus], pixel_masks[0]):
             first_label = "Foreground window excluded"
-    deadline = time.monotonic() + _NATIVE_TIMEOUT_S
-    for request in requests:
-        if request is not None:
-            filter_, config, callback = request
-            SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(filter_, config, callback.complete)
-    images = [request[2].result(deadline) if request is not None else None for request in requests]
+    images = _request_images(SCScreenshotManager, requests)
     captured_at = datetime.now(UTC)
     if not Quartz.CGPreflightScreenCaptureAccess():
         raise DesktopCaptureRestricted("Screen recording permission is required", reason="screen_recording_permission_denied")
@@ -570,6 +588,45 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
         raise DesktopCaptureRestricted("The desktop inventory changed during capture", reason="desktop_inventory_changed")
     jpeg = _encode_montage(AppKit, images, sizes, columns, first_label, pixel_masks)
     return FilteredDesktopCapture(captured_at, jpeg, first_label != "Active display")
+
+
+def _capture_unfiltered_macos(session_id: str) -> FilteredDesktopCapture:
+    import AppKit
+    import Quartz
+
+    if not Quartz.CGPreflightScreenCaptureAccess():
+        raise DesktopCaptureRestricted("Screen recording permission is required", reason="screen_recording_permission_denied")
+    session = (False, session_id)
+    if _mac_session() != session:
+        raise DesktopCaptureRestricted("The desktop session could not be verified", reason="desktop_session_unverified")
+    from ScreenCaptureKit import SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration
+
+    content = _shareable_content(SCShareableContent, exclude_desktop=False, reason=_UNFILTERED_UNAVAILABLE)
+    displays = _display_inventory(content, Quartz)
+    ordered, sizes, columns, first_label = _layout(displays, None)
+    requests = []
+    for display, size in zip(ordered, sizes, strict=True):
+        # ScreenCaptureKit's display exclusion initializer includes the desktop,
+        # Dock and menu bar. An empty exclusion list keeps all shareable windows.
+        filter_ = SCContentFilter.alloc().initWithDisplay_excludingWindows_(display.native, [])
+        if filter_ is None:
+            raise DesktopCaptureRestricted("The display capture could not be configured", reason=_UNFILTERED_UNAVAILABLE)
+        config = _display_configuration(SCStreamConfiguration, size)
+        requests.append((filter_, config, _NativeResult()))
+    if _mac_session() != session:
+        raise DesktopCaptureRestricted("The desktop session changed before capture", reason="desktop_session_unverified")
+    images = _request_images(SCScreenshotManager, requests, reason=_UNFILTERED_UNAVAILABLE)
+    captured_at = datetime.now(UTC)
+    content = _shareable_content(SCShareableContent, exclude_desktop=False, reason=_UNFILTERED_UNAVAILABLE)
+    after = _display_inventory(content, Quartz)
+    if not Quartz.CGPreflightScreenCaptureAccess():
+        raise DesktopCaptureRestricted("Screen recording permission is required", reason="screen_recording_permission_denied")
+    if _mac_session() != session:
+        raise DesktopCaptureRestricted("The desktop session changed during capture", reason="desktop_session_unverified")
+    if displays != after:
+        raise DesktopCaptureRestricted("The desktop inventory changed during capture", reason="desktop_inventory_changed")
+    jpeg = _encode_montage(AppKit, images, sizes, columns, first_label, reason=_UNFILTERED_UNAVAILABLE)
+    return FilteredDesktopCapture(captured_at, jpeg, foreground_excluded=False)
 
 
 def capture_filtered_desktop(
@@ -589,3 +646,17 @@ def capture_filtered_desktop(
         raise
     except Exception:
         raise DesktopCaptureRestricted("The native filtered desktop capture failed", reason="filtered_desktop_unavailable") from None
+
+
+def capture_unfiltered_desktop(sample: ActivitySample, *, platform: str) -> FilteredDesktopCapture:
+    """Capture all active macOS displays in memory for an explicitly enabled caller."""
+    if platform != "darwin":
+        raise DesktopCaptureRestricted("Unfiltered desktop capture requires macOS", reason=_UNFILTERED_UNAVAILABLE)
+    if sample.screen_locked is not False or not sample.session_id:
+        raise DesktopCaptureRestricted("The desktop session is locked or unknown", reason="desktop_session_unverified")
+    try:
+        return _capture_unfiltered_macos(sample.session_id)
+    except DesktopCaptureRestricted:
+        raise
+    except Exception:
+        raise DesktopCaptureRestricted("The native unfiltered desktop capture failed", reason=_UNFILTERED_UNAVAILABLE) from None

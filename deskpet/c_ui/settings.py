@@ -230,9 +230,12 @@ class SettingsPanel(_Panel):
         self._screen_scope.addItem("当前窗口", "foreground_window")
         if platform == "darwin":
             self._screen_scope.addItem("所有显示器（排除黑名单应用）", "all_displays")
+            self._screen_scope.addItem("所有显示器原始画面（实验）", "all_displays_unfiltered")
         else:
             self._screen_scope.addItem("所有显示器（此系统不可用）", "all_displays")
             self._screen_scope.model().item(1).setEnabled(False)
+            self._screen_scope.addItem("所有显示器原始画面（此系统不可用）", "all_displays_unfiltered")
+            self._screen_scope.model().item(2).setEnabled(False)
         section.addWidget(_text("截图范围", size=12))
         section.addWidget(self._screen_scope)
         self._screen_scope.activated.connect(
@@ -241,8 +244,12 @@ class SettingsPanel(_Panel):
         note = "若已授权云端识图，所选范围内获准的截图可发送给该接收方。"
         if platform == "darwin":
             note = ("所有显示器范围需要 macOS 14.2 或更高版本及屏幕录制权限。"
-                    "已识别的无痕窗口会排除。未设域名排除时，无法判断是否无痕的窗口仍可采集。" + note)
+                    "过滤模式会排除已识别的无痕窗口。未设域名排除时，无法判断是否无痕的窗口仍可采集。" + note)
         section.addWidget(_text(note, size=11, color=MUTED, wrap=True))
+        if platform == "darwin":
+            raw_note = ("实验模式将原始截图发送到已授权并验证的阿里云百炼通义千问。"
+                        "截图可能包含排除列表中的应用、域名和无痕窗口。模型只在输出中尝试脱敏。")
+            section.addWidget(_text(raw_note, size=11, color=MUTED, wrap=True))
         section.addWidget(self._checkboxes["observation_browser_metadata"])
         exclusions = QPushButton("编辑排除应用与域名")
         exclusions.setObjectName("settings-observation-exclusions")

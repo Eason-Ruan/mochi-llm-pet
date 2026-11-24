@@ -114,6 +114,7 @@ class ObservationStore(ActivityStore):
                 "visible_changes": "TEXT", "next_check": "TEXT", "document_name": "TEXT",
                 "document_source": "TEXT", "filtered_fields": "TEXT",
                 "realtime_eligible": "INTEGER NOT NULL DEFAULT 1",
+                "unfiltered_desktop": "INTEGER NOT NULL DEFAULT 0",
             })
             if live:
                 self._add_columns("effective_observations", {
@@ -291,6 +292,7 @@ class ObservationStore(ActivityStore):
         data["captured_at"] = _timestamp(screen.captured_at)
         data["processed_at"] = _timestamp(processed_at) if processed_at else None
         data["realtime_eligible"] = int(realtime_eligible)
+        data["unfiltered_desktop"] = int(data.get("unfiltered_desktop", False))
         data["document_source"] = document_source if data.get("document_name") else None
         for field in ("scene_elements", "visible_changes", "filtered_fields"):
             data[field] = json.dumps(data[field], ensure_ascii=False) if field in data else None
@@ -302,11 +304,11 @@ class ObservationStore(ActivityStore):
                     (capture_id, activity_id, captured_at, status, model_id,
                      screen_kind, visible_text_redacted, screen_summary, processed_at,
                      activity_kind, scene_elements, visible_changes, next_check,
-                     document_name, document_source, filtered_fields, realtime_eligible)
+                     document_name, document_source, filtered_fields, realtime_eligible, unfiltered_desktop)
                 VALUES (:capture_id, :activity_id, :captured_at, :status, :model_id,
                         :screen_kind, :visible_text_redacted, :screen_summary, :processed_at,
                         :activity_kind, :scene_elements, :visible_changes, :next_check,
-                        :document_name, :document_source, :filtered_fields, :realtime_eligible)
+                        :document_name, :document_source, :filtered_fields, :realtime_eligible, :unfiltered_desktop)
             """, data)
 
     def recent_screens(self, since: datetime) -> list[dict]:
@@ -834,18 +836,31 @@ def run_live_multimodal(
     close_vision: Callable[[], None] | None = None,
 ) -> dict:
     """Publish a local desk state and sample stable, materially changed views."""
-    from .media import DesktopCaptureRestricted, capture_filtered_desktop, capture_window, cloud_window_eligible
-    from .openai_cloud import LOCAL_CAPTURE, RoutedObservationModel, prepare_vision_capture
+    from .activity import _app_excluded, _domain_excluded, _excluded_app_rules, _excluded_domain_rules, _page_domain
+    from .desktop_capture import _sensitive_title
+    from .media import (
+        DesktopCaptureRestricted, capture_filtered_desktop, capture_unfiltered_desktop, capture_window,
+        cloud_window_eligible,
+    )
+    from .openai_cloud import LOCAL_CAPTURE, RoutedObservationModel, permits_unfiltered_desktop, prepare_vision_capture
     from .vision import VisionSignals, analyze_multimodal
 
     if (not math.isfinite(model_interval_s) or model_interval_s <= 0
             or duration_s is not None and (not math.isfinite(duration_s) or duration_s <= 0)):
         raise ValueError("Live duration and update interval must be positive and finite")
-    if screen_scope not in ("foreground_window", "all_displays"):
+    if screen_scope not in ("foreground_window", "all_displays", "all_displays_unfiltered"):
         raise ValueError("Invalid live screen scope")
-    all_displays = screen_scope == "all_displays"
+    unfiltered_desktop = screen_scope == "all_displays_unfiltered"
+    all_displays = screen_scope != "foreground_window"
     routed_vision = vision if isinstance(vision, RoutedObservationModel) else None
     protected_foreground_reasons = {"privacy_excluded", "private_window", "browser_url_unavailable", "mochi_foreground"}
+    app_rules = _excluded_app_rules(excluded_apps)
+    domain_rules = _excluded_domain_rules(excluded_domains)
+
+    def desktop_identity(sample: ActivitySample) -> tuple:
+        if unfiltered_desktop:
+            return sample.session_id, sample.screen_locked, sample.app_id or sample.app_name, sample.window_id
+        return _desktop_identity(sample)
 
     def admit_scope(scope: CloudRouteSnapshot | None):
         if routed_vision is None or scope is None:
@@ -880,6 +895,7 @@ def run_live_multimodal(
     activity_id = None
     last_sample = None
     last_desktop_identity = None
+    raw_scene_changed = False
     latest = None
     visual = None
     previous_visual = None
@@ -908,6 +924,7 @@ def run_live_multimodal(
             activity_id = activity.activity_id if activity is not None else None
             changed = (
                 prior_activity != activity_id or last_sample is None
+                or raw_scene_changed
                 or sample.screen_locked is not last_sample.screen_locked or sample.session_id != last_sample.session_id
                 or sample.monotonic_s - last_sample.monotonic_s > 3 * ACTIVITY_POLL_S
                 or not clocks_agree(sample.observed_at, sample.monotonic_s, last_sample.observed_at, last_sample.monotonic_s)
@@ -938,11 +955,23 @@ def run_live_multimodal(
         )
 
         def observe_sample(sample: ActivitySample) -> None:
-            nonlocal last_desktop_identity
+            nonlocal last_desktop_identity, raw_scene_changed
             if all_displays:
                 # Only an in-memory comparison is needed to revoke a stale frame.
-                last_desktop_identity = sha256(repr(_desktop_identity(sample)).encode(errors="replace")).digest()
-            recorder.observe(sample)
+                identity = sha256(repr(desktop_identity(sample)).encode(errors="replace")).digest()
+                raw_scene_changed = unfiltered_desktop and last_desktop_identity != identity
+                last_desktop_identity = identity
+            if unfiltered_desktop and not is_mochi_app(sample.app_name, sample.app_id) and (
+                sample.private_window is True
+                or _sensitive_title(sample.window_title)
+                or _sensitive_title(sample.active_tab_title)
+                or _app_excluded(sample.app_name, sample.app_id, app_rules)
+                or (domain := _page_domain(sample.url)) and _domain_excluded(domain, domain_rules)
+            ):
+                # Attribute the frame to an anonymous activity without storing blocked native metadata.
+                sample = replace(sample, app_name=None, app_id=None, window_id=None,
+                                 window_title=None, url=None, private_window=None, active_tab_title=None)
+            recorder.observe(sample, new_activity=raw_scene_changed and sample.app_name is None)
 
         def activities_at(at: datetime) -> list:
             since = at - timedelta(seconds=observer.window_seconds)
@@ -1000,7 +1029,14 @@ def run_live_multimodal(
             restriction = recorder.capture_ineligibility
             foreground_excluded = False
             context_only = False
-            if all_displays:
+            if unfiltered_desktop:
+                if sampler.platform != "darwin":
+                    restriction = "unfiltered_desktop_unavailable"
+                elif sample.screen_locked is not False or not sample.session_id:
+                    restriction = "desktop_session_unverified"
+                else:
+                    restriction = "mochi_foreground" if is_mochi_app(sample.app_name, sample.app_id) else None
+            elif all_displays:
                 if sampler.platform != "darwin":
                     restriction = "filtered_desktop_unavailable"
                 elif sample.screen_locked is False:
@@ -1033,6 +1069,9 @@ def run_live_multimodal(
                 return not stopped() and capture_stamp() == stamp
 
             grant = prepare_vision_capture(vision, permitted=permitted)
+            if unfiltered_desktop and (routed_vision is None or not permits_unfiltered_desktop(grant)):
+                store.save_capture_health("source_restricted", sample.observed_at, reason="recipient_unavailable")
+                return
             scope = None
             if grant is not None and routed_vision is not None:
                 try:
@@ -1044,7 +1083,14 @@ def run_live_multimodal(
                 return
             failure = None
             try:
-                if all_displays:
+                if unfiltered_desktop:
+                    with admit_scope(scope) as authorized:
+                        if not authorized:
+                            raise CloudRouteError("Unfiltered desktop capture authorization changed")
+                        grant.check()
+                        desktop = capture_unfiltered_desktop(sample, platform=sampler.platform)
+                    acquired_at, image = desktop.captured_at, desktop.jpeg
+                elif all_displays:
                     desktop = capture_filtered_desktop(
                         sample, platform=sampler.platform, excluded_apps=excluded_apps, excluded_domains=excluded_domains,
                         foreground_excluded=foreground_excluded,
@@ -1056,11 +1102,13 @@ def run_live_multimodal(
                 thumbnail = None if context_only else frame_thumbnail(image)
             except DesktopCaptureRestricted as exc:
                 failure = ("source_restricted", exc.reason)
+            except CloudRouteError:
+                failure = ("source_restricted", "recipient_unavailable")
             except (OSError, RuntimeError, ValueError):
                 failure = ("capture_failed", None)
 
             after = sampler.sample()
-            if (_desktop_identity(sample) != _desktop_identity(after)
+            if (desktop_identity(sample) != desktop_identity(after)
                     or not clocks_agree(after.observed_at, after.monotonic_s, sample.observed_at, sample.monotonic_s)
                     or after.monotonic_s - sample.monotonic_s > 3 * ACTIVITY_POLL_S):
                 observe_sample(after)
@@ -1115,7 +1163,7 @@ def run_live_multimodal(
                 at, mono = datetime.now(UTC), time.monotonic()
                 return (activity_id == activity.activity_id and mono < deadline_s and coverage_current(at, mono)
                         and last_sample is not None and last_sample.screen_locked is False
-                        and recorder.capture_eligible
+                        and (unfiltered_desktop or recorder.capture_eligible)
                         and (not all_displays or last_desktop_identity == scene_identity))
 
             if grant is not LOCAL_CAPTURE:
@@ -1131,6 +1179,7 @@ def run_live_multimodal(
                     vision, image=image, activity_id=activity.activity_id, capture_id=capture_id,
                     captured_at=acquired_at, image_grant=None if grant is LOCAL_CAPTURE else grant,
                     signals=evidence, document_source=document_source, all_displays=all_displays,
+                    unfiltered_desktop=unfiltered_desktop,
                     local_permitted=permitted_to_send, deadline_s=min(deadline_s, end_at),
                     scoped_snapshot=scope,
                 )

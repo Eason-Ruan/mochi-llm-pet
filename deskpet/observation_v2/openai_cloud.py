@@ -176,6 +176,15 @@ class VisionImageGrant:
             raise CloudRouteError("Window capture authorization changed")
 
 
+def permits_unfiltered_desktop(grant: object) -> bool:
+    if not isinstance(grant, VisionImageGrant):
+        return False
+    snapshot = grant.snapshot
+    route = snapshot.route
+    return (snapshot.role == VISION and snapshot.permission and snapshot.verified and route is not None
+            and route.model == BAILIAN_OBSERVATION_MODEL and is_bailian_endpoint(route.base_url))
+
+
 def prepare_vision_capture(
     model: ScreenModel, *, permitted: Callable[[], bool] = lambda: True,
 ) -> VisionImageGrant | object | None:
@@ -564,6 +573,7 @@ class RoutedObservationModel:
     def complete_multimodal_image(
         self, image_grant: VisionImageGrant | None, *, image: bytes, signals: VisionSignals | None,
         captured_at: datetime, activity_id: int, allow_document_title: bool, all_displays: bool = False,
+        unfiltered_desktop: bool = False,
         local_permitted: Callable[[], bool] | None = None, deadline_s: float | None = None,
         scoped_snapshot: CloudRouteSnapshot | None = None,
     ) -> dict:
@@ -571,6 +581,8 @@ class RoutedObservationModel:
 
         if self._role != VISION or not image or captured_at.utcoffset() is None:
             raise CloudRouteError("A timed window capture is required")
+        if unfiltered_desktop and not permits_unfiltered_desktop(image_grant):
+            raise CloudRouteError("Unfiltered desktop capture requires an authorized Qwen vision route")
         projected = _project_signals(
             signals, captured_at=captured_at, activity_id=activity_id,
             comparison_scope=image_grant.comparison_scope if image_grant is not None else None,
@@ -580,7 +592,7 @@ class RoutedObservationModel:
         request = _multimodal_request(
             projected, captured_at=captured_at, allow_document_title=allow_document_title,
             include_signals=image_grant is None or image_grant.snapshot.vision_signals_permission,
-            all_displays=all_displays,
+            all_displays=all_displays, unfiltered_desktop=unfiltered_desktop,
         )
         if image_grant is not None:
             image_grant = replace(image_grant, allow_late_result=True)

@@ -12,6 +12,7 @@ from deskpet.observation_v2.context import ObservationContextReader, project_obs
 from deskpet.observation_v2.pipeline import ObservationStore, _live_writer
 from deskpet.observation_v2.state import Observation
 from deskpet.observation_v2.vision import MultimodalScreenObservation, ScreenObservation
+from deskpet.system2.dsh_projection import project_context
 
 NOW = datetime(2026, 11, 23, 2, tzinfo=UTC)
 
@@ -123,6 +124,39 @@ def test_legacy_logs_supply_history_without_authorizing_current(tmp_path):
     assert context.history.recent[-1].summary == "screen"
     with pytest.raises(ValueError, match="dedicated live database"):
         ObservationStore(path, live=True)
+
+
+@pytest.mark.parametrize("app_name", ["Editor", "Visual Studio Code", None])
+def test_unfiltered_summary_reaches_activity_context_under_existing_sharing_controls(tmp_path, app_name):
+    path = tmp_path / "live.sqlite"
+    summary = "A spreadsheet is comparing model validation results across experiments."
+    title = "analysis.py — Visual Studio Code" if app_name == "Visual Studio Code" else None
+    new_sample = NOW + timedelta(seconds=1)
+    with ObservationStore(path, live=True) as store:
+        recorder = ActivityRecorder(store, document_local_sources=("app:vscode",))
+        recorder.observe(ActivitySample(
+            NOW, 100, app_name=app_name, window_id=1, window_title=title, screen_locked=False, idle_s=1,
+        ))
+        activity_id = recorder.current_activity.activity_id
+        store.save_screen(MultimodalScreenObservation(
+            "raw", activity_id, NOW, "ready", "qwen", "document", screen_summary=summary,
+            activity_kind="work", scene_elements=("spreadsheet grid",), unfiltered_desktop=True,
+        ))
+        recorder.observe(ActivitySample(
+            new_sample, 101, app_name=app_name, window_id=1, window_title=title, screen_locked=False, idle_s=1,
+        ))
+
+    context = ObservationContextReader(path).read_observation_context(new_sample)
+    view = project_observation_context(context, share_summary=True, restrict_legacy_summaries=True)
+    assert view["last_observed_activity"]["summary"] == summary
+    assert view["history_1h"]["segments"][0]["summary"] == summary
+    assert project_context(view, share=True)["last_observed_activity"]["summary"] == summary
+    assert summary not in str(project_context(view, share=False))
+    assert summary not in str(project_observation_context(context))
+    if app_name:
+        assert summary not in str(project_observation_context(
+            context, share_summary=True, excluded_apps=(app_name.casefold(),),
+        ))
 
 
 def test_document_history_stays_timed_and_separate_from_interruptibility(tmp_path):

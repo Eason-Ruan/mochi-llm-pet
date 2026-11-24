@@ -360,7 +360,7 @@ class ActivityRecorder:
             return None
         return elapsed
 
-    def observe(self, sample: ActivitySample) -> CaptureRequest | None:
+    def observe(self, sample: ActivitySample, *, new_activity: bool = False) -> CaptureRequest | None:
         observed_at = _utc(sample.observed_at)
         if not math.isfinite(sample.monotonic_s):
             raise ValueError("Monotonic sample time must be finite")
@@ -415,7 +415,7 @@ class ActivityRecorder:
                                    system_sampled_at=system_at)
         previous = self._previous
         current = self.current_activity
-        if previous == sanitized and identity == self._identity:
+        if not new_activity and previous == sanitized and identity == self._identity:
             self.capture_ineligibility = capture_ineligibility
             self.last_capture_reason = "duplicate_sample"
             return None
@@ -430,8 +430,8 @@ class ActivityRecorder:
                 return None
             self.close()
             current, continuous = None, False
-        same = not excluded and continuous and identity == self._identity and current is not None
-        boundary = (not continuous or excluded or self._identity is not None and (
+        same = not new_activity and not excluded and continuous and identity == self._identity and current is not None
+        boundary = (new_activity or not continuous or excluded or self._identity is not None and (
             self._identity.private != private or (self._identity.app == "mochi") != own
         ))
         with self.store.connection:

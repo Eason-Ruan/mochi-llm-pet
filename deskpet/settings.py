@@ -46,7 +46,9 @@ class Settings(BaseModel):
     allow_system_notifications: bool = False
     lock_screen_detail: bool = False
     observation_screenshots: bool = False
-    observation_screen_scope: Literal["foreground_window", "all_displays"] = "foreground_window"
+    observation_screen_scope: Literal[
+        "foreground_window", "all_displays", "all_displays_unfiltered",
+    ] = "foreground_window"
     observation_browser_metadata: bool = False
     observation_excluded_apps: tuple[str, ...] = Field(default=(), max_length=100)
     observation_excluded_domains: tuple[str, ...] = Field(default=(), max_length=100)

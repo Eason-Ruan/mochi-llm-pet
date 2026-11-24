@@ -17,7 +17,9 @@ from typing import Literal
 from .documents import document_source_allowed, is_mochi_app, native_document_source, sanitize_document_name
 from .realtime import boot_id as system_boot_id, clocks_agree
 from .state import Observation, _KINDS, _REASONS
-from .vision import cloud_screen_text, multimodal_summary, validated_scene_elements, validated_visible_changes
+from .vision import (
+    cloud_screen_text, multimodal_summary, validated_scene_elements, validated_screen_summary, validated_visible_changes,
+)
 
 _HOUR = timedelta(hours=1)
 _GAP = timedelta(seconds=45)
@@ -34,7 +36,7 @@ CAPTURE_HEALTH_REASONS = {
     "screen_recording_permission_denied", "filtered_desktop_unavailable", "desktop_privacy_restricted",
     "desktop_display_inventory_unverified", "desktop_window_inventory_unverified", "desktop_session_unverified",
     "desktop_inventory_changed", "desktop_no_visible_windows",
-    "foreground_context_only",
+    "foreground_context_only", "unfiltered_desktop_unavailable",
 }
 CAPTURE_HEALTH_TIMES = ("last_ready_at", "last_failure_at", "last_skipped_at")
 
@@ -526,6 +528,7 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
             if since < started <= until:
                 details.append(base)
         latest_capture = None
+        latest_unfiltered = False
         # Keep the screen timestamp as evidence, with the start as a scope boundary.
         # A late response can enrich that segment without changing the live head.
         for frame in frames:
@@ -533,18 +536,21 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
             if captured_at is None:
                 continue
             latest_capture = captured_at
+            latest_unfiltered = _row_value(frame, "unfiltered_desktop") == 1
             screen_source = _row_value(frame, "document_source")
             screen_name = sanitize_document_name(_row_value(frame, "document_name"), screen_source)
             elements = validated_scene_elements(_tokens(_row_value(frame, "scene_elements")))
             changes = validated_visible_changes(_tokens(_row_value(frame, "visible_changes")))
             activity_kind = _row_value(frame, "activity_kind")
-            legacy_summary = None
+            summary = multimodal_summary(frame["screen_kind"], elements)
             if activity_kind not in _KINDS:
                 activity_kind = _legacy_activity_kind(connection, frame, as_of)
-                legacy_summary = cloud_screen_text(frame["screen_summary"], summary=True)
+                summary = cloud_screen_text(frame["screen_summary"], summary=True) or summary
+            if latest_unfiltered:
+                summary = validated_screen_summary(frame["screen_summary"])
             detail = replace(
                 base, observed_at=captured_at, activity_kind=activity_kind,
-                summary=legacy_summary or multimodal_summary(frame["screen_kind"], elements),
+                summary=summary,
                 document_name=name or (screen_name if screen_source else None),
                 document_source=source if name else screen_source,
                 scene_elements=elements, visible_changes=changes,
@@ -554,7 +560,7 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
             )
             details.append(detail)
         if sampled is not None and max(started, since, latest_capture or started, change or started) < sampled <= until:
-            if not frames or name:
+            if not frames or (name and not latest_unfiltered):
                 details.append(replace(base, observed_at=sampled, document_change_at=change))
     return tuple(sorted(details, key=lambda detail: (detail.observed_at, detail.activity_id)))
 

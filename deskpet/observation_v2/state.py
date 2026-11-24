@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 
-from .vision import ScreenModel, redact_text
+from .vision import ScreenModel, redact_text, validated_screen_summary
 
 WINDOW_SECONDS = 60.0
 TTL_SECONDS = 15.0
@@ -131,7 +131,7 @@ def _label(foreground: _Foreground | None) -> dict | None:
     return {"app_name": app, "window_title_redacted": title, "domain": domain}
 
 
-def _screen_context(rows: Iterable[object], start: datetime, as_of: datetime) -> list[tuple[datetime, object, dict]]:
+def _screen_context(rows: Iterable[object], start: datetime, as_of: datetime) -> list[tuple[datetime, object, bool, dict]]:
     observations = []
     for row in rows:
         captured = _time(_value(row, "captured_at"))
@@ -143,11 +143,16 @@ def _screen_context(rows: Iterable[object], start: datetime, as_of: datetime) ->
             continue
         screen_kind = _value(row, "screen_kind")
         ready = status == "ready"
-        observations.append((captured, _value(row, "activity_id"), {
+        unfiltered_desktop = _value(row, "unfiltered_desktop") == 1
+        summary = None
+        if ready:
+            value = _value(row, "screen_summary")
+            summary = validated_screen_summary(value) if unfiltered_desktop else _clean(value, _SUMMARY_LENGTH)
+        observations.append((captured, _value(row, "activity_id"), unfiltered_desktop, {
             "captured_at": captured.isoformat(),
             "status": status,
             "screen_kind": screen_kind if ready and screen_kind in _SCREEN_KINDS else "unknown",
-            "screen_summary": _clean(_value(row, "screen_summary"), _SUMMARY_LENGTH) if ready else None,
+            "screen_summary": summary,
             "visible_text_redacted": _clean(_value(row, "visible_text_redacted")) if ready else None,
         }))
     return sorted(observations, key=lambda entry: entry[0])
@@ -259,18 +264,21 @@ def _window(
         screen_locked = latest_lock[1]
 
     screen_rows = _screen_context(screens, start, as_of)
+    # The experimental capture can describe the active scene without a native app label.
+    unlocked_activity = prior_id is not None and screen_locked is False
     foreground_screens = (
-        [entry for entry in screen_rows if current_foreground is not None and entry[1] == prior_id]
+        [entry for entry in screen_rows if entry[1] == prior_id and
+         (unlocked_activity if entry[2] else current_foreground is not None)]
         if live else screen_rows
     )
     last_screen = next((
-        (at, data) for at, activity_id, data in reversed(foreground_screens)
+        (at, data) for at, activity_id, _, data in reversed(foreground_screens)
         if screen_locked is not True and data["status"] == "ready"
         and (current_foreground is None or (at >= foreground_started_at and (prior_id is None or activity_id == prior_id)))
     ), None)
     screen_until = last_screen[0] + ttl if last_screen and last_screen[0] + ttl > as_of else None
     screen = last_screen[1] if screen_until is not None else None
-    known_screens = [(at, data["screen_kind"]) for at, _, data in screen_rows if data["screen_kind"] != "unknown"]
+    known_screens = [(at, data["screen_kind"]) for at, _, _, data in screen_rows if data["screen_kind"] != "unknown"]
     screen_switches = [
         current_at for (previous_at, previous_kind), (current_at, current_kind)
         in zip(known_screens, known_screens[1:])
@@ -301,7 +309,7 @@ def _window(
         "screen_scene_switches": len(screen_switches), "recently_switched_screen_scene": recent_screen_switch,
         "idle_s": idle_age, "recent_os_input": input_until is not None,
         "screen_locked": screen_locked, "sustained_activity": sustained_activity,
-        "recent_screen_results": [data for _, _, data in foreground_screens[-3:]],
+        "recent_screen_results": [data for _, _, _, data in foreground_screens[-3:]],
         "current_screen": screen,
     }
     semantics = [current_foreground, prior_id if current_foreground else None, screen and (screen["screen_kind"], screen["screen_summary"], screen["visible_text_redacted"]),

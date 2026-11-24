@@ -22,6 +22,7 @@ from .desktop_capture import (
     DesktopCaptureRestricted as DesktopCaptureRestricted,
     FilteredDesktopCapture as FilteredDesktopCapture,
     capture_filtered_desktop as capture_filtered_desktop,
+    capture_unfiltered_desktop as capture_unfiltered_desktop,
 )
 from .documents import is_mochi_app
 

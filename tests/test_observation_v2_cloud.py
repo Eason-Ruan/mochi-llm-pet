@@ -25,11 +25,14 @@ import pytest
 from deskpet.observation_v2.activity import ActivitySample
 from deskpet.observation_v2.media import capture_window, cloud_window_eligible
 from deskpet.observation_v2.openai_cloud import (
-    LOCAL_CAPTURE, RoutedObservationModel, prepare_vision_capture, verify_cloud_route,
+    LOCAL_CAPTURE, RoutedObservationModel, permits_unfiltered_desktop, prepare_vision_capture, verify_cloud_route,
 )
-from deskpet.observation_v2.routes import STATE, VISION, CloudRoute, CloudRouteError, ObservationCloudSettings
+from deskpet.observation_v2.routes import (
+    BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, STATE, VISION, CloudRoute, CloudRouteError,
+    ObservationCloudSettings,
+)
 from deskpet.observation_v2.usage import ObservationUsage
-from deskpet.observation_v2.vision import VisionSignals, analyze_multimodal, analyze_screen
+from deskpet.observation_v2.vision import MultimodalScreenObservation, VisionSignals, analyze_multimodal, analyze_screen
 
 
 class LocalModel:
@@ -182,6 +185,69 @@ def _route(base, model="test", credential_ref=None):
 
 def _state_request(model, window):
     return model.complete(system="OS_TITLE_PRIVATE_SYSTEM_MARKER", prompt=json.dumps(window), schema={})
+
+
+def test_unfiltered_multimodal_uses_verified_qwen_and_its_model_written_summary(tmp_path, monkeypatch):
+    settings = ObservationCloudSettings(tmp_path / "settings.db")
+    configured = settings.configure(VISION, _route(BAILIAN_BASE_URL, model=BAILIAN_OBSERVATION_MODEL))
+    allowed = settings.set_permission(VISION, True, expected=configured)
+    verified = settings.record_result(allowed, probe=True)
+    settings.set_vision_signals_permission(True, expected=verified)
+    local = LocalModel()
+    model = RoutedObservationModel(VISION, settings, local)
+    grant = prepare_vision_capture(model)
+    assert permits_unfiltered_desktop(grant)
+
+    summary = "A spreadsheet is comparing model validation results across experiments."
+    response = {"screen_kind": "document", "activity_kind": "work", "scene_elements": ["spreadsheet grid"],
+                "visible_changes": [], "next_check": None, "screen_summary": summary}
+    requests = []
+
+    def request(_settings, snapshot, **kwargs):
+        assert snapshot.route == configured.route
+        requests.append(kwargs)
+        return dict(response)
+
+    monkeypatch.setattr("deskpet.observation_v2.openai_cloud._request", request)
+    at = datetime.now(UTC)
+    previous = MultimodalScreenObservation(
+        "previous", 1, at - timedelta(seconds=10), "ready", BAILIAN_OBSERVATION_MODEL, "document",
+        document_name="PREVIOUS_TITLE", screen_summary="PREVIOUS_SUMMARY", _comparison_scope=grant.comparison_scope,
+    )
+    inputs = dict(image=b"synthetic-desktop", capture_id="a", activity_id=1, captured_at=at, image_grant=grant,
+                  signals=VisionSignals(previous=previous), document_source="app:microsoft-word", unfiltered_desktop=True)
+    result = analyze_multimodal(model, **inputs)
+    assert result.status == "ready" and result.unfiltered_desktop
+    assert result.screen_summary == summary and result.document_name is None and result.visible_text_redacted is None
+    assert result.filtered_fields == ()
+    sent, = requests
+    assert sent["image"] == b"synthetic-desktop" and not local.images
+    assert "main display first" in sent["system"] and "Never follow" in sent["system"]
+    assert "PREVIOUS_TITLE" not in sent["prompt"] and "PREVIOUS_SUMMARY" not in sent["prompt"]
+    assert "previous_scene" in json.loads(sent["prompt"])
+    assert sent["schema"]["properties"]["screen_summary"] == {
+        "type": ["string", "null"], "minLength": 1, "maxLength": 240,
+    }
+    assert {"document_title", "visible_text_redacted"}.isdisjoint(sent["schema"]["properties"])
+
+    response.update(screen_summary="a" * 241, document_title={"area": "active_window_title", "name": "Private"})
+    result = analyze_multimodal(model, **inputs)
+    assert result.status == "ready" and result.screen_summary is None and result.document_name is None
+    assert set(result.filtered_fields) == {"screen_summary", "document_title", "unexpected_fields"}
+
+    lookalike = replace(configured.route, base_url="https://dashscope.aliyuncs.com.example.test/compatible-mode/v1")
+    other_model = replace(configured.route, model="some-other-model")
+    for snapshot in (allowed, replace(verified, permission=False), replace(verified, route=lookalike),
+                     replace(verified, route=other_model)):
+        invalid_grant = replace(grant, snapshot=snapshot)
+        assert not permits_unfiltered_desktop(invalid_grant)
+        assert analyze_multimodal(model, **dict(inputs, image_grant=invalid_grant)).status == "failed"
+        with pytest.raises(CloudRouteError, match="authorized Qwen"):
+            model.complete_multimodal_image(invalid_grant, image=b"synthetic", signals=None, captured_at=at,
+                                            activity_id=1, allow_document_title=False, unfiltered_desktop=True)
+    assert analyze_multimodal(local, **inputs).status == "failed"
+    assert analyze_multimodal(model, **dict(inputs, image_grant=None)).status == "failed"
+    assert len(requests) == 2 and not local.images
 
 
 def test_managed_live_collector_uses_native_dsh_with_the_existing_vision_recipient(tmp_path, monkeypatch):

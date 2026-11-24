@@ -58,8 +58,11 @@ def test_legacy_screenshot_scope_defaults_to_foreground_and_scope_changes_advanc
     assert SettingsStore.read_at(path) == widened
     repeated = store.update(expected_version=widened.version, observation_screen_scope="all_displays")
     assert repeated.observation_generation == widened.observation_generation
-    narrowed = store.update(expected_version=repeated.version, observation_screen_scope="foreground_window")
-    assert narrowed.observation_generation == widened.observation_generation + 1
+    raw = store.update(expected_version=repeated.version, observation_screen_scope="all_displays_unfiltered")
+    assert raw.observation_generation == widened.observation_generation + 1
+    assert SettingsStore.read_at(path) == raw
+    narrowed = store.update(expected_version=raw.version, observation_screen_scope="foreground_window")
+    assert narrowed.observation_generation == raw.observation_generation + 1
 
 
 def test_document_permissions_migrate_and_apply_only_to_the_exact_allowed_source(tmp_path):
@@ -304,9 +307,16 @@ def test_settings_widget_applies_capture_scope_and_app_blacklist(tmp_path, monke
     try:
         assert scope.currentData() == "foreground_window"
         assert any("仍可采集" in label.text() and "云端" in label.text() for label in panel.findChildren(QLabel))
+        assert any(
+            all(word in label.text() for word in ("原始截图", "通义千问", "无痕窗口", "只在输出中尝试脱敏"))
+            for label in panel.findChildren(QLabel)
+        )
         scope.setCurrentIndex(scope.findData("all_displays"))
         scope.activated.emit(scope.currentIndex())
         assert store.read().observation_screen_scope == "all_displays"
+        scope.setCurrentIndex(scope.findData("all_displays_unfiltered"))
+        scope.activated.emit(scope.currentIndex())
+        assert store.read().observation_screen_scope == "all_displays_unfiltered"
         assert not store.read().observation_screenshots
         QTimer.singleShot(0, edit_exclusions)
         panel.findChild(QPushButton, "settings-observation-exclusions").click()

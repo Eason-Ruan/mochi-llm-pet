@@ -205,19 +205,21 @@ def test_observation_policy_waits_for_a_short_business_write(tmp_path, monkeypat
         assert request.result(timeout=1) is None
 
 
-def test_managed_cli_pins_scope_and_revokes_previous_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scope", ["all_displays", "all_displays_unfiltered"])
+def test_managed_cli_pins_scope_and_revokes_previous_worker(tmp_path, monkeypatch, scope):
     from deskpet.observation_v2 import __main__ as cli
 
     observer = DesktopObserver(tmp_path)
     current = observer.settings.update(
-        expected_version=0, observation_screenshots=True, observation_screen_scope="all_displays",
+        expected_version=0, observation_screenshots=True, observation_screen_scope=scope,
     )
     args = observer._arguments(current)
+    monkeypatch.setattr(cli, "platform", "darwin")
     monkeypatch.setattr(sys, "argv", ["deskpet.observation_v2", *args[3:]])
 
     def verify_live_policy(database, vision, **options):
         assert database == observer.database
-        assert options["screen_scope"] == "all_displays"
+        assert options["screen_scope"] == scope
         assert options["capture_policy"]() == options["producer_policy"]() == current.observation_generation
         observer.settings.update(expected_version=current.version, observation_screen_scope="foreground_window")
         assert options["capture_policy"]() is None and options["producer_policy"]() is None
@@ -299,9 +301,12 @@ def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
 
 @pytest.mark.parametrize("platform,scope,flags,error", [
     ("darwin", "all-displays", [], "requires --capture-screen"),
+    ("darwin", "all-displays-unfiltered", [], "requires --capture-screen"),
     ("darwin", "all-displays", ["--capture-screen", "--split-models"], "Use replay without --multimodal"),
     ("darwin", "foreground-window", ["--capture-screen", "--split-models"], "Use replay without --multimodal"),
     ("win32", "all-displays", ["--capture-screen"], "requires macOS 14.2 or later"),
+    ("win32", "all-displays-unfiltered", ["--capture-screen"], "requires macOS 14.2 or later"),
+    ("darwin", "all-displays-unfiltered", ["--capture-screen"], "requires --cloud-settings"),
     ("darwin", "all-displays", ["--capture-screen"], None),
 ])
 def test_explicit_cli_requires_capture_opt_in_and_macos_multimodal(
@@ -329,6 +334,26 @@ def test_explicit_cli_requires_capture_opt_in_and_macos_multimodal(
     else:
         cli.main()
         assert '"scope": "all_displays"' in capsys.readouterr().out
+
+
+def test_explicit_cli_passes_opted_in_unfiltered_scope_to_live_pipeline(tmp_path, monkeypatch, capsys):
+    from deskpet.observation_v2 import __main__ as cli
+
+    monkeypatch.setattr(cli, "platform", "darwin")
+    monkeypatch.setattr(sys, "argv", [
+        "deskpet.observation_v2", "live", "--database", str(tmp_path / "observation.db"),
+        "--capture-screen", "--screen-scope", "all-displays-unfiltered",
+        "--cloud-settings", str(tmp_path / "settings.db"),
+    ])
+
+    def verify_scope(database, vision, **options):
+        assert options["capture_screen"]
+        assert options["screen_scope"] == "all_displays_unfiltered"
+        return {"scope": options["screen_scope"]}
+
+    monkeypatch.setattr(cli, "run_live_multimodal", verify_scope)
+    cli.main()
+    assert '"scope": "all_displays_unfiltered"' in capsys.readouterr().out
 
 
 def test_production_tool_and_qt_readers_reject_still_fresh_head_after_pause_resume(tmp_path, monkeypatch):

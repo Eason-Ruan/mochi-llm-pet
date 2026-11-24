@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from deskpet.observation_v2.state import StateObserver, aggregate_window, context_revision
-from deskpet.observation_v2.vision import ScreenObservation
+from deskpet.observation_v2.vision import MultimodalScreenObservation, ScreenObservation
 
 
 EPOCH = datetime(2026, 11, 22, 12, tzinfo=UTC)
@@ -63,6 +63,24 @@ def test_window_clips_observed_durations_and_does_not_count_gaps_or_overlap():
     assert features["locked_s"] is None
     assert features["current_screen"]["screen_summary"] == "Newest screen"
     assert len(features["recent_screen_results"]) == 2
+
+
+def test_live_unfiltered_scene_can_enrich_a_matching_anonymous_activity():
+    anonymous = dict(activity(0, 20, app=None, locked=False, sampled=20), activity_id=1)
+    summary = "A spreadsheet is comparing model validation results across experiments."
+    raw = MultimodalScreenObservation(
+        "raw", 1, at(20), "ready", "qwen", "document", screen_summary=summary,
+        activity_kind="work", unfiltered_desktop=True,
+    )
+    observer = StateObserver()
+    features = observer.features([anonymous], [raw], as_of=at(20), live=True)
+    assert features["current_foreground"] is None
+    assert features["current_screen"]["screen_summary"] == summary
+    result = observer.observe_local([anonymous], [raw], as_of=at(20), activity_kind="work")
+    assert result.activity_kind == "work" and result.summary == summary
+    assert observer.features([anonymous], [screen(20)], as_of=at(20), live=True)["current_screen"] is None
+    assert observer.features([dict(anonymous, activity_id=2)], [raw], as_of=at(20), live=True)["current_screen"] is None
+    assert observer.features([dict(anonymous, screen_locked=True)], [raw], as_of=at(20), live=True)["current_screen"] is None
 
 
 def test_contiguous_switch_and_measured_input_recovery_support_available():

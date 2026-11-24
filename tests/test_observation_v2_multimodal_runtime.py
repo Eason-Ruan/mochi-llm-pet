@@ -13,7 +13,9 @@ import pytest
 
 from deskpet.observation_v2 import __main__ as cli, media, openai_cloud, pipeline, vision as vision_module
 from deskpet.observation_v2.activity import ActivitySample
-from deskpet.observation_v2.routes import OLLAMA, VISION, CloudRoute, ObservationCloudSettings
+from deskpet.observation_v2.routes import (
+    BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, OLLAMA, VISION, CloudRoute, ObservationCloudSettings,
+)
 from deskpet.observation_v2.sampling import CaptureSchedule, frame_thumbnail
 from deskpet.observation_v2.state import StateObserver
 
@@ -429,6 +431,74 @@ def test_collector_rechecks_recipient_after_vision_result_validation(tmp_path, m
     else:
         assert report["state_runs"].get("model", 0) == 0 and commits == []
         assert stored == ("redacted_out", "original-model", 0, None, None)
+
+
+@pytest.mark.parametrize("authorized", ["qwen", "no_consent", "other_model", "revoked_before_capture"])
+def test_unfiltered_desktop_requires_qwen_and_publishes_its_summary(tmp_path, monkeypatch, authorized):
+    runtime = FakeRuntime(monkeypatch, metadata=lambda at: {
+        "app_name": "Blocked App", "private_window": True,
+        "window_id": 1 if at < 4 else 2,
+    })
+    uploaded = []
+    summary = "正在检查一份数据表里的汇总结果。"
+
+    class CompletedRuntime:
+        def complete(self, **kwargs):
+            uploaded.append(kwargs)
+            return {
+                "screen_kind": "document", "activity_kind": "work", "scene_elements": ["spreadsheet grid"],
+                "visible_changes": [], "next_check": None, "screen_summary": summary,
+            }
+
+    def capture_unfiltered(sample, *, platform):
+        at, jpeg = runtime.capture(sample, platform=platform)
+        return media.FilteredDesktopCapture(at, jpeg, False)
+
+    monkeypatch.setattr(media, "capture_unfiltered_desktop", capture_unfiltered)
+    settings = ObservationCloudSettings(tmp_path / "settings.sqlite")
+    route = CloudRoute(
+        "openai_compatible", BAILIAN_BASE_URL,
+        "other-model" if authorized == "other_model" else BAILIAN_OBSERVATION_MODEL, "Test provider",
+    )
+    snapshot = settings.configure(VISION, route)
+    if authorized != "no_consent":
+        snapshot = settings.set_permission(VISION, True, expected=snapshot)
+        settings.record_result(snapshot, probe=True)
+    vision = openai_cloud.RoutedObservationModel(VISION, settings, Vision(), vision_runtime=CompletedRuntime())
+    if authorized == "revoked_before_capture":
+        scope_for = vision.capture_result_scope
+
+        def revoke_before_capture(grant):
+            settings.set_permission(VISION, False, expected=settings.snapshot(VISION))
+            return scope_for(grant)
+
+        monkeypatch.setattr(vision, "capture_result_scope", revoke_before_capture)
+    database = tmp_path / "desktop.sqlite"
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=6, capture_screen=True, screen_scope="all_displays_unfiltered",
+        excluded_apps=("Blocked App",),
+    )
+
+    assert not runtime.desktop_captures
+    if authorized != "qwen":
+        assert report["visual_attempts"] == 0
+        assert not runtime.captures and not uploaded
+        return
+    assert report["visual_attempts"] == 1
+    assert report["state_runs"]["model"] == 1
+    assert runtime.captures == [3]
+    assert len(uploaded) == 1 and uploaded[0]["image"] == _frame()
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("""
+            SELECT a.app_name, s.status, s.screen_summary, s.unfiltered_desktop
+            FROM screen_observations s JOIN activities a USING (activity_id)
+        """).fetchone() == (None, "ready", summary, 1)
+        assert conn.execute("""
+            SELECT summary FROM effective_observations WHERE activity_kind='work'
+        """).fetchone() == (summary,)
+        assert conn.execute("""
+            SELECT count(*) FROM activities WHERE app_name IS NULL
+        """).fetchone() == (2,)
 
 
 @pytest.mark.parametrize("allow_title", [True, False])
