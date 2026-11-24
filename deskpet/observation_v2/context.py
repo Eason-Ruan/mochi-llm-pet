@@ -15,7 +15,7 @@ import time
 from typing import Literal
 
 from .documents import document_source_allowed, is_mochi_app, native_document_source, sanitize_document_name
-from .realtime import boot_id as system_boot_id, clocks_agree
+from .realtime import CLOCK_TOLERANCE_S, boot_id as system_boot_id, clocks_agree
 from .state import Observation, _KINDS, _REASONS
 from .vision import (
     cloud_screen_text, multimodal_summary, validated_scene_elements, validated_screen_summary, validated_visible_changes,
@@ -70,6 +70,7 @@ class ActivityDetail:
     document_change_at: datetime | None = None
     visual: bool = False
     hidden: bool = False
+    capture_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ def _observation_projection(obs: Observation, *, current: bool, share_summary: b
         "reason_codes": [reason for reason in obs.reason_codes if reason in _REASONS],
     }
     if current:
-        result["valid_until"] = obs.valid_until.isoformat()
+        result["valid_until"] = obs.valid_until.isoformat() if obs.valid_until is not None else None
         result["context_revision"] = obs.context_revision if type(obs.context_revision) is int else None
     if share_summary:
         result["summary"] = obs.summary
@@ -167,6 +168,7 @@ class ObservationContext:
     history_start: datetime | None = None
     history_end: datetime | None = None
     recent_activities: tuple[ActivityDetail, ...] | None = None
+    current_visual: ActivityDetail | None = None
 
     @classmethod
     def empty(cls, as_of: datetime) -> ObservationContext:
@@ -183,6 +185,7 @@ class RealtimeHead:
     publication_cursor: int | None = None
     producer_generation: str | None = None
     foreground_key: str | None = None
+    scene_invalidated: bool = False
 
 
 @dataclass(frozen=True)
@@ -330,11 +333,20 @@ def project_observation_context(
         _restrict_legacy_summaries(history)
     latest = None if paused else next((detail for detail in reversed(recent_details)
                                        if not _excluded(detail, excluded_apps, excluded_domains)), None)
+    visual = context.current_visual if current is not None else None
+    if (visual is not None and not _excluded(visual, excluded_apps, excluded_domains)
+            and (latest is None or (latest.activity_id == visual.activity_id
+                 and not latest.visual and latest.document_change_at is None))):
+        latest = visual
     if latest is not None:
         activity = _detail_projection(latest, share_summary=share_summary, document_sources=document_sources,
                                       include_document_source=include_document_source)
-        activity["relation"] = ("current" if not protected and not latest.late and
-                                current_signals.activity_id == latest.activity_id else "previous")
+        visual_is_current = (current is not None
+                             and (current.valid_until is not None or current.visual_capture_id == latest.capture_id))
+        activity["relation"] = (
+            "current" if not protected and not latest.late and current_signals.activity_id == latest.activity_id
+            and (not latest.visual or visual_is_current) else "previous"
+        )
     elif not context.activities and not recent_details and not paused and not excluded_apps and not excluded_domains:
         legacy = max((item for item in ((*context.history.recent, context.current)
                                         if context.current else context.history.recent)),
@@ -380,8 +392,9 @@ def project_observation_context(
 def _decode(row: sqlite3.Row) -> Observation:
     return Observation(
         row["activity_kind"], row["state"], row["summary"], tuple(json.loads(row["reason_codes"])),
-        datetime.fromisoformat(row["observed_at"]), datetime.fromisoformat(row["valid_until"]),
-        row["context_revision"],
+        datetime.fromisoformat(row["observed_at"]),
+        None if _row_value(row, "scene_scoped") == 1 else datetime.fromisoformat(row["valid_until"]),
+        row["context_revision"], _row_value(row, "visual_capture_id"),
     )
 
 
@@ -389,8 +402,10 @@ def _current(row: sqlite3.Row | None, as_of: datetime) -> tuple[Observation | No
     if row is None:
         return None, "no_data"
     observation = _decode(row)
-    if observation.valid_until <= as_of:
+    if observation.valid_until is not None and observation.valid_until <= as_of:
         return None, "expired"
+    if observation.valid_until is None and datetime.fromisoformat(row["valid_until"]) < as_of:
+        return None, "context_changed"
     if "invalidated_at" not in row.keys():
         # Old databases do not record publication or context invalidation.
         return None, "context_changed"
@@ -556,7 +571,7 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
                 scene_elements=elements, visible_changes=changes,
                 late=_row_value(frame, "realtime_eligible") == 0,
                 document_change_at=change if change is not None and change <= captured_at else None,
-                visual=True,
+                visual=True, capture_id=frame["capture_id"],
             )
             details.append(detail)
         if sampled is not None and max(started, since, latest_capture or started, change or started) < sampled <= until:
@@ -588,6 +603,23 @@ def _recent_activity_details(connection, *, as_of: datetime, since: datetime, un
     return _activity_details(connection, as_of=as_of, since=started - timedelta(microseconds=1), until=as_of)
 
 
+def _current_visual_detail(connection, current: Observation | None, *, as_of: datetime,
+                           details: tuple[ActivityDetail, ...]) -> ActivityDetail | None:
+    if current is None or current.visual_capture_id is None:
+        return None
+    capture_id = current.visual_capture_id
+    detail = next((item for item in details if item.capture_id == capture_id), None)
+    if detail is not None:
+        return detail
+    # A continuously owned scene can predate the requested history range.
+    row = connection.execute("SELECT captured_at FROM screen_observations WHERE capture_id=?", (capture_id,)).fetchone()
+    captured_at = _known_time(row[0]) if row is not None else None
+    if captured_at is None or captured_at > as_of:
+        return None
+    capture = _activity_details(connection, as_of=as_of, since=captured_at - timedelta(microseconds=1), until=captured_at)
+    return next((item for item in capture if item.capture_id == capture_id), None)
+
+
 def _capture_health(connection, as_of: datetime) -> dict | None:
     if not _columns(connection, "observation_capture_health"):
         return None
@@ -616,6 +648,7 @@ class ObservationContextReader:
         self._clock_guard = Lock()
         self._highest_cursor = 0
         self._rejected_cursor: int | None = None
+        self._invalidated_cursor: int | None = None
         self._latest_read: tuple[tuple[str, int], datetime, float] | None = None
 
     @contextmanager
@@ -727,9 +760,10 @@ class ObservationContextReader:
             activities = _activity_details(connection, as_of=as_of, since=since, until=until)
             recent = _recent_activity_details(connection, as_of=as_of, since=since, until=until, details=activities)
             health = _capture_health(connection, as_of)
+            visual = _current_visual_detail(connection, current, as_of=as_of, details=recent or activities)
         current_id = latest["observation_id"] if current is not None else None
         return ObservationContext(as_of, current, status, _history(rows, current_id), signals, activities,
-                                  health, since, until, recent)
+                                  health, since, until, recent, visual)
 
     def read_privacy_marker(self) -> tuple[str | None, int, bool | None]:
         """Read the producer's lock interval without depending on a current estimator result."""
@@ -786,18 +820,26 @@ class ObservationContextReader:
             return RealtimeHead(None, "no_data", producer_generation=generation)
         row = connection.execute("SELECT * FROM effective_observations WHERE observation_id = ?", (cursor,)).fetchone()
         changed = RealtimeHead(None, "context_changed", cursor, generation)
+        invalidated = replace(changed, scene_invalidated=True)
         head_policy = head["policy_generation"] if "policy_generation" in head.keys() else None
         if head_policy != policy_generation:
-            return changed
-        required = ("sampled_at", "sampled_monotonic_s", "sample_deadline_s", "published_monotonic_s", "valid_until_monotonic_s")
+            return invalidated
+        required = ("sampled_at", "sampled_monotonic_s", "sample_deadline_s", "published_monotonic_s")
+        scene_scoped = row is not None and _row_value(row, "scene_scoped") == 1
+        if not scene_scoped:
+            required += ("valid_until_monotonic_s",)
         trusted_boot = self._boot_id or system_boot_id()
         with self._clock_guard:
             # An older read transaction may resume after a different thread
             # has already observed a later publication or its invalidation.
-            if cursor < self._highest_cursor or self._rejected_cursor == cursor:
+            if cursor < self._highest_cursor:
                 return changed
             self._highest_cursor = cursor
-            if (row is None or row["invalidated_at"] is not None or not trusted_boot or trusted_boot != head["boot_id"]
+            if (self._invalidated_cursor == cursor or row is not None and row["invalidated_at"] is not None
+                    or trusted_boot and head["boot_id"] and trusted_boot != head["boot_id"]):
+                self._invalidated_cursor = cursor
+                return invalidated
+            if (self._rejected_cursor == cursor or row is None or not trusted_boot or not head["boot_id"]
                     or any(head[field] is None for field in required)):
                 self._rejected_cursor = cursor
                 return changed
@@ -807,20 +849,32 @@ class ObservationContextReader:
                 return changed
             published = datetime.fromisoformat(row["published_at"])
             sampled = datetime.fromisoformat(head["sampled_at"])
-            if visible_at is not None and (published > visible_at or sampled > visible_at):
+            if visible_at is not None and (published > visible_at or (not scene_scoped and sampled > visible_at)):
                 return changed
             token = generation, cursor
             previous = self._latest_read
             rollback = previous is not None and previous[0] == token and monotonic_s >= previous[2] and at < previous[1]
-            if rollback or not clocks_agree(at, monotonic_s, published, published_s) or not clocks_agree(at, monotonic_s, sampled, sampled_s):
+            wall_lead = (max(published, sampled) - at).total_seconds()
+            if not rollback and 0 < wall_lead <= CLOCK_TOLERANCE_S:
+                # The wall and monotonic reads can straddle a concurrent sample.
+                return changed
+            # The writer checks continuity between native samples. A scene can
+            # outlive ordinary wall clock slew measured from its publication.
+            if (rollback or published > at or not clocks_agree(at, monotonic_s, sampled, sampled_s)
+                    or (not scene_scoped and not clocks_agree(at, monotonic_s, published, published_s))):
+                if scene_scoped:
+                    self._invalidated_cursor = cursor
+                    return invalidated
                 self._rejected_cursor = cursor
                 return changed
             observation = _decode(row)
-            if observation.valid_until <= at or monotonic_s >= head["valid_until_monotonic_s"]:
+            if observation.valid_until is not None and (
+                observation.valid_until <= at or monotonic_s >= head["valid_until_monotonic_s"]
+            ):
                 return RealtimeHead(None, "expired", cursor, generation)
             if monotonic_s > head["sample_deadline_s"]:
-                self._rejected_cursor = cursor
-                return changed
+                self._invalidated_cursor = cursor
+                return invalidated
             if previous is None or previous[0] != token or monotonic_s >= previous[2]:
                 self._latest_read = token, at, monotonic_s
         return RealtimeHead(observation, "fresh", cursor, generation, _row_value(row, "foreground_key"))
@@ -869,10 +923,14 @@ class ObservationContextReader:
                 FROM realtime_observation_head WHERE singleton=1""").fetchone()
             if head is None or (head["generation"], head["publication_cursor"]) != (generation, last):
                 return False
-            original = db.execute("""SELECT state, observed_at, context_revision FROM effective_observations
-                WHERE observation_id=?""", (first,)).fetchone()
+            original = db.execute("SELECT * FROM effective_observations WHERE observation_id=?", (first,)).fetchone()
             if original is None or (revision is not None and revision != original["context_revision"]):
                 return False
+            if _row_value(original, "scene_scoped") == 1 and db.execute("""
+                SELECT 1 FROM effective_observations WHERE observation_id>=? AND observation_id<?
+                AND scene_scoped=1 AND producer_generation=? AND invalidated_at IS NOT NULL LIMIT 1
+            """, (first, last, generation)).fetchone() is not None:
+                return True
             state = original["state"]
             different = db.execute("""SELECT 1 FROM effective_observations
                 WHERE observation_id>? AND observation_id<=? AND state<>?
@@ -961,6 +1019,7 @@ class ObservationContextReader:
             activities = _activity_details(connection, as_of=at, since=since, until=until)
             recent = _recent_activity_details(connection, as_of=at, since=since, until=until, details=activities)
             health = _capture_health(connection, at)
+            visual = _current_visual_detail(connection, head.current, as_of=at, details=recent or activities)
         current_id = head.publication_cursor if head.current is not None else None
         return ObservationContext(at, head.current, head.current_status, _history(rows, current_id), signals,
-                                  activities, health, since, until, recent)
+                                  activities, health, since, until, recent, visual)

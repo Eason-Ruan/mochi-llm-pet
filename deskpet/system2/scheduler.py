@@ -277,7 +277,7 @@ class Scheduler:
         if self.observation is None:
             return RealtimeBridge(RealtimeHead(None, "no_data"))
         if settings.observation_paused:
-            return RealtimeBridge(RealtimeHead(None, "context_changed"))
+            return RealtimeBridge(RealtimeHead(None, "context_changed", scene_invalidated=True))
         clock = sample_realtime_clock(self.clock.wall_now, self.clock.monotonic_now)
         if clock is None:
             return RealtimeBridge(RealtimeHead(None, "no_data"))
@@ -291,7 +291,9 @@ class Scheduler:
         except (sqlite3.Error, OSError, ValueError):
             return RealtimeBridge(RealtimeHead(None, "no_data"))
         head = bridge.head
-        if head.current is not None and not head.current.observed_at <= now < head.current.valid_until:
+        current = head.current
+        if current is not None and (now < current.observed_at
+                                    or (current.valid_until is not None and now >= current.valid_until)):
             return replace(bridge, head=replace(head, current=None, current_status="context_changed"))
         return bridge
 
@@ -373,11 +375,12 @@ class Scheduler:
         if locked is True:
             self._close(db, now, max(cursor, schedule["publication_cursor"]))
         if locked is not False:
-            return RealtimeHead(None, "context_changed", head.publication_cursor, head.producer_generation)
+            return replace(head, current=None, current_status="context_changed",
+                           scene_invalidated=head.scene_invalidated or locked is True)
         if head.current_status != "fresh" or head.current is None:
             return head
         if cursor <= schedule["closed_through_cursor"]:
-            return RealtimeHead(None, "context_changed", head.publication_cursor, head.producer_generation)
+            return replace(head, current=None, current_status="context_changed", scene_invalidated=True)
         if head.current.state in {"working", "away"}:
             # A valid working observation remains usable for the silent, urgent exception.
             self._close(db, now, max(0, cursor - 1))
@@ -467,11 +470,10 @@ class Scheduler:
                         db.execute("UPDATE system2_defer_context SET evidence=? WHERE id=?",
                                    (json.dumps(baseline), waiter["waiter_id"]))
                     continue
-                until = min(head.current.valid_until, deadline) if head.current else deadline
-            else:
-                if head.current_status != "fresh" or head.current is None:
-                    continue
-                until = min(head.current.valid_until, deadline)
+            elif head.current_status != "fresh" or head.current is None:
+                continue
+            observation_limit = head.current.valid_until if head.current else None
+            until = min(observation_limit, deadline) if observation_limit is not None else deadline
             event_id = self._event_id("observation_ready", waiter["waiter_id"])
             self._enqueue(db, event_id=event_id, kind="observation_ready", at=now, reason=waiter["purpose"],
                           task=task, valid_until=until, waiter_id=waiter["waiter_id"], head=head)
@@ -1015,6 +1017,16 @@ class Scheduler:
             observation_generation = previous["observation_generation"]
         if head is None:
             head = self._sync(db, now)
+        scene_bound = (context_revision is not None and observation_cursor is not None
+                       and observation_generation is not None)
+        # A heartbeat can win the race against the read clock. Revoke only on
+        # positive invalidation or a known change of source.
+        if scene_bound and (
+            self.observation is None or head.scene_invalidated
+            or (head.producer_generation is not None and head.producer_generation != observation_generation)
+            or (head.publication_cursor is not None and head.publication_cursor < observation_cursor)
+        ):
+            return "STALE_CONTEXT"
         if self._material_change(head, now, context_revision, observation_cursor, observation_generation):
             self._context_recheck(db, presentation_kind=presentation_kind, task=task,
                                   cursor=head.publication_cursor, generation=head.producer_generation, now=now)
@@ -1124,7 +1136,8 @@ class Scheduler:
         if current.state == "available" and not opportunity:
             raise SchedulerError("STALE_CONTEXT", "The interruption opportunity has closed")
         draft = task.draft
-        until = min(value for value in (current.valid_until, draft.opportunity_close_at,
+        delivery_limit = current.valid_until or now + _PRESENTATION_LEASE
+        until = min(value for value in (delivery_limit, draft.opportunity_close_at,
                                         draft.urgency_until if low else None) if value is not None)
         return ReminderAuthorization(head, task, opportunity, until, low, urgency)
 
@@ -1178,11 +1191,15 @@ class Scheduler:
                                                 reason_code=reason_code, now=now, db=tx)
             except SchedulerError as error:
                 return self._deny(error.code)
-            authority_limit = getattr(authority, "expires_at" if semantic else "observation_valid_until", None)
-            if not semantic and not self._matches_context(grant.head, now, context_revision, authority_limit,
+            authority_limit = getattr(authority, "expires_at", None)
+            observation_limit = None if semantic else getattr(authority, "observation_valid_until", None)
+            if not semantic and not self._matches_context(grant.head, now, context_revision, observation_limit,
                                                           cursor, generation):
                 return self._deny("STALE_CONTEXT")
-            valid_until = min(grant.valid_until, authority_limit) if authority_limit else grant.valid_until
+            valid_until = min(limit for limit in (grant.valid_until, authority_limit, observation_limit)
+                              if limit is not None)
+            if valid_until <= now:
+                return self._deny("EXPIRED_REQUEST")
             task = grant.task
             if level == "passive":
                 # Updating the menu must not claim or acknowledge the occurrence's primary delivery.

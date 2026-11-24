@@ -101,6 +101,44 @@ def test_locked_optional_database_does_not_delay_a_hard_deadline(tmp_path):
         assert len(env.delivery.commands) == 1
 
 
+def test_desktop_reads_retained_observation_while_its_producer_is_live(tmp_path, monkeypatch):
+    monkeypatch.setattr("deskpet.observation_v2.context.system_boot_id", lambda: "test-boot")
+    database = tmp_path / "observation.sqlite3"
+    settings = SettingsStore(tmp_path / "business.sqlite3")
+    initial = datetime(2026, 11, 25, tzinfo=UTC)
+    at = initial + timedelta(seconds=90)
+    mono = 190.0
+    observation = Observation("leisure", "working", "A video site is visible.", (), initial, None, 71)
+    with ObservationStore(database, live=True, boot_id="test-boot") as producer:
+        producer.begin_live_run(initial, monotonic_s=100.0, policy_generation=0)
+        producer.save_observation(observation, published_at=initial, monotonic_s=100.0)
+        with producer.connection:
+            producer._record_live_sample(at, mono)
+    monkeypatch.setattr("deskpet.m0.observation_input.sample_realtime_clock", lambda *_: (at, mono))
+    monkeypatch.setattr("deskpet.m0.observation_input.monotonic", lambda: mono)
+    reader = DesktopObservationInput(database, settings_path=settings.path)
+
+    assert reader.read_current(at) == (observation, "fresh")
+    assert reader.read_observation_context(at).current == observation
+    late_reader = DesktopObservationInput(database, settings_path=settings.path)
+    original_read = late_reader.reader.read_realtime_context
+
+    def time_passes_during_read(*args, **kwargs):
+        nonlocal at, mono
+        result = original_read(*args, **kwargs)
+        if kwargs["include_current"]:
+            at += timedelta(seconds=5)
+            mono += 5
+        return result
+
+    monkeypatch.setattr(late_reader.reader, "read_realtime_context", time_passes_during_read)
+    assert late_reader.read_observation_context(at).current is None
+
+    settings.update(expected_version=settings.read().version, observation_paused=True)
+    assert reader.read_current(at)[0] is None
+    assert reader.read_observation_context(at).current is None
+
+
 def test_supervisor_releases_child_on_pause_and_starts_with_updated_policy(tmp_path, monkeypatch):
     children = []
 

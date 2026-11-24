@@ -23,7 +23,7 @@ class LiveObservation:
         self.cursor = 1
 
     def read_realtime_bridge(self, now, **_):
-        if now >= self.current.valid_until:
+        if self.current.valid_until is not None and now >= self.current.valid_until:
             return RealtimeBridge(RealtimeHead(None, "expired", self.cursor, "producer-test"))
         return RealtimeBridge(RealtimeHead(self.current, "fresh", self.cursor, "producer-test"))
 
@@ -79,6 +79,16 @@ def test_legacy_motion_shares_slot_and_is_consumed_once(pet, monkeypatch):
     assert store.claim(delivery_id, clock.wall_now()) is None
     assert not scheduler.claim_opportunity(opportunity_id=opportunity_id, delivery_id="proposal",
                                            now=clock.wall_now())
+
+
+@pytest.mark.parametrize("elapsed, permitted", [(16, True), (30, False)])
+def test_legacy_pet_intent_uses_admission_deadline_with_continuous_evidence(pet, monkeypatch, elapsed, permitted):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
+    clock, observation, _, _, _, store = pet
+    observation.current = replace(observation.current, valid_until=None)
+    delivery_id, _ = offer(pet)
+    clock.advance(elapsed)
+    assert (store.claim(delivery_id, clock.wall_now()) is not None) is permitted
 
 
 @pytest.mark.parametrize("invalidate", ["revision", "expiry", "lock", "recipient", "consent"])

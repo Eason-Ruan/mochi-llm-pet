@@ -31,6 +31,7 @@ from .vision import MultimodalScreenObservation, ScreenModel, ScreenObservation,
 REPLAY_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
 LIVE_UPDATE_INTERVAL_S = 30.0
 LIVE_VISION_WAIT_S = 2.0
+VISION_JOB_LIMIT_S = 15.0
 _JOB_CHECK_INTERVAL_S = 0.05
 
 
@@ -119,6 +120,7 @@ class ObservationStore(ActivityStore):
             if live:
                 self._add_columns("effective_observations", {
                     "foreground_key": "TEXT", "producer_generation": "TEXT", "screen_locked": "INTEGER",
+                    "scene_scoped": "INTEGER NOT NULL DEFAULT 0", "visual_capture_id": "TEXT",
                 })
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS realtime_observation_head (
@@ -232,6 +234,7 @@ class ObservationStore(ActivityStore):
         activity: Activity | None = None,
     ) -> None:
         """Refresh the source clock evidence inside the Activity transaction."""
+        sample_limit_s = 3 * self._poll_interval_s
         self.connection.execute("""
             UPDATE realtime_observation_head
             SET sampled_at = ?, sampled_monotonic_s = ?, sample_deadline_s = ?,
@@ -239,12 +242,19 @@ class ObservationStore(ActivityStore):
                 activity_id = ?, app_name = ?, screen_locked = ?, idle_s = ?, system_sampled_at = ?
             WHERE singleton = 1
         """, (
-            _timestamp(as_of), monotonic_s, monotonic_s + 3 * self._poll_interval_s,
+            _timestamp(as_of), monotonic_s, monotonic_s + sample_limit_s,
             sample.screen_locked if sample else None,
             activity.activity_id if activity else None, activity.app_name if activity else None,
             sample.screen_locked if sample else None, sample.idle_s if sample else None,
             _timestamp(sample.system_sampled_at) if sample and sample.system_sampled_at else None,
         ))
+        # The legacy wall-time slot stores sampler coverage for historical reads
+        # of scene-scoped rows. The realtime reader validates the monotonic head.
+        self.connection.execute("""
+            UPDATE effective_observations SET valid_until = ?
+            WHERE observation_id = (SELECT publication_cursor FROM realtime_observation_head WHERE singleton = 1)
+                AND scene_scoped = 1 AND invalidated_at IS NULL
+        """, (_timestamp(as_of + timedelta(seconds=sample_limit_s)),))
 
     def save_capture_health(
         self, status: str, at: datetime, *, reason: str | None = None, preserve_status: bool = False,
@@ -320,13 +330,19 @@ class ObservationStore(ActivityStore):
 
     def save_observation(
         self, observation: Observation, *, published_at: datetime, monotonic_s: float | None = None,
+        invalidate_previous: bool = False,
     ) -> None:
         data = observation.to_dict()
         data["reason_codes"] = json.dumps(data["reason_codes"], separators=(",", ":"))
         data["observed_at"] = _timestamp(observation.observed_at)
-        data["valid_until"] = _timestamp(observation.valid_until)
+        scene_scoped = observation.valid_until is None
+        if scene_scoped and not self._live:
+            raise ValueError("Scene-scoped observations require a live store")
+        data["valid_until"] = _timestamp(observation.valid_until or published_at)
         data["published_at"] = _timestamp(published_at)
         with self.connection:
+            if invalidate_previous:
+                self._invalidate_current(published_at)
             cursor = self.connection.execute("""
                 INSERT INTO effective_observations
                     (activity_kind, state, summary, reason_codes, observed_at, valid_until,
@@ -336,23 +352,24 @@ class ObservationStore(ActivityStore):
             """, data)
             if self._live:
                 deadline = None
-                if monotonic_s is not None:
+                if monotonic_s is not None and observation.valid_until is not None:
                     deadline = monotonic_s + (observation.valid_until - published_at).total_seconds()
-                self._record_publication_evidence(cursor.lastrowid)
+                self._record_publication_evidence(cursor.lastrowid, observation)
                 self.connection.execute("""
                     UPDATE realtime_observation_head
                     SET publication_cursor = ?, published_monotonic_s = ?, valid_until_monotonic_s = ?
                     WHERE singleton = 1
                 """, (cursor.lastrowid, monotonic_s, deadline))
                 if (observation.state in {"working", "away"} and monotonic_s is not None
-                        and observation.observed_at <= published_at < observation.valid_until):
+                        and observation.observed_at <= published_at
+                        and (scene_scoped or published_at < observation.valid_until)):
                     self._record_live_departure(observation.state)
 
-    def _record_publication_evidence(self, cursor):
+    def _record_publication_evidence(self, cursor: int, observation: Observation) -> None:
         # Correlate a pending decision with the exact sample it received. Keep
         # only an opaque local foreground fingerprint and the sampled lock flag.
         row = self.connection.execute("""
-            SELECT h.generation, h.app_name, h.screen_locked, a.domain, a.document_status
+            SELECT h.generation, h.app_name, h.screen_locked, h.sampled_at, a.domain, a.document_status
             FROM realtime_observation_head h LEFT JOIN activities a ON a.activity_id=h.activity_id
             WHERE h.singleton=1
         """).fetchone()
@@ -363,10 +380,18 @@ class ObservationStore(ActivityStore):
         if (row["screen_locked"] == 0 and app and not is_mochi_app(app)
                 and row["document_status"] != "private_window"):
             key = sha256(json.dumps([app.casefold(), row["domain"]]).encode()).hexdigest()
+        scene_scoped = observation.valid_until is None
+        coverage_until = None
+        if scene_scoped and row["sampled_at"] is not None:
+            sampled_at = datetime.fromisoformat(row["sampled_at"])
+            coverage_until = _timestamp(sampled_at + timedelta(seconds=3 * self._poll_interval_s))
         self.connection.execute("""
-            UPDATE effective_observations SET producer_generation=?, foreground_key=?, screen_locked=?
+            UPDATE effective_observations
+            SET producer_generation=?, foreground_key=?, screen_locked=?, scene_scoped=?, visual_capture_id=?,
+                valid_until=coalesce(?, valid_until)
             WHERE observation_id=?
-        """, (row["generation"], key, row["screen_locked"], cursor))
+        """, (row["generation"], key, row["screen_locked"], scene_scoped, observation.visual_capture_id,
+              coverage_until, cursor))
 
     def counts(self) -> dict:
         activities = self.connection.execute("SELECT count(*) FROM activities").fetchone()[0]
@@ -805,6 +830,7 @@ class _MultimodalJob:
     activity_id: int
     document_source: str | None
     video_hint: bool
+    capture_stamp: int
     permitted: Callable[[], bool]
     owns_scene: Callable[[], bool]
     scope: CloudRouteSnapshot | None
@@ -815,8 +841,11 @@ class _MultimodalJob:
 class _ScopedScreen:
     screen: MultimodalScreenObservation
     scope: CloudRouteSnapshot | None
+    capture_stamp: int
 
-    def comparable_to(self, scope: CloudRouteSnapshot | None) -> bool:
+    def comparable_to(self, scope: CloudRouteSnapshot | None, capture_stamp: int) -> bool:
+        if self.capture_stamp != capture_stamp:
+            return False
         if self.scope is None or scope is None:
             return self.scope is scope
         return (self.scope.route_generation, self.scope.consent_generation) == (
@@ -898,7 +927,6 @@ def run_live_multimodal(
     raw_scene_changed = False
     latest = None
     visual = None
-    previous_visual = None
     job = None
     uploads = 0
     immediate_update = False
@@ -919,7 +947,7 @@ def run_live_multimodal(
         schedule = CaptureSchedule(last_upload_s=store.last_upload(datetime.now(UTC), next_poll))
 
         def record_sample(sample: ActivitySample, activity: Activity | None, boundary: bool, _switched: bool) -> None:
-            nonlocal activity_floor, activity_id, last_sample, latest, visual, previous_visual, immediate_update
+            nonlocal activity_floor, activity_id, last_sample, latest, visual, immediate_update
             prior_activity = activity_id
             activity_id = activity.activity_id if activity is not None else None
             changed = (
@@ -936,7 +964,7 @@ def run_live_multimodal(
                     observer.reset_live_context()
             if changed:
                 store._invalidate_current(sample.observed_at)
-                latest = visual = previous_visual = None
+                latest = visual = None
                 immediate_update = True
             if sample.screen_locked is True and (last_sample is None or last_sample.screen_locked is not True):
                 store._record_live_departure("locked")
@@ -987,7 +1015,7 @@ def run_live_multimodal(
             return (last_sample is not None and mono - last_sample.monotonic_s <= 3 * ACTIVITY_POLL_S
                     and clocks_agree(at, mono, last_sample.observed_at, last_sample.monotonic_s))
 
-        def refresh(*, publish: bool, outcome: str = "local") -> None:
+        def refresh(*, publish: bool, outcome: str = "local", scene_changed: bool = False) -> None:
             nonlocal latest
             at, mono = datetime.now(UTC), time.monotonic()
             if stopped() or not coverage_current(at, mono):
@@ -998,32 +1026,44 @@ def run_live_multimodal(
             activities = activities_at(at)
             screens = [visual.screen] if visual is not None else []
             activity_kind = visual.screen.activity_kind if visual is not None else "unknown"
-            estimate = local_outcome(observer.features(activities, screens, as_of=at, live=True), activity_kind)
+            estimate = local_outcome(
+                observer.features(activities, screens, as_of=at, live=True, retain_screen=True), activity_kind,
+            )
             if latest is not None:
                 published = (latest.activity_kind, latest.state, latest.summary, latest.reason_codes)
-                if latest.valid_until <= at or estimate != published:
-                    store.invalidate_current(at)
-                    latest = None
-            if not publish:
-                # A short availability opportunity can fall between periodic publications.
-                publish = latest is None and estimate[1] == "available"
-            if not publish:
+                if estimate == published and outcome != "model" and not scene_changed:
+                    return
+            elif not publish and estimate[1] != "available":
                 return
-            result = observer.observe_local(activities, screens, as_of=at, activity_kind=activity_kind)
+            result = observer.observe_local(activities, screens, as_of=at, activity_kind=activity_kind,
+                                            scene_scoped=True, scene_changed=scene_changed)
             if result is not None:
-                latest = replace(result, context_revision=result.context_revision + revision_base)
-                store.save_observation(latest, published_at=at, monotonic_s=mono)
+                capture_id = (
+                    visual.screen.capture_id if visual is not None and "screen_context" in result.reason_codes else None
+                )
+                observation = replace(result, context_revision=result.context_revision + revision_base,
+                                      visual_capture_id=capture_id)
+                store.save_observation(observation, published_at=at, monotonic_s=mono,
+                                       invalidate_previous=scene_changed and latest is not None)
+                latest = observation
                 outcomes[outcome] += 1
 
-        def refresh_with_cached_screen(*, publish: bool) -> None:
-            nonlocal visual, previous_visual
+        def refresh_with_cached_screen(*, publish: bool, scene_changed: bool) -> None:
+            nonlocal visual
             with admit_scope(visual.scope if visual is not None else None) as authorized:
-                if not authorized:
-                    visual = previous_visual = None
-                refresh(publish=publish)
+                revoked = visual is not None and (not authorized or capture_stamp() != visual.capture_stamp)
+                if revoked:
+                    visual = None
+                refresh(publish=publish, scene_changed=revoked or scene_changed)
+
+        def revoke_visual() -> None:
+            nonlocal visual
+            if visual is not None:
+                visual = None
+                refresh(publish=True, scene_changed=True)
 
         def acquire(sample: ActivitySample) -> None:
-            nonlocal immediate_update, job, uploads, visual, previous_visual
+            nonlocal immediate_update, job, uploads
             activity = recorder.current_activity
             stamp = capture_stamp()
             restriction = recorder.capture_ineligibility
@@ -1116,7 +1156,7 @@ def run_live_multimodal(
                 store.save_capture_health("source_restricted", after.observed_at,
                                           reason="foreground_changed_during_capture")
                 if immediate_update:
-                    refresh(publish=True)
+                    refresh(publish=True, scene_changed=True)
                     immediate_update = False
                 return
             if failure is not None:
@@ -1125,21 +1165,21 @@ def run_live_multimodal(
                 if status == "capture_failed" and activity is not None and not context_only:
                     store.set_capture_status(activity.activity_id, "failed")
                 store.save_capture_health(status, after.observed_at, reason=reason)
+                if reason == "screen_recording_permission_denied":
+                    revoke_visual()
                 return
             if not permitted() or not sample.observed_at <= acquired_at <= after.observed_at:
                 return
             if context_only:
                 schedule.defer_probe(after.monotonic_s)
                 store.save_capture_health("skipped", acquired_at, reason="foreground_context_only")
-                if visual is not None or previous_visual is not None:
-                    visual = previous_visual = None
-                    refresh(publish=True)
+                revoke_visual()
                 return
             assert activity is not None and thumbnail is not None
             now = time.monotonic()
             if not schedule.inspect(thumbnail, now):
                 store.save_capture_health("skipped", acquired_at, reason="waiting_for_visual_change",
-                                          preserve_status=previous_visual is not None)
+                                          preserve_status=visual is not None)
                 return
             store.set_capture_status(activity.activity_id, "captured")
             signals = observer.features(activities_at(acquired_at), [], as_of=acquired_at, live=True)
@@ -1152,25 +1192,28 @@ def run_live_multimodal(
                 foreground_run_s=signals["current_foreground_run_s"],
                 foreground_switches=signals["foreground_switches"], screen_locked=signals["screen_locked"],
                 recent_os_input=signals["recent_os_input"] if signals["idle_s"] is not None else None,
-                previous=(previous_visual.screen if previous_visual is not None and previous_visual.comparable_to(scope)
+                previous=(visual.screen if visual is not None and visual.comparable_to(scope, stamp)
                           else None),
             )
             capture_id = uuid4().hex
-            deadline_s = after.monotonic_s + observer.ttl_seconds - (after.observed_at - acquired_at).total_seconds()
+            deadline_s = after.monotonic_s + VISION_JOB_LIMIT_S - (after.observed_at - acquired_at).total_seconds()
             scene_identity = last_desktop_identity
 
             def still_owns_scene() -> bool:
                 at, mono = datetime.now(UTC), time.monotonic()
-                return (activity_id == activity.activity_id and mono < deadline_s and coverage_current(at, mono)
+                return (activity_id == activity.activity_id and coverage_current(at, mono)
                         and last_sample is not None and last_sample.screen_locked is False
                         and (unfiltered_desktop or recorder.capture_eligible)
                         and (not all_displays or last_desktop_identity == scene_identity))
 
+            def send_permitted() -> bool:
+                return time.monotonic() < deadline_s and still_owns_scene()
+
             if grant is not LOCAL_CAPTURE:
-                grant = replace(grant, send_permitted=still_owns_scene)
+                grant = replace(grant, send_permitted=send_permitted)
 
             def permitted_to_send() -> bool:
-                return permitted() and still_owns_scene()
+                return permitted() and send_permitted()
 
             def request() -> ScreenObservation:
                 if not permitted_to_send():
@@ -1190,7 +1233,7 @@ def run_live_multimodal(
                 schedule.recommend(None, now, video=True)
             uploads += 1
             job = _MultimodalJob(
-                activity.activity_id, document_source, video_hint, permitted, still_owns_scene, scope,
+                activity.activity_id, document_source, video_hint, stamp, permitted, still_owns_scene, scope,
                 workers.submit(request),
             )
 
@@ -1204,11 +1247,10 @@ def run_live_multimodal(
                 accept(finished, result, finishing=finishing, permission=authorized and finished.permitted())
 
         def accept(finished: _MultimodalJob, result: ScreenObservation, *, finishing: bool, permission: bool) -> None:
-            nonlocal visual, previous_visual
+            nonlocal visual
             at, mono = datetime.now(UTC), time.monotonic()
             same_activity = finished.activity_id == activity_id
-            realtime = (not finishing and permission and finished.owns_scene()
-                        and at < result.captured_at + timedelta(seconds=observer.ttl_seconds))
+            realtime = not finishing and permission and finished.owns_scene()
             if not permission:
                 result = ScreenObservation(result.capture_id, result.activity_id, result.captured_at, "redacted_out", result.model_id)
             store.save_screen(result, processed_at=max(at, result.captured_at), realtime_eligible=realtime,
@@ -1218,16 +1260,20 @@ def run_live_multimodal(
                 if getattr(result, "filtered_fields", ()):
                     health = "filtered"
                 store.save_capture_health(health, at)
-            if isinstance(result, MultimodalScreenObservation) and result.status == "ready" and same_activity:
-                previous_visual = _ScopedScreen(result, finished.scope)
-                if realtime:
-                    visual = previous_visual
-                    # Only a native foreground hint can enable the slower video cadence for a desktop composite.
-                    video = finished.video_hint if all_displays else (
-                        result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
-                    )
-                    schedule.recommend(result.next_check, mono, video=video)
-                    refresh(publish=True, outcome="model")
+            if isinstance(result, MultimodalScreenObservation) and result.status == "ready" and realtime:
+                previous = visual.screen if visual is not None else None
+                scene_changed = previous is not None and (
+                    (result.screen_kind != "unknown" and previous.screen_kind != result.screen_kind)
+                    or (result.activity_kind != "unknown" and previous.activity_kind != result.activity_kind)
+                    or (result.document_name is not None and previous.document_name != result.document_name)
+                )
+                visual = _ScopedScreen(result, finished.scope, finished.capture_stamp)
+                # Only a native foreground hint can enable the slower video cadence for a desktop composite.
+                video = finished.video_hint if all_displays else (
+                    result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
+                )
+                schedule.recommend(result.next_check, mono, video=video)
+                refresh(publish=True, outcome="model", scene_changed=scene_changed)
             if not realtime:
                 outcomes["discarded"] += 1
 
@@ -1243,7 +1289,7 @@ def run_live_multimodal(
                         recorder.close()
                     observe_sample(sample)
                     periodic = mono >= next_update
-                    refresh_with_cached_screen(publish=periodic or immediate_update)
+                    refresh_with_cached_screen(publish=periodic or immediate_update, scene_changed=immediate_update)
                     immediate_update = False
                     if periodic:
                         next_update = mono + model_interval_s
@@ -1260,10 +1306,8 @@ def run_live_multimodal(
                     stop_event.wait(wait_s)
         finally:
             recorder.close()
-        halted = stopped()
-        if halted:
             store.invalidate_current(datetime.now(UTC))
-            latest = None
+        halted = stopped()
         # Interrupt pending runtime work before the executor joins its thread.
         if job is not None and not job.future.done():
             vision_lifetime.close()
@@ -1272,6 +1316,6 @@ def run_live_multimodal(
         as_of = datetime.now(UTC)
         return {
             **store.counts(), "visual_attempts": uploads, "state_runs": dict(outcomes),
-            "last_observation": latest.to_dict() if latest is not None and latest.valid_until > as_of
+            "last_observation": latest.to_dict() if not halted and latest is not None
             and coverage_current(as_of, time.monotonic()) else None, "native_probe_errors": sampler.errors,
         }

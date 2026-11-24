@@ -207,14 +207,16 @@ class PetIntentStore:
             return {"status": "rejected", "error_code": "UNSUPPORTED_CHANNEL"}
         if not semantic and (
             authority.context_revision is None or authority.observation_cursor is None
-            or authority.observation_generation is None or authority.observation_valid_until is None
+            or authority.observation_generation is None
         ):
             return {"status": "rejected", "error_code": "STALE_CONTEXT"}
-        expires_at = authority.expires_at if semantic else min(authority.expires_at, authority.observation_valid_until)
+        expires_at = authority.expires_at
+        if not semantic and authority.observation_valid_until is not None:
+            expires_at = min(expires_at, authority.observation_valid_until)
         context = {
             "context_revision": authority.context_revision, "observation_cursor": authority.observation_cursor,
             "observation_generation": authority.observation_generation,
-            "context_valid_until": expires_at if semantic else authority.observation_valid_until,
+            "context_valid_until": expires_at,
         }
         event_key = authority.trigger_id if semantic else f"{authority.admission_id}:{authority.call_id}"
         delivery_id = "pet-" + sha256(

@@ -33,6 +33,24 @@ class DesktopObservationInput:
         settings = SettingsStore.read_at(self.settings_path, timeout=timeout)
         return not settings.observation_paused, settings.observation_generation
 
+    def _current_survived_read(self, observation, current_at, started, policy):
+        if self._policy(timeout=_CONTEXT_BUSY_TIMEOUT_S) != policy:
+            return False
+        if observation.valid_until is not None:
+            return monotonic() - started < (observation.valid_until - current_at).total_seconds()
+        reading = sample_realtime_clock(lambda: datetime.now(UTC), monotonic)
+        if reading is None:
+            return False
+        at, sampled_monotonic = reading
+        head = self.reader.read_realtime_head(
+            at, monotonic_s=sampled_monotonic, policy_generation=policy[1],
+        )
+        current = head.current
+        return not head.scene_invalidated and (
+            current is None or (current.context_revision, current.visual_capture_id)
+            == (observation.context_revision, observation.visual_capture_id)
+        )
+
     def read_current(self, as_of):
         try:
             allowed, generation = self._policy()
@@ -44,9 +62,12 @@ class DesktopObservationInput:
             sampled_at, sampled_monotonic = reading
             current = self.reader.read_realtime_current(sampled_at, monotonic_s=sampled_monotonic,
                                                         policy_generation=generation)
-            if current[0] is not None and not current[0].observed_at <= as_of < current[0].valid_until:
-                return None, "context_changed"
-            if current[0] is not None and self._policy() != (allowed, generation):
+            observation = current[0]
+            if observation is not None and (
+                observation.observed_at > as_of
+                or (observation.valid_until is not None and as_of >= observation.valid_until)
+                or self._policy() != (allowed, generation)
+            ):
                 return None, "context_changed"
         except (sqlite3.Error, OSError, ValueError) as exc:
             self._failed(exc)
@@ -67,9 +88,8 @@ class DesktopObservationInput:
                 include_current=allowed and reading is not None,
                 busy_timeout_s=timeout, history_start=history_start, history_end=history_end,
             )
-            if context.current is not None and (
-                self._policy(timeout=timeout) != (allowed, generation)
-                or monotonic() - started >= (context.current.valid_until - current_at).total_seconds()
+            if context.current is not None and not self._current_survived_read(
+                context.current, current_at, started, (allowed, generation),
             ):
                 context = self.reader.read_realtime_context(
                     as_of, include_current=False, busy_timeout_s=timeout,

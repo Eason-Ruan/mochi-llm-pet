@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import sqlite3
 
@@ -157,6 +158,65 @@ def test_unfiltered_summary_reaches_activity_context_under_existing_sharing_cont
         assert summary not in str(project_observation_context(
             context, share_summary=True, excluded_apps=(app_name.casefold(),),
         ))
+
+
+def test_scene_visual_outlives_history_range_while_sampler_is_current(tmp_path):
+    path = tmp_path / "live.sqlite"
+    reader = ObservationContextReader(path, boot_id="test-boot")
+    with ObservationStore(path, live=True, boot_id="test-boot") as store:
+        store.begin_live_run(NOW, monotonic_s=100, policy_generation=5)
+        recorder = ActivityRecorder(store)
+        initial = ActivitySample(NOW, 100, app_name="Editor", screen_locked=False, idle_s=1,
+                                 system_sampled_at=NOW)
+        recorder.observe(initial)
+        activity = recorder.current_activity
+        with store.connection:
+            store._record_live_sample(NOW, 100, sample=initial, activity=activity)
+        store.save_screen(MultimodalScreenObservation(
+            "retained", activity.activity_id, NOW, "ready", "fixture", "document", None, None,
+            activity_kind="work", scene_elements=("page canvas",),
+        ), processed_at=NOW)
+        store.save_observation(
+            Observation("work", "working", "The visible interface includes page canvas.",
+                        ("screen_context",), NOW, None, 1, visual_capture_id="retained"),
+            published_at=NOW, monotonic_s=100,
+        )
+
+        # Summarize continuous sampling after an hour and small cumulative wall-clock slew.
+        wall = NOW + timedelta(seconds=3610.1)
+        mono = 3710
+        confirmed_activity = replace(activity, ended_at=wall, duration_s=3610, system_sampled_at=wall)
+        refreshed = replace(initial, observed_at=wall, monotonic_s=mono, system_sampled_at=wall)
+        with store.connection:
+            store._extend(confirmed_activity)
+            store._record_live_sample(wall, mono, sample=refreshed, activity=confirmed_activity)
+
+        raced = reader.read_realtime_head(wall - timedelta(milliseconds=5), monotonic_s=mono - 0.005, policy_generation=5)
+        assert raced.current is None and not raced.scene_invalidated
+        admission_at = wall - timedelta(milliseconds=1)
+        admitted = reader.read_realtime_context(admission_at, current_at=wall, monotonic_s=mono, policy_generation=5)
+        assert admitted.current is not None and admitted.current_context.observed_at is None
+        view = reader.read_realtime_context(wall, monotonic_s=mono, policy_generation=5).to_dict()
+        assert view["current"]["observed_at"] == NOW.isoformat()
+        assert view["current"]["valid_until"] is None
+        assert view["last_observed_activity"]["relation"] == "current"
+        assert view["last_observed_activity"]["observed_at"] == NOW.isoformat()
+        assert view["last_observed_activity"]["scene_elements"] == ["page canvas"]
+        assert all(segment["first_observed_at"] >= view["history_1h"]["from_at"]
+                   for segment in view["history_1h"]["segments"])
+
+        rollback_reader = ObservationContextReader(path, boot_id="test-boot")
+        assert rollback_reader.read_realtime_head(wall, monotonic_s=mono, policy_generation=5).current
+        rollback = rollback_reader.read_realtime_head(
+            wall - timedelta(seconds=1), monotonic_s=mono + 1, policy_generation=5,
+        )
+        assert rollback.current is None and rollback.scene_invalidated
+
+        missing_at = wall + timedelta(seconds=5)
+        lost = reader.read_realtime_head(missing_at, monotonic_s=mono + 5, policy_generation=5)
+        assert lost.current is None and lost.scene_invalidated
+        assert reader.read_current(missing_at) == (None, "context_changed")
+        assert reader.read_current(wall)[0].visual_capture_id == "retained"
 
 
 def test_document_history_stays_timed_and_separate_from_interruptibility(tmp_path):

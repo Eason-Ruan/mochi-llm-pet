@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -41,14 +42,17 @@ class Desktop:
     def reopen_scheduler(self):
         return Scheduler(self.path, clock=self.clock, observation=self.reader)
 
-    def publish(self, state='available', revision=71, ttl=15, *, seconds=0):
+    def sample(self, seconds=0):
         self.clock.advance(seconds)
-        mono = self.clock.monotonic_now()
         with self.observation.connection:
-            self.observation._record_live_sample(self.now, mono)
+            self.observation._record_live_sample(self.now, self.clock.monotonic_now())
+
+    def publish(self, state='available', revision=71, ttl=15, *, seconds=0):
+        self.sample(seconds)
+        expiry = self.now + timedelta(seconds=ttl) if ttl is not None else None
         self.observation.save_observation(
-            Observation('work', state, None, (), self.now, self.now + timedelta(seconds=ttl), revision),
-            published_at=self.now, monotonic_s=mono,
+            Observation('work', state, None, (), self.now, expiry, revision),
+            published_at=self.now, monotonic_s=self.clock.monotonic_now(),
         )
 
     def reminder(self, name, **values):
@@ -274,6 +278,37 @@ def test_wait_rollback_transaction_and_expired_publication_do_not_authorize(desk
     desktop.publish()
     recovered.poll()
     assert [event.publication_cursor for event in recovered.pending_wakes()] == [2]
+
+
+def test_wait_wake_uses_its_own_deadline_with_continuous_live_observation(desktop):
+    desktop.enable_focus_waits()
+    deadline = desktop.now + timedelta(seconds=25)
+    desktop.scheduler.register_wait(purpose='focus_suggestion', after_cursor=0, valid_until=deadline)
+    desktop.publish(ttl=None)
+    desktop.scheduler.poll()
+    wake, = desktop.scheduler.pending_wakes()
+    for _ in range(20):
+        desktop.sample(1)
+        desktop.scheduler.poll()
+    assert desktop.scheduler.pending_wakes() == (wake,)
+    desktop.clock.advance(5)
+    assert desktop.scheduler.pending_wakes() == ()
+
+
+def test_legacy_soft_reminder_can_use_continuous_live_observation(desktop, legacy_background):
+    task = desktop.reminder("drink")
+    desktop.publish(ttl=None)
+    admitted = desktop.authority()
+    admitted.expires_at = desktop.now + timedelta(seconds=32)
+    for _ in range(20):
+        desktop.sample(1)
+        desktop.scheduler.poll()
+    decision = desktop.present(task.occurrence_id, authority=admitted)
+    assert decision["status"] == "pending"
+    desktop.tasks.pump()
+    command, = desktop.delivery.commands
+    assert command.expires_at == admitted.expires_at
+    assert desktop.present(task.occurrence_id, authority=admitted)["delivery_id"] == command.delivery_id
 
 
 def test_rollback_never_allows_previous_observation_or_queued_effect(desktop, legacy_background):
@@ -585,11 +620,29 @@ def test_unscoped_task_response_does_not_cross_conflicting_reminder_owners(deskt
 
 def test_material_change_rechecks_once_and_lock_unknown_blocks_detail(desktop):
     task = desktop.reminder("handoff")
-    desktop.publish("working")
+    desktop.publish("working", ttl=None)
+    original = desktop.scheduler.snapshot(desktop.now)
     assert desktop.present(task.occurrence_id)["status"] == "pending"
     desktop.tasks.pump()
     command, = desktop.delivery.commands
-    desktop.publish("away", revision=72, seconds=1)
+    for _ in range(20):
+        desktop.sample(1)
+        desktop.scheduler.poll()
+        current = desktop.scheduler.snapshot(desktop.now)
+        assert (current["current_status"], current["current"], current["publication_cursor"]) == (
+            "fresh", original["current"], original["publication_cursor"],
+        )
+        assert desktop.scheduler.presentation_permit(
+            now=desktop.now, presentation_kind="reminder", channel="pet_card",
+            context_valid_until=command.expires_at, recheck_key=command.delivery_id,
+        )
+    desktop.publish("working", revision=72, ttl=None, seconds=1)
+    assert desktop.scheduler.presentation_permit(
+        now=desktop.now, presentation_kind="reminder", channel="pet_card",
+        context_valid_until=command.expires_at, recheck_key=command.delivery_id,
+    )
+    assert all(event.reason != "presentation_context_changed" for event in desktop.scheduler.pending_wakes())
+    desktop.publish("away", revision=73, ttl=None, seconds=1)
     ledger = PresentationLedger(desktop.path, authorize_early=desktop.scheduler.authorize_qt)
     assert not ledger.permit_qt(command, desktop.now)
     assert not ledger.permit_qt(command, desktop.now)
@@ -605,6 +658,49 @@ def test_material_change_rechecks_once_and_lock_unknown_blocks_detail(desktop):
     desktop.settings.update(expected_version=desktop.settings.read().version, allow_system_notifications=True)
     assert desktop.present(another.occurrence_id, presentation={"channel": "os_notification"})[
         "status"] == "pending"
+
+
+@pytest.mark.parametrize("source_change", ["unavailable", "restarted", "invalidated"])
+def test_scene_bound_presentation_requires_its_original_live_source(desktop, source_change):
+    desktop.publish(ttl=None)
+    authority = desktop.authority()
+    scene = {
+        "context_revision": authority.context_revision,
+        "observation_cursor": authority.observation_cursor,
+        "observation_generation": authority.observation_generation,
+    }
+    permit = desktop.scheduler.presentation_permit
+    assert permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="scene", capture=True, **scene)
+    assert permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="history", capture=True)
+    if source_change == "unavailable":
+        desktop.scheduler.observation = None
+    elif source_change == "restarted":
+        desktop.clock.advance(1)
+        desktop.observation.begin_live_run(desktop.now, monotonic_s=desktop.clock.monotonic_now())
+        desktop.publish(revision=72, ttl=None)
+    else:
+        desktop.sample(1)
+        desktop.observation.invalidate_current(desktop.now)
+    assert not permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="scene")
+    assert not permit(now=desktop.now, presentation_kind="pet_presentation", capture=True, **scene)
+    assert permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="history")
+
+
+def test_transient_live_read_does_not_revoke_a_scene_bound_presentation(desktop, monkeypatch):
+    desktop.publish(ttl=None)
+    authority = desktop.authority()
+    permit = desktop.scheduler.presentation_permit
+    assert permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="scene", capture=True,
+                  context_revision=authority.context_revision, observation_cursor=authority.observation_cursor,
+                  observation_generation=authority.observation_generation)
+    read = desktop.reader.read_realtime_bridge
+
+    def racing_heartbeat(*args, **kwargs):
+        bridge = read(*args, **kwargs)
+        return replace(bridge, head=replace(bridge.head, current=None, current_status="context_changed"))
+
+    monkeypatch.setattr(desktop.reader, "read_realtime_bridge", racing_heartbeat)
+    assert permit(now=desktop.now, presentation_kind="pet_presentation", recheck_key="scene")
 
 
 def test_no_evidence_can_authorize_and_expired_soft_reminder_does_not_display(desktop):

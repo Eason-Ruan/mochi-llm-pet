@@ -22,7 +22,7 @@ from .openai_cloud import (
     RoutedObservationModel, delete_route_credential, store_route_credential, verify_cloud_route,
 )
 from .pipeline import (
-    LIVE_UPDATE_INTERVAL_S, run_live_multimodal, run_replay, run_replay_multimodal,
+    LIVE_UPDATE_INTERVAL_S, VISION_JOB_LIMIT_S, run_live_multimodal, run_replay, run_replay_multimodal,
 )
 from .routes import (
     OFFICIAL_BASE_URL, OLLAMA, STATE, VISION, CloudRoute, ObservationCloudSettings, _normalize_base_url,
@@ -178,7 +178,8 @@ def main(*, stop_event: Event | None = None) -> None:
     common.add_argument("--vision-model", default="qwen3-vl:2b-instruct")
     common.add_argument("--timeout-s", type=_positive, default=90.0, help="model request timeout ceiling")
     common.add_argument("--window-s", type=_positive, default=60.0)
-    common.add_argument("--ttl-s", type=_positive, default=15.0)
+    common.add_argument("--ttl-s", type=_positive, default=15.0,
+                        help="replay observation lifetime and native signal coverage window")
     commands = parser.add_subparsers(dest="mode", required=True)
     _cloud_commands(commands)
     replay = commands.add_parser("replay", parents=[common], help="replay a local screen recording")
@@ -283,7 +284,7 @@ def main(*, stop_event: Event | None = None) -> None:
         if (arguments.cloud_settings is None and arguments.vision_model == arguments.state_model
                 and vision_endpoint == state_endpoint):
             parser.error("choose distinct vision and state models for the same Ollama endpoint")
-    timeout = min(arguments.timeout_s, arguments.ttl_s) if arguments.mode == "live" else arguments.timeout_s
+    timeout = min(arguments.timeout_s, VISION_JOB_LIMIT_S) if arguments.mode == "live" else arguments.timeout_s
     try:
         with ExitStack() as stack:
             vision = stack.enter_context(OllamaClient(arguments.vision_model, endpoint=vision_endpoint, timeout=timeout))

@@ -72,8 +72,9 @@ class Observation:
     summary: str | None
     reason_codes: tuple[str, ...]
     observed_at: datetime
-    valid_until: datetime
+    valid_until: datetime | None
     context_revision: int
+    visual_capture_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -82,7 +83,7 @@ class Observation:
             "summary": self.summary,
             "reason_codes": list(self.reason_codes),
             "observed_at": self.observed_at.isoformat(),
-            "valid_until": self.valid_until.isoformat(),
+            "valid_until": self.valid_until.isoformat() if self.valid_until is not None else None,
             "context_revision": self.context_revision,
         }
 
@@ -131,12 +132,12 @@ def _label(foreground: _Foreground | None) -> dict | None:
     return {"app_name": app, "window_title_redacted": title, "domain": domain}
 
 
-def _screen_context(rows: Iterable[object], start: datetime, as_of: datetime) -> list[tuple[datetime, object, bool, dict]]:
+def _screen_context(rows: Iterable[object], start: datetime | None, as_of: datetime) -> list[tuple[datetime, object, bool, dict]]:
     observations = []
     for row in rows:
         captured = _time(_value(row, "captured_at"))
         available = _value(row, "processed_at")
-        if not start <= captured <= as_of or (available is not None and _time(available) > as_of):
+        if captured > as_of or (start is not None and captured < start) or (available is not None and _time(available) > as_of):
             continue
         status = _value(row, "status")
         if status not in _SCREEN_STATUSES:
@@ -176,7 +177,7 @@ def _latest_input_recovery(
 
 def _window(
     segments: Iterable[object], screens: Iterable[object], *, as_of: datetime, window_seconds: float,
-    ttl_seconds: float, live: bool = False,
+    ttl_seconds: float, live: bool = False, retain_screen: bool = False,
 ) -> _Window:
     as_of = _time(as_of)
     if not _seconds(window_seconds) or not _seconds(ttl_seconds):
@@ -263,7 +264,7 @@ def _window(
         lock_until = latest_lock[0] + ttl
         screen_locked = latest_lock[1]
 
-    screen_rows = _screen_context(screens, start, as_of)
+    screen_rows = _screen_context(screens, None if retain_screen else start, as_of)
     # The experimental capture can describe the active scene without a native app label.
     unlocked_activity = prior_id is not None and screen_locked is False
     foreground_screens = (
@@ -274,10 +275,12 @@ def _window(
     last_screen = next((
         (at, data) for at, activity_id, _, data in reversed(foreground_screens)
         if screen_locked is not True and data["status"] == "ready"
-        and (current_foreground is None or (at >= foreground_started_at and (prior_id is None or activity_id == prior_id)))
+        and (retain_screen or current_foreground is None or (
+            at >= foreground_started_at and (prior_id is None or activity_id == prior_id)
+        ))
     ), None)
     screen_until = last_screen[0] + ttl if last_screen and last_screen[0] + ttl > as_of else None
-    screen = last_screen[1] if screen_until is not None else None
+    screen = last_screen[1] if last_screen and (retain_screen or screen_until is not None) else None
     known_screens = [(at, data["screen_kind"]) for at, _, _, data in screen_rows if data["screen_kind"] != "unknown"]
     screen_switches = [
         current_at for (previous_at, previous_kind), (current_at, current_kind)
@@ -373,20 +376,24 @@ class StateObserver:
         self._revision = 0
         self._estimate: tuple[str, str] | None = None
 
-    def _window(self, segments: Iterable[object], screens: Iterable[object], as_of: datetime, live: bool = False) -> _Window:
+    def _window(
+        self, segments: Iterable[object], screens: Iterable[object], as_of: datetime,
+        live: bool = False, *, retain_screen: bool = False,
+    ) -> _Window:
         return _window(segments, screens, as_of=as_of, window_seconds=self.window_seconds,
-                       ttl_seconds=self.ttl_seconds, live=live)
+                       ttl_seconds=self.ttl_seconds, live=live, retain_screen=retain_screen)
 
     def features(
         self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime, live: bool = False,
+        retain_screen: bool = False,
     ) -> dict:
-        return self._window(segments, screen_results, as_of, live).data
+        return self._window(segments, screen_results, as_of, live, retain_screen=retain_screen).data
 
-    def _advance(self, signature: str, as_of: datetime) -> int | None:
+    def _advance(self, signature: str, as_of: datetime, *, scene_changed: bool = False) -> int | None:
         with self._guard:
             if self._context_at is not None and as_of < self._context_at:
                 return None
-            if signature != self._context:
+            if scene_changed or signature != self._context:
                 self._revision += 1
                 self._estimate = None
             self._context = signature
@@ -450,15 +457,17 @@ class StateObserver:
 
     def observe_local(
         self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime,
-        activity_kind: str = "unknown", live: bool = True,
+        activity_kind: str = "unknown", live: bool = True, scene_scoped: bool = False,
+        scene_changed: bool = False,
     ) -> Observation | None:
-        """Use native signals for interruptibility and optional current vision for the scene."""
+        """Use native signals and, for the live producer, a screen known to belong to the active scene."""
         at = _time(as_of)
-        window = self._window(segments, screen_results, at, live)
-        revision = self._advance(window.context, at)
+        window = self._window(segments, screen_results, at, live, retain_screen=scene_scoped)
+        revision = self._advance(window.context, at, scene_changed=scene_changed)
         if revision is None:
             return None
-        return self._publish(*local_outcome(window.data, activity_kind), at, window.valid_until, revision)
+        deadline = None if scene_scoped else window.valid_until
+        return self._publish(*local_outcome(window.data, activity_kind), at, deadline, revision)
 
     def fallback(
         self, segments: Iterable[object], screen_results: Iterable[object], *, as_of: datetime, live: bool = False,

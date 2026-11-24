@@ -209,7 +209,8 @@ class ToolRuntime:
         now = self.clock.wall_now()
         expected = snapshot.current
         if (snapshot.current_status != "fresh" or expected is None or expected.state != "available"
-                or expected.valid_until <= now or self.observation_context_reader is None):
+                or (expected.valid_until is not None and expected.valid_until <= now)
+                or self.observation_context_reader is None):
             return False
         current, status = self.observation_context_reader.read_current(now)
         return (status == "fresh" and current is not None and current.state == "available"

@@ -85,7 +85,7 @@ def _mac_window(window_id: int) -> Image.Image:
     import Quartz
 
     if not Quartz.CGPreflightScreenCaptureAccess():
-        raise RuntimeError("Window capture is unavailable without screen recording permission")
+        raise DesktopCaptureRestricted("Screen recording permission is required", reason="screen_recording_permission_denied")
     app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
     if app is None:
         raise RuntimeError("No foreground window")
@@ -226,6 +226,8 @@ def capture_window(sample: ActivitySample, *, platform: str) -> tuple[datetime, 
         image = _mac_window(sample.window_id) if platform == "darwin" else _win_window(sample.window_id)
         captured_at = datetime.now(UTC)
         return captured_at, _jpeg(image)
+    except DesktopCaptureRestricted:
+        raise
     except Exception:
         raise RuntimeError("Verified single-window capture is unavailable") from None
 

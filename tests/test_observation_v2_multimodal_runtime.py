@@ -13,6 +13,7 @@ import pytest
 
 from deskpet.observation_v2 import __main__ as cli, media, openai_cloud, pipeline, vision as vision_module
 from deskpet.observation_v2.activity import ActivitySample
+from deskpet.observation_v2.context import ObservationContextReader
 from deskpet.observation_v2.routes import (
     BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, OLLAMA, VISION, CloudRoute, ObservationCloudSettings,
 )
@@ -148,7 +149,7 @@ def test_production_cli_uses_local_state_without_a_text_transport(tmp_path, monk
     assert constructed == ["qwen3-vl:2b-instruct"]
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT observed_at, state FROM effective_observations ORDER BY observation_id").fetchall() == [
-            (_time(0), "unknown"), (_time(6), "available"), (_time(30), "working"),
+            (_time(0), "unknown"), (_time(6), "available"), (_time(21), "working"),
         ]
         assert conn.execute("SELECT app_name, screen_locked FROM realtime_observation_head").fetchone() == ("Browser", 0)
         assert conn.execute("SELECT count(*) FROM screen_observations").fetchone() == (0,)
@@ -208,6 +209,121 @@ def test_stable_material_change_has_one_call_each_and_keeps_capture_time(tmp_pat
         assert conn.execute("SELECT status, last_ready_at FROM observation_capture_health").fetchone() == (
             "ready", _time(39),
         )
+
+
+@pytest.mark.parametrize("change", ["window", "capture_policy", "screen_recording"])
+def test_stable_live_scene_survives_a_minute_until_scope_changes(tmp_path, monkeypatch, change):
+    native_capture = media.capture_window
+    runtime = FakeRuntime(
+        monkeypatch, metadata=lambda at: {"window_id": 2} if change == "window" and at >= 66 else {},
+    )
+    if change == "screen_recording":
+        monkeypatch.setitem(sys.modules, "AppKit", SimpleNamespace())
+        monkeypatch.setitem(sys.modules, "Quartz", SimpleNamespace(CGPreflightScreenCaptureAccess=lambda: False))
+
+        def capture(sample, *, platform):
+            if runtime.elapsed >= 66:
+                return native_capture(sample, platform=platform)
+            return runtime.capture(sample, platform=platform)
+
+        monkeypatch.setattr(media, "capture_window", capture)
+    database = tmp_path / "desktop.sqlite"
+    monkeypatch.setattr(pipeline, "system_boot_id", lambda: "test-boot")
+    reader = ObservationContextReader(database, boot_id="test-boot")
+    observed = {}
+
+    def sample_while_running(seconds):
+        if runtime.elapsed in (12, 33, 64.5, 66):
+            head = reader.read_realtime_head(runtime.now(), monotonic_s=runtime.elapsed)
+            details = reader.read_realtime_context(runtime.now(), monotonic_s=runtime.elapsed).to_dict()
+            observed[runtime.elapsed] = head, details
+        runtime.sleep(seconds)
+
+    monkeypatch.setattr(pipeline.time, "sleep", sample_while_running)
+    vision = Vision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=67, capture_screen=True,
+        capture_policy=lambda: None if change == "capture_policy" and runtime.elapsed >= 66 else 1,
+    )
+
+    stable, stable_detail = observed[12]
+    assert stable.current.state == "working"
+    assert stable.current.valid_until is None
+    assert stable.current.observed_at == EPOCH + timedelta(seconds=10.5)
+    assert stable_detail["last_observed_activity"]["relation"] == "current"
+    assert stable_detail["last_observed_activity"]["observed_at"] == (EPOCH + timedelta(seconds=3)).isoformat()
+    for seconds in (33, 64.5):
+        head, detail = observed[seconds]
+        assert head == stable
+        assert detail["last_observed_activity"] == stable_detail["last_observed_activity"]
+        assert detail["interruptibility"]["current"]["valid_until"] is None
+    updated, detail = observed[66]
+    assert updated.publication_cursor > stable.publication_cursor
+    assert updated.current.visual_capture_id is None
+    assert updated.current.activity_kind == "unknown"
+    assert any(segment.get("scene_elements") == ["page canvas"] for segment in detail["history_1h"]["segments"])
+    if change in ("capture_policy", "screen_recording"):
+        assert detail["last_observed_activity"]["relation"] == "previous"
+    assert len(vision.calls) == 1
+    assert report["last_observation"]["valid_until"] is None
+    assert reader.read_realtime_head(runtime.now(), monotonic_s=runtime.elapsed).scene_invalidated
+
+
+@pytest.mark.parametrize("change", ["classification", "document"])
+def test_pending_visual_refresh_keeps_scene_until_substantive_change(tmp_path, monkeypatch, change):
+    first, changed = _frame(), _frame(area=(100, 100, 560, 140))
+    runtime = FakeRuntime(
+        monkeypatch, jpeg=lambda at: first if at < 37.5 else changed, model_delay=2,
+        metadata=lambda _: {
+            "app_name": "Google Chrome", "window_title": "Google Docs", "active_tab_title": "Google Docs",
+            "url": "https://docs.google.com/document/d/synthetic/edit",
+        },
+    )
+    database = tmp_path / "desktop.sqlite"
+    monkeypatch.setattr(pipeline, "system_boot_id", lambda: "test-boot")
+    reader = ObservationContextReader(database, boot_id="test-boot")
+    observed = {}
+
+    class ChangingVision(Vision):
+        def complete(self, **kwargs):
+            result = super().complete(**kwargs)
+            if len(self.calls) == 2:
+                if change == "classification":
+                    result.update(screen_kind="meeting", activity_kind="work", scene_elements=["video call"])
+                else:
+                    result["document_title"]["name"] = "Weekly Plan"
+            return result
+
+    def sample_while_running(seconds):
+        for key in (39, 42):
+            if runtime.elapsed >= key and key not in observed:
+                observed[key] = reader.read_realtime_head(runtime.now(), monotonic_s=runtime.elapsed)
+        if len(observed) == 2 and "revoked" not in observed:
+            prior, later = observed[39], observed[42]
+            observed["revoked"] = reader.presentation_context_changed(
+                prior.publication_cursor, later.publication_cursor, revision=prior.current.context_revision,
+                generation=prior.producer_generation, now=runtime.now(),
+            )
+        runtime.sleep(seconds)
+
+    monkeypatch.setattr(pipeline.time, "sleep", sample_while_running)
+    pipeline.run_live_multimodal(
+        database, ChangingVision(), duration_s=43, capture_screen=True, browser_metadata=True,
+        document_local_sources=("domain:docs.google.com",),
+    )
+    prior, later = observed[39], observed[42]
+    assert "page canvas" in prior.current.summary
+    if change == "classification":
+        assert "meeting view" in later.current.summary
+    else:
+        assert later.current.summary == prior.current.summary
+        with sqlite3.connect(database) as db:
+            assert db.execute(
+                "SELECT document_name FROM screen_observations ORDER BY captured_at"
+            ).fetchall() == [("Quarterly Outlook",), ("Weekly Plan",)]
+    assert prior.current.state == later.current.state == "working"
+    assert later.current.context_revision > prior.current.context_revision
+    assert observed["revoked"] is True
 
 
 def test_all_displays_observes_ordinary_chrome_without_window_or_browser_metadata(tmp_path, monkeypatch):

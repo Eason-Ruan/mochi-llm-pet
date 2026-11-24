@@ -60,7 +60,7 @@ _REASONS = {
     "quiet": "这次没有需要主动打扰的事项。",
     "busy": "当时的状态适合继续等待。",
     "focus_active": "当时正在专注，普通提醒继续等待。",
-    "not_fresh": "当时没有可用于判断打扰时机的新观测。",
+    "not_fresh": "当时没有可用于判断打扰时机的当前观测。",
     "no_eligible_items": "当时没有符合时间条件的提醒。",
     "no_meaningful_change": "没有需要再次提示的新进展。",
     "awaiting_response": "相关事项已提示，正在等待处理。",
