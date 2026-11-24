@@ -28,7 +28,7 @@ def _write_profile(home: Path, name: str, entries: list[dict]) -> None:
 
 def _base_entries(
     profile: str, *, origin: str, model: str, official: bool, prompt: str,
-    image_policy: dict | None = None,
+    context_window: int = 32768, image_policy: dict | None = None,
 ) -> list[dict]:
     return [
         _row("sdk-app", {"profile": profile}),
@@ -45,7 +45,7 @@ def _base_entries(
             },
             "retryPolicy": {"mode": "normal", "maxRetries": 0},
             **(image_policy or {}),
-            "models": [{"id": model, "name": model, "contextWindow": 32768,
+            "models": [{"id": model, "name": model, "contextWindow": context_window,
                         "maxTokens": 4096, "reasoningEfforts": False,
                         **({"input": ["text", "image"]} if image_policy else {})}],
         }}}),
@@ -62,9 +62,12 @@ def _base_entries(
 
 def write_system2_profile(
     home: Path, *, origin: str, model: str, official: bool,
-    prompt: str, tools: list[dict], port_file: Path, sessions: Path,
+    prompt: str, tools: list[dict], port_file: Path, sessions: Path, bailian: bool = False,
 ) -> None:
-    entries = _base_entries("mochi", origin=origin, model=model, official=official, prompt=prompt)
+    entries = _base_entries(
+        "mochi", origin=origin, model=model, official=official, prompt=prompt,
+        context_window=1_000_000 if bailian else 32768,
+    )
     entries += [
         _row("session-persistence-jsonl", {"root": str(sessions), "compression": "none"}),
         _row("session-checkpoint-policy"),

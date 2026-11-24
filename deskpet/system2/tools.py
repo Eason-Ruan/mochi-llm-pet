@@ -852,8 +852,15 @@ class System2ToolExecutor:
     def _current_proposal(self, db, scope, business_key, now, authority, semantic):
         self._expire_proposals(db, scope, now)
         for previous in proposals.get_business(db, scope, business_key):
-            if previous.state == "pending" or (previous.state == "rejected" and authority.origin != "user"
-                                               and (semantic or authority.opportunity_id or previous.valid_until > now)):
+            if previous.state == "pending":
+                return previous
+            # A later background decision can suggest focus even without an
+            # intervening phase once the previous card's validity ends.
+            if (semantic and previous.function == "phase.start"
+                    and previous.args.get("kind", "focus") == "focus" and now >= previous.valid_until):
+                continue
+            if (previous.state == "rejected" and authority.origin != "user"
+                    and (semantic or authority.opportunity_id or previous.valid_until > now)):
                 return previous
             if semantic and previous.state == "expired":
                 delivery = proposals.latest_delivery(db, scope, previous.id)

@@ -21,7 +21,9 @@ import httpx
 from deskpet.dsh_process import SDKWorker
 from deskpet.dsh_profile import write_system2_profile
 from deskpet.observation_v2.openai_cloud import _resolve_credential
-from deskpet.observation_v2.routes import SYSTEM2, CloudRoute, CloudRouteError, CloudRouteSnapshot, ObservationCloudSettings
+from deskpet.observation_v2.routes import (
+    BAILIAN, SYSTEM2, CloudRoute, CloudRouteError, CloudRouteSnapshot, ObservationCloudSettings,
+)
 from deskpet.settings import SettingsStore
 
 from .bailian import BailianTurn
@@ -90,6 +92,7 @@ class _Runtime:
         credential: Callable[[CloudRoute], str], share: bool, closing: Event | None = None,
         document_sources: tuple[str, ...] = (), private_storage: TemporaryDirectory | None = None,
         recent_chat: tuple[dict[str, str], ...] = (),
+        discard_after_turn: bool = False,
     ) -> None:
         self.session_id = session_id
         self.policy = policy
@@ -99,6 +102,7 @@ class _Runtime:
         self._document_sources = document_sources
         self._private_storage = private_storage
         self._recent_chat = recent_chat
+        self.discard_after_turn = discard_after_turn
         self.document_disclosed = False
         self.last_user_message: str | None = None
         self._closing = closing
@@ -123,6 +127,7 @@ class _Runtime:
             write_system2_profile(
                 home, origin=self.gateway.origin, model=route.model, official=route.provider_kind == "openai",
                 prompt=prompt, tools=tools, port_file=self.port_file, sessions=sessions,
+                bailian=route.provider_kind == BAILIAN,
             )
             policy.check()
             self._worker = SDKWorker(home, self.gateway.token, label="System 2")
@@ -269,7 +274,7 @@ class _Runtime:
 
 
 class DSHEngine:
-    """Serialize independent Mochi admissions through a single scoped DSH runtime."""
+    """Serialize independent Mochi admissions through scoped DSH runtimes."""
 
     def __init__(
         self, data_dir: Path | str, *, settings: SettingsStore, tools: Iterable,
@@ -295,6 +300,13 @@ class DSHEngine:
         for runtime in runtimes.values():
             runtime.close()
 
+    def _discard_runtime(self, runtime: _Runtime) -> None:
+        with self._state:
+            for key, current in tuple(self._runtimes.items()):
+                if current is runtime:
+                    del self._runtimes[key]
+        runtime.close()
+
     def _select_runtime(self, turn, snapshot: CloudRouteSnapshot) -> _Runtime:
         if snapshot.route is None:
             raise CloudRouteError("Configure a System 2 model before use")
@@ -306,6 +318,7 @@ class DSHEngine:
             raise CloudRouteError("System 2 activity authorization changed")
         share = text_sharing_allowed(preferences, snapshot, marker[2])
         background = turn.source == "background" and semantic_background_enabled()
+        fresh_background = turn.source == "background" and snapshot.route.provider_kind == BAILIAN
         chat = turn.source == "user"
         # Cloud document sharing is scoped to chat. A local background turn
         # can use the locally approved title sources in its own session.
@@ -335,7 +348,7 @@ class DSHEngine:
             "prompt_version": turn.prompt_version,
             "prompt": turn.system_prompt, "tools": self._tools,
         }).encode()).hexdigest()
-        session_id = "mochi-" + identity[:32]
+        session_id = "mochi-" + (secrets.token_hex(16) if fresh_background else identity[:32])
         with self._state:
             current = self._runtimes.get(runtime_key)
             if current is not None and current.session_id == session_id:
@@ -344,9 +357,10 @@ class DSHEngine:
         if current is not None:
             current.close()
         self._root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        # A title can be returned after a chat has started, so any native
-        # dialogue eligible to receive titles uses temporary storage.
-        storage = TemporaryDirectory(prefix="mochi-observation-") if private else None
+        # Each Bailian background admission gets a complete new snapshot and
+        # recent contacts. Replaying previous snapshots grows an unrelated
+        # dialogue and can permanently strand the session after overflow.
+        storage = TemporaryDirectory(prefix="mochi-observation-") if private or fresh_background else None
         path = Path(storage.name) if storage is not None else self._root / identity[:32]
         path.mkdir(mode=0o700, exist_ok=True)
         runtime = _Runtime(
@@ -354,6 +368,7 @@ class DSHEngine:
             credential=self._credential, share=share, closing=self._closing, document_sources=sources,
             private_storage=storage,
             recent_chat=tuple(self._private_chat_history) if private and chat else (),
+            discard_after_turn=fresh_background,
         )
         with self._state:
             if not self._closing.is_set():
@@ -369,6 +384,7 @@ class DSHEngine:
             if self._closing.is_set() or turn.user_scope != self._routes.user_scope:
                 raise CloudRouteError("Invalid System 2 user or runtime")
             snapshot = self._routes.snapshot(SYSTEM2)
+            runtime = None
             try:
                 runtime = self._select_runtime(turn, snapshot)
                 reply = runtime.run(turn, call_tool)
@@ -379,9 +395,7 @@ class DSHEngine:
                         # Prevent the native transcript from replaying titles
                         # in a subsequent turn that did not ask for them.
                         self._private_chat_history.append({"omitted": "本轮涉及观察到的文档标题"})
-                        with self._state:
-                            self._runtimes.pop((False, True, True), None)
-                        runtime.close()
+                        self._discard_runtime(runtime)
                     elif runtime.last_user_message:
                         self._private_chat_history.append({
                             "user": runtime.last_user_message[:_CHAT_HISTORY_TEXT_LIMIT],
@@ -402,6 +416,9 @@ class DSHEngine:
                     except (CloudRouteError, sqlite3.Error, ValueError):
                         pass
                 raise failure from None
+            finally:
+                if runtime is not None and runtime.discard_after_turn:
+                    self._discard_runtime(runtime)
 
     def close(self) -> None:
         self._closing.set()

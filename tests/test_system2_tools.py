@@ -190,7 +190,7 @@ def test_focus_offer_while_working_without_habit_task_or_available_slot(business
     assert not business.tools.validate_presentation(offer.delivery_id)
 
 
-def test_refusal_survives_restart_and_observation_changes(business):
+def test_focus_refusal_survives_restart_until_proposal_expires(business):
     business.auto_adjust()
     snapshot = business.publish(71)
     first = business.command("proposal.offer", _offer(), "offer", origin="agent", snapshot=snapshot)
@@ -213,6 +213,35 @@ def test_refusal_survives_restart_and_observation_changes(business):
     next_offer = business.command("proposal.offer", _offer(), "new-opportunity", origin="agent", snapshot=next_slot)
     assert next_offer.error_code == "ALREADY_RESOLVED"
     assert next_offer.subject_ref == first.subject_ref
+
+    business.clock.advance(5 * 60 - 3)
+    fresh = business.publish(75, "working")
+    new_offer = business.command("proposal.offer", _offer(1200), "new-focus", origin="agent", snapshot=fresh)
+    assert new_offer.status == "pending" and new_offer.actual_version == 1
+    assert new_offer.subject_ref != first.subject_ref and new_offer.delivery_id
+    assert new_offer.view["args"]["planned_duration_s"] == 1200
+    assert business.command("proposal.resolve", declined, "old-refusal-replay").status == "duplicate"
+    assert business.tools.pending_proposals() == [new_offer.view]
+
+
+def test_displayed_focus_offer_can_be_replaced_after_expiration(business):
+    business.auto_adjust()
+    first = business.command("proposal.offer", _offer(), "shown-focus", origin="agent")
+    assert business.tools.permit_presentation(first.delivery_id)
+    assert business.tools.ack_presentation(first.delivery_id, displayed=True)
+    business.clock.advance(5 * 60 - 1)
+    repeat = business.command("proposal.offer", _offer(1200), "still-pending", origin="agent")
+    assert repeat.subject_ref == first.subject_ref and repeat.delivery_id == first.delivery_id
+    assert repeat.view == first.view
+
+    business.clock.advance(1)
+    business.tools = business.gateway()
+    offer = business.command("proposal.offer", _offer(), "later-focus", origin="agent")
+    assert offer.status == "pending" and offer.actual_version == 1
+    assert offer.subject_ref != first.subject_ref and offer.delivery_id != first.delivery_id
+    assert business.tools.permit_presentation(offer.delivery_id)
+    replay = business.command("proposal.offer", _offer(), "shown-focus", origin="agent")
+    assert replay.status == "duplicate" and replay.delivery_id == first.delivery_id
 
 
 def test_legacy_wait_cancellation_and_proposal_priority(business, monkeypatch):

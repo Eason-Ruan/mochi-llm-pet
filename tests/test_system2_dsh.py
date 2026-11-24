@@ -100,6 +100,7 @@ def endpoints():
             self.hosts = []
             self.path = "/v1/chat/completions"
             self.reasoning_parts = ()
+            self.prompt_tokens = 10
             self.failure = None
             self.failure_body = None
             self.redirect_to = None
@@ -167,7 +168,8 @@ def endpoints():
                     pieces = [
                         *({"choices": [{"index": 0, "delta": delta, "finish_reason": None}]} for delta in deltas),
                         {"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
-                        {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+                        {"choices": [], "usage": {"prompt_tokens": model.prompt_tokens, "completion_tokens": 5,
+                                                  "total_tokens": model.prompt_tokens + 5}},
                     ]
                     if model.reasoning_parts:
                         self.protocol_version = "HTTP/1.1"
@@ -522,6 +524,8 @@ def test_bailian_native_tool_continuation_and_credential_scope(tmp_path, endpoin
     endpoint, redirect = endpoints(), endpoints()
     endpoint.path = "/compatible-mode/v1/chat/completions"
     endpoint.reasoning_parts = ("核对", "合成项目")
+    # Bailian can report prompt usage beyond the generic 32,768-token DSH profile.
+    endpoint.prompt_tokens = 33_500
     public_url = httpx.URL(base_url + "/chat/completions")
     loopback = httpx.URL(endpoint.origin)
     original_handle = httpx.HTTPTransport.handle_request
