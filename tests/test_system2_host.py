@@ -685,6 +685,46 @@ def test_committed_scope_allows_same_turn_update_without_unrelated_title(runtime
         host.close()
 
 
+def test_chat_creates_issue_and_starts_linked_one_off_focus(runtime):
+    business, create = runtime
+    title = "研究汇丰银行 QDII"
+
+    def model(request, data, call):
+        assert data["semantic_chat"]
+        assert {"item.create", "phase.start"} <= set(request.allowed_tools)
+        assert data["grants"]["phase.start"]["issues"] == []
+        item = call("item_create", "create-issue", {"type": "issue", "title": title})
+        assert item["outcome"] == "committed"
+        issue_id = item["view"]["id"]
+        # Start directly from the creation receipt in the same turn.
+        start = call("phase_start", "start-focus", {
+            "kind": "focus", "title": title, "planned_duration_s": 600,
+            "issue_links": [issue_id], "primary_issue_id": issue_id,
+        })
+        assert start["outcome"] == "committed"
+        return ""
+
+    host = create(model)
+    try:
+        host.submit_user("我准备研究一下汇丰银行qdii 创建一个10分钟工作段并设置对应的番茄钟")
+        assert host.pump() and not host.pump()
+        task, = business.tasks.list_tasks()
+        assert task.draft.item_type == "issue" and task.draft.content == title
+        assert task.effective_issue_status == "in_progress" and not task.draft.reminder_enabled
+        active, = business.phases.list_phases()
+        assert active.kind == "focus" and active.state == "running" and active.planned_duration_s == 600
+        assert active.issue_links == (task.task_id,) and active.primary_issue_id == task.task_id
+        assert active.habit_id is None and not business.settings.list_habits()
+        reply, = host.ui_events()
+        assert reply.payload["status"] == "applied"
+        actions = reply.payload["actions"]
+        assert [action["result_ref"] for action in actions] == [f"item:{task.task_id}", f"phase:{active.id}"]
+        assert [action["outcome"] for action in actions] == ["committed", "committed"]
+        assert actions[1]["text"] == "已开始 · 10 分钟"
+    finally:
+        host.close()
+
+
 @pytest.mark.parametrize("old_state", ["elapsed", "running", "paused"])
 def test_chat_creates_and_starts_named_habit_with_existing_focus(runtime, old_state):
     business, create = runtime
@@ -700,7 +740,7 @@ def test_chat_creates_and_starts_named_habit_with_existing_focus(runtime, old_st
     def model(_request, data, call):
         assert data["context"]["current_phase"]["id"] == previous.id
         habit = call("habit_create", "create-habit", {
-            "title": "研究汇丰银行 QDII", "behavior": {"focus_s": 600, "short_break_s": 300},
+            "title": "晨间阅读", "behavior": {"focus_s": 600, "short_break_s": 300},
         })
         assert habit["outcome"] == "committed"
         start = call("phase_start", "start-habit", {
@@ -714,7 +754,7 @@ def test_chat_creates_and_starts_named_habit_with_existing_focus(runtime, old_st
 
     host = create(model)
     try:
-        host.submit_user("我准备研究一下汇丰银行qdii 创建一个10分钟工作段并设置对应的番茄钟")
+        host.submit_user("保存一个叫晨间阅读的番茄钟习惯，每次专注十分钟、短休息五分钟，并现在启动")
         assert host.pump()
         habit, = business.settings.list_habits()
         assert habit.behavior.focus_s == 600

@@ -155,7 +155,8 @@ _register("context.read", "Read decision evidence. Optional history_start and hi
           history_end=(AwareDatetime | None, None), include_capture_health=(bool | None, None))
 _register("item.get", "Read one reminder or issue by ID.", **Identified)
 _register("item.list", "List reminders or issues.", filter=(ItemFilter | None, None))
-_register("item.create", "Create a reminder or issue. An issue deadline does not create a notification.",
+_register("item.create", "Create a reminder or an issue that tracks a work goal or to-do. "
+          "An issue deadline does not create a notification.",
           type=(Literal["reminder", "issue"], ...), title=(Identifier, ...),
           description=(str | None, None), due_at=(AwareDatetime | None, None),
           due_offset_s=(RelativeSeconds | None, None),
@@ -194,8 +195,10 @@ _register("proposal.resolve", "Accept, decline, or cancel the proposal answered 
           answer=(Literal["accept", "reject", "cancel"], ...), amendments=(ProposalAmendments | None, None),
           **IdentifiedWrite)
 _register("phase.get", "Read a phase by ID, or read the current phase if omitted.", id=(Identifier | None, None))
-_register("phase.start", "Start a focus or break phase. A blank focus title uses 专注. "
-          "Use the habit ID and version to start a named habit. Omit predecessor fields for a new focus.",
+_register("phase.start", "Start a focus or break phase now. A blank focus title uses 专注. "
+          "To attribute focus to a work issue, include its ID in issue_links and use it as primary_issue_id. "
+          "An existing habit can supply timing through habit_id and expected_habit_version. "
+          "Omit predecessor fields for a new focus.",
           kind=(PhaseKind, "focus"), planned_duration_s=(Duration | None, None),
           habit_id=(Identifier | None, None), previous_phase_id=(Identifier | None, None),
           expected_previous_version=(Version | None, None), expected_habit_version=(Version | None, None),
@@ -226,7 +229,8 @@ _register("phase.reassign_interval", "Change the issue assigned to a sealed inte
 
 _register("habit.get", "Read the specified named focus habit.", **Identified)
 _register("habit.list", "Read the named focus habits.")
-_register("habit.create", "Create a named focus habit.", title=(Identifier, ...),
+_register("habit.create", "Save a named, reusable focus or break routine at the user's request. "
+          "Start a one-time timer with phase.start.", title=(Identifier, ...),
           behavior=(HabitBehavior, ...), status=(Literal["enabled", "disabled"], "enabled"), **VersionFields)
 _register("habit.update", "Change a named habit's future behavior or status.", patch=(HabitPatch, ...), **IdentifiedWrite)
 _register("habit.archive", "Archive a named habit and stop its future automatic transitions.", **IdentifiedWrite)
