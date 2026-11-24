@@ -27,6 +27,12 @@ _BROWSER_BUNDLES = (
     "app.zen-browser.zen",
 )
 _SYSTEM_PRIVATE_APPS = ("com.apple.passwords", "com.apple.securityagent", "com.apple.loginwindow")
+_SCREENSHOT_UI_BUNDLE = "com.apple.screencaptureui"
+_SCREENSHOT_UI_PATH = "/System/Library/CoreServices/screencaptureui.app"
+_SCREENSHOT_OVERLAY_LAYER = 24  # Quartz main menu window level.
+_DOCK_BUNDLE = "com.apple.dock"
+_DOCK_PATH = "/System/Library/CoreServices/Dock.app"
+_DOCK_LAYER = 20  # Quartz Dock window level.
 _PixelBox = tuple[int, int, int, int]
 
 
@@ -129,17 +135,188 @@ def _window_bounds(row) -> _Bounds:
     return _Bounds(*(raw.get(key, 0) for key in ("X", "Y", "Width", "Height")))
 
 
-def _occlusion_masks(rows, windows: dict[int, _Window]) -> frozenset[_Bounds]:
+def _verified_system_app(pid, bundle, path, owner_name, app_rules) -> bool:
+    import AppKit
+
+    app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is None or app.bundleIdentifier() != bundle:
+        return False
+    bundle_url = app.bundleURL()
+    return (
+        bundle_url is not None and bundle_url.path() == path
+        and not _app_excluded(app.localizedName(), bundle, app_rules)
+        and not _app_excluded(owner_name, None, app_rules)
+    )
+
+
+def _background_screenshot_overlays(quartz_windows, displays: tuple[_Display, ...], native_windows: dict[int, Any],
+                                    front_pid: int | None, sample_window_id: int | str | None,
+                                    app_rules: tuple[str, ...]) -> set[int]:
+    if front_pid is None or front_pid <= 0:
+        return set()
+
+    display_bounds = {display.bounds for display in displays}
+    sampled_window = str(sample_window_id) if sample_window_id is not None else None
+    overlays = {}
+    for window_id, row in quartz_windows.items():
+        if (row.get("kCGWindowLayer") != _SCREENSHOT_OVERLAY_LAYER
+                or row.get("kCGWindowAlpha") != 1 or row.get("kCGWindowName")):
+            continue
+        pid = row.get("kCGWindowOwnerPID")
+        if window_id is None or str(window_id) == sampled_window or pid is None or pid <= 0 or pid == front_pid:
+            continue
+        if _window_bounds(row) not in display_bounds:
+            continue
+        if not _verified_system_app(pid, _SCREENSHOT_UI_BUNDLE, _SCREENSHOT_UI_PATH,
+                                    row.get("kCGWindowOwnerName"), app_rules):
+            continue
+        native = native_windows.get(window_id)
+        if native is not None:
+            if native.windowLayer() != _SCREENSHOT_OVERLAY_LAYER or native.title():
+                continue
+            owner = native.owningApplication()
+            if owner is not None:
+                bundle = owner.bundleIdentifier()
+                if (owner.processID() != pid or (bundle and bundle.casefold() != _SCREENSHOT_UI_BUNDLE)
+                        or _app_excluded(owner.applicationName(), bundle, app_rules)):
+                    continue
+        overlays[window_id] = pid
+    if not overlays:
+        return set()
+
+    # Screenshot can have a visible toolbar or preview while another app is
+    # still frontmost. Retain the masks when a peer window is visible.
+    eligible_pids = set(overlays.values())
+    for window_id, row in quartz_windows.items():
+        pid = row.get("kCGWindowOwnerPID")
+        if pid not in eligible_pids or window_id in overlays or row.get("kCGWindowAlpha", 1) <= 0:
+            continue
+        bounds = _window_bounds(row)
+        if min(bounds.width, bounds.height) > 0:
+            eligible_pids.discard(pid)
+    # ScreenCaptureKit's on-screen inventory can expose a peer omitted by Quartz.
+    for window_id, native in native_windows.items():
+        if window_id not in quartz_windows:
+            owner = native.owningApplication()
+            if owner is not None:
+                eligible_pids.discard(owner.processID())
+    return {window_id for window_id, pid in overlays.items() if pid in eligible_pids}
+
+
+def _dock_occlusions(quartz_windows, native_windows, displays, windows, front_pid, sample_window_id,
+                     app_rules) -> dict[int, _Bounds | None]:
+    if front_pid is None or front_pid <= 0:
+        return {}
+
+    display_bounds = {display.bounds for display in displays}
+    sampled_window = str(sample_window_id) if sample_window_id is not None else None
+    candidates = []
+    lower_windows = []
+    for window_id, row in reversed(quartz_windows.items()):
+        window = windows.get(window_id)
+        if window is not None and window.allowed:
+            lower_windows.append(window.bounds)
+            continue
+        if (row.get("kCGWindowLayer") != _DOCK_LAYER or row.get("kCGWindowAlpha") != 1
+                or row.get("kCGWindowName") != "Dock" or not row.get("kCGWindowSharingState")):
+            continue
+        pid = row.get("kCGWindowOwnerPID")
+        if pid is None or pid <= 0 or pid == front_pid or str(window_id) == sampled_window:
+            continue
+        native = native_windows.get(window_id)
+        bounds = _window_bounds(row)
+        if native is None or bounds not in display_bounds or not any(bounds.intersection(lower) for lower in lower_windows):
+            continue
+        if not _verified_system_app(pid, _DOCK_BUNDLE, _DOCK_PATH, row.get("kCGWindowOwnerName"), app_rules):
+            continue
+        owner = native.owningApplication()
+        if (owner is None or owner.processID() != pid or owner.bundleIdentifier() != _DOCK_BUNDLE
+                or _app_excluded(owner.applicationName(), _DOCK_BUNDLE, app_rules)
+                or native.windowLayer() != _DOCK_LAYER or native.title() not in ("Dock", "", None)):
+            continue
+        frame = native.frame()
+        if bounds != _Bounds(frame.origin.x, frame.origin.y, frame.size.width, frame.size.height):
+            continue
+        candidates.append((window_id, native, bounds))
+    if not candidates:
+        return {}
+
+    import AppKit
+    from ScreenCaptureKit import SCContentFilter, SCScreenshotManager, SCStreamConfiguration
+
+    deadline = time.monotonic() + _NATIVE_TIMEOUT_S
+    pending = []
+    for window_id, native, bounds in candidates:
+        try:
+            filter_ = SCContentFilter.alloc().initWithDesktopIndependentWindow_(native)
+            if filter_ is None:
+                continue
+            scale = filter_.pointPixelScale()
+            size = (math.ceil(bounds.width * scale), math.ceil(bounds.height * scale))
+            if min(size) <= 0:
+                continue
+            config = SCStreamConfiguration.alloc().init()
+            config.setWidth_(size[0])
+            config.setHeight_(size[1])
+            config.setScalesToFit_(True)
+            config.setPreservesAspectRatio_(False)
+            config.setShowsCursor_(False)
+            config.setIncludeChildWindows_(False)
+            config.setIgnoreShadowsSingleWindow_(True)
+            config.setShouldBeOpaque_(False)
+            callback = _NativeResult()
+            SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(filter_, config, callback.complete)
+            pending.append((window_id, bounds, size, filter_, config, callback))
+        except Exception:
+            # Keep the geometric mask if an isolated probe is unavailable.
+            continue
+
+    regions = {}
+    for window_id, bounds, size, _filter, _config, callback in pending:
+        try:
+            image = callback.result(deadline)
+            with Image.open(BytesIO(_native_png(AppKit, image))) as captured:
+                if captured.size != size or "A" not in captured.getbands():
+                    continue
+                box = captured.getchannel("A").getbbox()
+        except Exception:
+            continue
+        if box is None:
+            regions[window_id] = None
+            continue
+        # Include every nonzero alpha pixel and pad the edge before mapping
+        # from capture pixels to the window's global bounds.
+        left, top, right, bottom = box
+        width, height = size
+        sx, sy = bounds.width / width, bounds.height / height
+        x0, y0 = max(0, left - 1), max(0, top - 1)
+        x1, y1 = min(width, right + 1), min(height, bottom + 1)
+        if (x0, y0, x1, y1) == (0, 0, width, height):
+            continue
+        regions[window_id] = _Bounds(bounds.x + x0 * sx, bounds.y + y0 * sy, (x1 - x0) * sx, (y1 - y0) * sy)
+    return regions
+
+
+def _occlusion_masks(rows, windows: dict[int, _Window], screenshot_overlays: set[int],
+                     dock_occlusions: dict[int, _Bounds | None]) -> frozenset[_Bounds]:
     # Quartz lists front to back. Protect the parts of included windows that
     # would be uncovered when the compositor removes a window above them.
     lower_windows = []
     masks = set()
     for row in reversed(rows):
-        window = windows.get(row.get("kCGWindowNumber"))
+        window_id = row.get("kCGWindowNumber")
+        if window_id in screenshot_overlays:
+            # The inactive screenshot surface can report full-screen bounds and
+            # alpha 1 even when it does not obscure the desktop. Its layer keeps
+            # it out of the ScreenCaptureKit inclusion filter.
+            continue
+        window = windows.get(window_id)
         if window is not None and window.allowed:
             lower_windows.append(window.bounds)
         elif row.get("kCGWindowAlpha", 1) > 0:
-            bounds = _window_bounds(row)
+            bounds = dock_occlusions.get(window_id, _window_bounds(row))
+            if bounds is None:
+                continue
             for lower in lower_windows:
                 overlap = bounds.intersection(lower)
                 if overlap is not None:
@@ -147,8 +324,8 @@ def _occlusion_masks(rows, windows: dict[int, _Window]) -> frozenset[_Bounds]:
     return frozenset(masks)
 
 
-def _window_inventory(content, Quartz, workspace, sample: ActivitySample, app_rules, domain_rules,
-                      foreground_excluded: bool) -> tuple[
+def _window_inventory(content, Quartz, workspace, displays: tuple[_Display, ...], sample: ActivitySample,
+                      app_rules, domain_rules, foreground_excluded: bool) -> tuple[
     dict[int, _Window], int | None, _Window | None, frozenset[_Bounds],
 ]:
     rows = Quartz.CGWindowListCopyWindowInfo(
@@ -168,8 +345,8 @@ def _window_inventory(content, Quartz, workspace, sample: ActivitySample, app_ru
     domain = _page_domain(sample.url)
     restrict_sample = foreground_excluded or sample.private_window is True
     windows = {}
-    for native_window in content.windows():
-        window_id = native_window.windowID()
+    native_windows = {window.windowID(): window for window in content.windows()}
+    for window_id, native_window in native_windows.items():
         owner = native_window.owningApplication()
         row = by_id.get(window_id)
         if owner is None or row is None or native_window.windowLayer() != 0 or row.get("kCGWindowLayer") != 0:
@@ -213,7 +390,11 @@ def _window_inventory(content, Quartz, workspace, sample: ActivitySample, app_ru
         )
         if is_front and (is_sample_window or sample.window_id is None):
             foreground_window = windows[window_id]
-    return windows, front_pid, foreground_window, _occlusion_masks(rows, windows)
+    screenshot_overlays = _background_screenshot_overlays(
+        by_id, displays, native_windows, front_pid, sample.window_id, app_rules,
+    )
+    dock_occlusions = _dock_occlusions(by_id, native_windows, displays, windows, front_pid, sample.window_id, app_rules)
+    return windows, front_pid, foreground_window, _occlusion_masks(rows, windows, screenshot_overlays, dock_occlusions)
 
 
 def _inventory(shareable, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded):
@@ -224,7 +405,7 @@ def _inventory(shareable, Quartz, workspace, sample, app_rules, domain_rules, fo
     content = callback.result(time.monotonic() + _NATIVE_TIMEOUT_S)
     displays = _display_inventory(content, Quartz)
     windows, front_pid, foreground, masks = _window_inventory(
-        content, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded,
+        content, Quartz, workspace, displays, sample, app_rules, domain_rules, foreground_excluded,
     )
     return displays, windows, front_pid, foreground, masks
 
@@ -287,6 +468,14 @@ def _visible_after_mask(size: tuple[int, int], allowed: list[_PixelBox], masks: 
     return occupancy.getbbox() is not None
 
 
+def _native_png(AppKit, image) -> bytes:
+    representation = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(image)
+    data = representation.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+    if data is None:
+        raise DesktopCaptureRestricted("macOS filtered frame could not be encoded", reason="filtered_desktop_unavailable")
+    return bytes(data)
+
+
 def _encode_montage(AppKit, images, sizes, columns: int, first_label: str, masks: list[tuple[_PixelBox, ...]]) -> bytes:
     label_height = 24 if len(images) > 1 or first_label != "Active display" else 0
     gap = 8
@@ -305,11 +494,7 @@ def _encode_montage(AppKit, images, sizes, columns: int, first_label: str, masks
             draw.text((x + 5, y + 3), label, fill=(255, 255, 255), font=font)
         if image is None:
             continue
-        representation = AppKit.NSBitmapImageRep.alloc().initWithCGImage_(image)
-        data = representation.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
-        if data is None:
-            raise DesktopCaptureRestricted("macOS filtered frame could not be encoded", reason="filtered_desktop_unavailable")
-        with Image.open(BytesIO(bytes(data))) as captured:
+        with Image.open(BytesIO(_native_png(AppKit, image))) as captured:
             rgba = captured.convert("RGBA")
         if rgba.size != size:
             raise DesktopCaptureRestricted("macOS returned unexpected display dimensions", reason="filtered_desktop_unavailable")
