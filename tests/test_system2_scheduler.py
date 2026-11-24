@@ -87,6 +87,25 @@ def desktop(tmp_path):
             app.tasks.close()
 
 
+def test_minute_tick_and_upgrade_from_a_persisted_two_minute_schedule(desktop):
+    from deskpet.system2.scheduler import _stamp
+
+    original = desktop.now
+    with desktop.scheduler._transaction() as db:
+        db.execute("UPDATE system2_schedule SET tick_at=? WHERE user_scope='default'",
+                   (_stamp(original + timedelta(seconds=120)),))
+    scheduler = Scheduler(desktop.tasks, clock=desktop.clock)
+    for cycle in range(2):
+        desktop.clock.advance(59)
+        scheduler.poll()
+        assert scheduler.pending_wakes() == ()
+        desktop.clock.advance(1)
+        scheduler.poll()
+        event, = scheduler.pending_wakes()
+        assert (event.kind, event.at) == ('tick', original + timedelta(minutes=cycle + 1))
+        scheduler.ack_wakes([event.event_id])
+
+
 def test_window_open_recheck_and_idle_tick_merge(desktop):
     start = desktop.now
     opens = start + timedelta(seconds=120)

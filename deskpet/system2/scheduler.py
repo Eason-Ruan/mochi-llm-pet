@@ -16,7 +16,8 @@ from deskpet.observation_v2.realtime import sample_realtime_clock
 from deskpet.settings import SettingsStore
 
 
-TICK_INTERVAL = timedelta(seconds=120)
+TICK_INTERVAL = timedelta(seconds=60)
+REMINDER_PRIORITY_HORIZON = timedelta(seconds=120)
 _EARLY_REASONS = {"opportunity", "tool"}
 _URGENCY_CODES = {"meeting_preparation", "time_sensitive", "deadline_approaching", "expiring"}
 _SCHEMA = (
@@ -161,6 +162,10 @@ class Scheduler:
                 db.execute(statement)
             created = db.execute("INSERT OR IGNORE INTO system2_schedule(user_scope,tick_at,last_wall) VALUES (?,?,?)",
                                  (self.user_scope, _stamp(now + TICK_INTERVAL), _stamp(now))).rowcount
+            if not created:
+                # An existing installation may still have a two-minute tick scheduled.
+                db.execute("UPDATE system2_schedule SET tick_at=? WHERE user_scope=? AND tick_at>?",
+                           (_stamp(now + TICK_INTERVAL), self.user_scope, _stamp(now + TICK_INTERVAL)))
             if created and self.user_scope == "default" and _table(db, "metadata"):
                 previous = db.execute("SELECT value FROM metadata WHERE key='opportunity'").fetchone()
                 opportunity = json.loads(previous[0]) if previous else {}
@@ -604,9 +609,8 @@ class Scheduler:
     def _time_sensitive(self, task: TaskView, now: datetime) -> bool:
         if self._urgency(task, now):
             return True
-        # A user-set boundary that arrives before the next regular judgment
-        # makes a currently eligible reminder ready ahead of ordinary suggestions.
-        return any(edge and now < edge <= now + TICK_INTERVAL
+        # Keep deadline prioritization independent of the idle-thinking cadence.
+        return any(edge and now < edge <= now + REMINDER_PRIORITY_HORIZON
                    for edge in (task.draft.hard_deadline, task.draft.expires_at))
 
     def has_time_sensitive_candidate(self, *, now: datetime, db=None) -> bool:
