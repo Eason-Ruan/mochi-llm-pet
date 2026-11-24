@@ -180,7 +180,7 @@ def _settings_grant(text: str, selected_ref: str | None, context: dict) -> dict 
         return None
     enabled = not re.search(r"(?:关闭|关掉|禁用|取消|不再|disable\b|\boff\b)", text)
     flags = {
-        "auto_adjust": r"自动(?:调整|建议)|auto adjust",
+        "auto_adjust": r"自动(?:调整|建议|番茄钟)|auto adjust",
         "habits_enabled": r"习惯(?:功能|模式|开关)|(?:开启|关闭|关掉|禁用|启用)习惯(?:[。！! ]|$)|habits?\b",
         "allow_proactive_movement": r"主动移动|proactive movement",
         "reminder_sound": r"提醒(?:声音|音效)|reminder sound",
@@ -223,9 +223,9 @@ def describe_grants(user: dict | None, context: dict, *, requested_at: datetime)
         rechecks = [ref_id(item["occurrence_id"]) for item in context.get("recheck_items", ()) if item.get("occurrence_id")]
         reviewable = list(dict.fromkeys(eligible + rechecks))
         focus = context["enabled_settings"].get("auto_adjust", False)
-        available = context["current_status"] == "fresh" and (context.get("current") or {}).get("state") == "available"
+        state = (context.get("current") or {}).get("state") if context["current_status"] == "fresh" else None
         grants = {}
-        if available and context.get("opportunity_id"):
+        if state == "available" and context.get("opportunity_id"):
             grants["pet.present"] = {}
         if focus or reviewable:
             grants["observation.wait_fresh"] = {"occurrences": reviewable, "focus": focus}
@@ -233,7 +233,7 @@ def describe_grants(user: dict | None, context: dict, *, requested_at: datetime)
             grants["reminder.present"] = {"occurrences": eligible}
         if reviewable:
             grants["reminder.recheck"] = {"occurrences": reviewable}
-        if focus and available:
+        if focus and state in {"working", "available"}:
             phase = ref_id((context.get("current_phase") or {}).get("id"))
             grants["proposal.offer"] = {"target": phase, "background": True}
         return grants

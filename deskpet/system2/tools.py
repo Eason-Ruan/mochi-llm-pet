@@ -752,13 +752,13 @@ class System2ToolExecutor:
     def _current_proposal(self, db, scope, business_key, now, authority):
         self._expire_proposals(db, scope, now)
         for previous in proposals.get_business(db, scope, business_key):
-            if previous.state == "pending" or (previous.state == "rejected" and authority.origin != "user"):
+            if previous.state == "pending" or (previous.state == "rejected" and authority.origin != "user"
+                                               and (authority.opportunity_id or previous.valid_until > now)):
                 return previous
         return None
 
     def _queue_proposal(self, db, scope, proposal, authority, now, opportunity):
-        if (authority.origin == "user" or not opportunity or authority.opportunity_id != opportunity
-                or authority.context_revision is None):
+        if authority.origin == "user" or authority.context_revision is None:
             return None
         valid_until = min(proposal.valid_until, authority.expires_at,
                           authority.observation_valid_until or authority.expires_at)
@@ -771,11 +771,10 @@ class System2ToolExecutor:
         previous = proposals.delivery(db, scope, delivery_id)
         if previous and previous["state"] != "revoked":
             return delivery_id
-        if self.scheduler.authorize_proposal(**bounds, now=now, db=db) != opportunity:
+        if not self.scheduler.authorize_proposal(**bounds, now=now, db=db):
             return None
-        if not self.scheduler.claim_opportunity(opportunity_id=opportunity, delivery_id=delivery_id, now=now, db=db):
-            return None
-        proposals.enqueue(db, scope, proposal, delivery_id=delivery_id, opportunity_id=opportunity,
+        # Empty slot denotes a focus suggestion independent of reminder quota.
+        proposals.enqueue(db, scope, proposal, delivery_id=delivery_id, opportunity_id="",
                           context_revision=authority.context_revision, valid_until=valid_until,
                           observation_cursor=authority.observation_cursor,
                           observation_generation=authority.observation_generation)

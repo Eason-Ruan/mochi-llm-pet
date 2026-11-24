@@ -36,7 +36,7 @@ _ROUTE_ENDPOINTS = {
 
 _CHECKBOXES = (
     ("link_issues", "关联事项与专注"),
-    ("auto_adjust", "根据活动建议开始或调整专注"),
+    ("auto_adjust", "自动番茄钟（工作中也可建议）"),
     ("habits_enabled", "允许习惯自动切换阶段"),
     ("allow_proactive_movement", "允许桌宠主动移动"),
     ("reduce_motion", "减少动效"),

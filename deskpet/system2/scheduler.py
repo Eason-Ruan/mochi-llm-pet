@@ -643,28 +643,26 @@ class Scheduler:
                     and (cursor is None or head.publication_cursor >= cursor)
                     and (generation is None or head.producer_generation == generation))
 
-    def _authorize_visible(self, db, now, revision, valid_until, cursor, generation, *, proposal):
-        head = self._sync(db, now)
-        self._revoke_stale_deliveries(db, now, head)
-        if (not self._matches_context(head, now, revision, valid_until, cursor, generation)
-                or head.current.state != "available"
-                or (proposal and not self._settings(db).auto_adjust)
-                or (not proposal and _running_focus(_phase(db)))
-                or self.has_time_sensitive_candidate(now=now, db=db)):
-            return None
-        return self.get_opportunity(db=db)
-
     def authorize_proposal(self, *, context_revision: int | None, now: datetime, db=None,
-                           context_valid_until=None, observation_cursor=None, observation_generation=None) -> str | None:
+                           context_valid_until=None, observation_cursor=None, observation_generation=None) -> bool:
         with self._transaction(db) as tx:
-            return self._authorize_visible(tx, now, context_revision, context_valid_until, observation_cursor,
-                                           observation_generation, proposal=True)
+            head = self._sync(tx, now)
+            return bool(self._matches_context(head, now, context_revision, context_valid_until,
+                                              observation_cursor, observation_generation)
+                        and head.current.state in {"working", "available"} and self._settings(tx).auto_adjust
+                        and not self.has_time_sensitive_candidate(now=now, db=tx))
 
     def authorize_pet(self, *, context_revision: int | None, now: datetime, db=None,
                       context_valid_until=None, observation_cursor=None, observation_generation=None) -> str | None:
         with self._transaction(db) as tx:
-            return self._authorize_visible(tx, now, context_revision, context_valid_until, observation_cursor,
-                                           observation_generation, proposal=False)
+            head = self._sync(tx, now)
+            self._revoke_stale_deliveries(tx, now, head)
+            if (not self._matches_context(head, now, context_revision, context_valid_until,
+                                          observation_cursor, observation_generation)
+                    or head.current.state != "available" or _running_focus(_phase(tx))
+                    or self.has_time_sensitive_candidate(now=now, db=tx)):
+                return None
+            return self.get_opportunity(db=tx)
 
     def _visible_permit(self, db, now, opportunity, delivery, revision, valid_until, cursor, generation, *, proposal):
         head = self._sync(db, now)
@@ -678,6 +676,12 @@ class Scheduler:
                         context_valid_until: datetime, now: datetime, db=None,
                         observation_cursor=None, observation_generation=None) -> bool:
         with self._transaction(db) as tx:
+            if not opportunity_id:
+                return self.authorize_proposal(
+                    context_revision=context_revision, context_valid_until=context_valid_until, now=now, db=tx,
+                    observation_cursor=observation_cursor, observation_generation=observation_generation,
+                )
+            # Presentations queued by older builds retain their original slot binding.
             return self._visible_permit(tx, now, opportunity_id, delivery_id, context_revision,
                                         context_valid_until, observation_cursor, observation_generation, proposal=True)
 

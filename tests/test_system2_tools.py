@@ -166,6 +166,24 @@ def test_concurrent_proposals_amendments_and_lost_result_replay(business, monkey
     assert len(business.phases.list_phases()) == 1
 
 
+def test_focus_offer_while_working_without_habit_task_or_available_slot(business):
+    from deskpet.system2.intent import describe_grants
+
+    business.auto_adjust()
+    snapshot = business.publish(71, "working")
+    assert snapshot["opportunity_id"] is None
+    context = {"current_status": "fresh", "current": {"state": "working"},
+               "enabled_settings": {"auto_adjust": True}, "eligible_items": []}
+    grants = describe_grants(None, context, requested_at=business.clock.wall_now())
+    assert "proposal.offer" in grants and "pet.present" not in grants and "reminder.present" not in grants
+    offer = business.command("proposal.offer", _offer(), "work-focus", origin="agent", snapshot=snapshot)
+    assert business.tools.permit_presentation(offer.delivery_id)
+    assert business.tools.validate_presentation(offer.delivery_id)
+    assert business.phases.current_phase() is None
+    business.publish(72, "away")
+    assert not business.tools.validate_presentation(offer.delivery_id)
+
+
 def test_refusal_persists_in_same_opportunity_until_work_then_available(business):
     business.auto_adjust()
     snapshot = business.publish(71)

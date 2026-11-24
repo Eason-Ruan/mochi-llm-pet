@@ -275,7 +275,7 @@ def test_time_sensitive_reminder_priority_and_shared_interruption_quota(desktop)
     desktop.publish()
     snapshot = desktop.scheduler.snapshot(desktop.now)
     opportunity = snapshot['opportunity_id']
-    assert desktop.scheduler.authorize_proposal(context_revision=71, now=desktop.now) is None
+    assert not desktop.scheduler.authorize_proposal(context_revision=71, now=desktop.now)
     assert desktop.present(normal.occurrence_id)['error_code'] == 'STALE_CONTEXT'
     accepted = desktop.present(urgent.occurrence_id)
     assert accepted['status'] == 'pending'
@@ -283,7 +283,7 @@ def test_time_sensitive_reminder_priority_and_shared_interruption_quota(desktop)
     desktop.clock.advance(15)
     desktop.scheduler.poll()
     desktop.publish(revision=72)
-    assert desktop.scheduler.authorize_proposal(context_revision=72, now=desktop.now) is None
+    assert not desktop.scheduler.authorize_proposal(context_revision=72, now=desktop.now)
     assert desktop.present(urgent.occurrence_id)['delivery_id'] == accepted['delivery_id']
 
 
