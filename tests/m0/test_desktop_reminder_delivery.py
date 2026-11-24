@@ -10,6 +10,41 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_reminder_response_uses_current_version_but_rejects_replaced_occurrence():
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from deskpet.c_ui.refine import RefineSession
+
+    submissions = []
+    responses = []
+    task = {"task_id": "transfer", "version": 4, "status": "registered", "occurrence": 2,
+            "draft": {"content": "汇丰转账", "mode": "hard"}}
+    session = RefineSession.__new__(RefineSession)
+    session.snapshot = {"tasks": [task]}
+    session.presentation = SimpleNamespace(now=lambda: datetime(2026, 11, 24, tzinfo=timezone.utc))
+    session._reminder_response_events = {}
+    session._reminder_response_versions = {}
+    session.overviews = {"reminders": SimpleNamespace(set_feedback=responses.append)}
+
+    def request(*args):
+        submissions.append(args)
+        return "menu-event"
+
+    session.reminders = SimpleNamespace(request=request, busy=lambda _: False,
+                                        result=SimpleNamespace(text=lambda: "正在提交…"))
+    assert session._respond_to_reminder("snooze", "transfer", 2, seconds=600) == "menu-event"
+    assert submissions == [("snooze", "transfer", 4, {"seconds": 600, "mode": "exact"})]
+    # The worker sends the applied result ahead of its updated snapshot.
+    session._reminder_response_versions["transfer"] = 5
+    assert session._respond_to_reminder("ack", "transfer", 2) is None
+    session._reminder_response_versions.clear()
+    task.update(version=5, occurrence=3)
+    assert session._respond_to_reminder("ack", "transfer", 2) is None
+    assert len(submissions) == 1
+    assert responses[-1] == "这次提醒已更新，请查看当前安排。"
+
+
 def test_production_editor_keeps_absolute_times_and_reports_each_visible_item(tmp_path):
     code = r'''
 from datetime import datetime, timedelta, timezone

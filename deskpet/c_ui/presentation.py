@@ -1,6 +1,7 @@
 """Desktop channel selection, reconciliation, and local audio preferences."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -12,9 +13,20 @@ from PyQt6.QtWidgets import QApplication
 from deskpet.contracts import TaskView
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.system2.semantic_policy import semantic_background_enabled
-from deskpet.task_service.presentation import EARLY_OS_TRANSFER, PresentationLedger
+from deskpet.task_service.presentation import EARLY_OS_TRANSFER, PresentationLedger, native_followup_due
 
 from .native_notifications import notification_id, platform_notifications
+
+
+@dataclass(frozen=True)
+class NativeReminderFollowup:
+    delivery_id: str
+    task_id: str
+    task_version: int
+    occurrence: int
+    content: str
+    delivered: bool
+    expires_at: datetime | None
 
 
 def _session_locked():
@@ -141,7 +153,36 @@ class DesktopPresentation(QObject):
     def _active_tasks(self):
         return [TaskView.model_validate(item) for item in self.snapshot.get("tasks", [])
                 if item["status"] == "registered" and not item.get("acknowledged_at")
-                and not item.get("displayed_at") and item["draft"].get("reminder_enabled", True)]
+                and not item.get("displayed_at") and not item.get("expired_at") and not item.get("archived_at")
+                and item["draft"].get("reminder_enabled", True)]
+
+    def native_followups(self, *, include_painted=True):
+        if not self.snapshot.get("now") or not self.rows:
+            return []
+        now = self.now()
+        by_id = {task.task_id: task for task in self._active_tasks()
+                 if task.draft.expires_at is None or now < task.draft.expires_at}
+        due_followups = {}
+        for row in self.rows:
+            task = by_id.get(row["task_id"])
+            if task is None or (row["followup_painted"] and not include_painted):
+                continue
+            due = native_followup_due(task, row, now)
+            if due is None:
+                continue
+            followup = NativeReminderFollowup(row["delivery_id"], task.task_id, task.version,
+                                              task.occurrence, task.draft.content, row["state"] == "delivered",
+                                              task.draft.expires_at)
+            due_followups[task.task_id] = (due, followup)
+        return [followup for _, followup in sorted(due_followups.values(), key=lambda item: (item[0], item[1].task_id))]
+
+    def native_followup_current(self, followup, *, include_painted=False, mark_painted=False):
+        current = (self.ledger is not None and self.lock_probe() is False
+                   and self.ledger.native_followup_current(followup, self.now(), include_painted=include_painted,
+                                                          mark_painted=mark_painted))
+        if current and mark_painted:
+            self.rows = self.ledger.rows()
+        return current
 
     @staticmethod
     def _delivery_id(task):

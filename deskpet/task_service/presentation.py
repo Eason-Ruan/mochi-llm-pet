@@ -19,9 +19,33 @@ CREATE TABLE IF NOT EXISTS presentations (
 )
 """
 
+NATIVE_FOLLOWUP_TABLE = """
+CREATE TABLE IF NOT EXISTS native_followup_paints (
+    task_id TEXT NOT NULL, occurrence INTEGER NOT NULL, PRIMARY KEY(task_id, occurrence)
+)
+"""
+
 RELEASED_STATES = {"cancelled", "failed", "released", "unavailable"}
 EARLY_OS_TRANSFER = "semantic_early_transfer"
 _TRANSFER_MARGIN = timedelta(seconds=5)
+
+
+def native_followup_due(task, row, now):
+    """Return the time of an actionable native reminder for ordering in the UI."""
+    if (row["channel"] != "os_notification" or row["occurrence"] != task.occurrence
+            or (task.draft.explicit_start_at and now < task.draft.explicit_start_at)):
+        return None
+    deadline = datetime.fromisoformat(row["deadline"]) if row["deadline"] else None
+    if deadline != task.draft.hard_deadline:
+        return None
+    recorded_at = datetime.fromisoformat(row["updated_at"])
+    if row["state"] == "delivered":
+        return recorded_at
+    if row["state"] in {"submitting", "scheduled", "submitted", "unknown", "cancel_intent", "cancelling"}:
+        due = deadline or recorded_at
+        if now >= due:
+            return due
+    return None
 
 
 def running_focus(db):
@@ -63,9 +87,8 @@ class PresentationLedger:
         if row is None:
             return None
         task = TaskView.model_validate_json(row[0])
-        if ((task.version, task.occurrence) != (version, occurrence) or task.status != "registered"
-                or task.displayed_at is not None or task.acknowledged_at is not None
-                or not task.draft.reminder_enabled or (task.draft.expires_at and now >= task.draft.expires_at)):
+        if ((task.version, task.occurrence) != (version, occurrence) or not task.active_reminder
+                or task.displayed_at is not None or (task.draft.expires_at and now >= task.draft.expires_at)):
             return None
         return task
 
@@ -282,6 +305,30 @@ class PresentationLedger:
         state = "badge_shown" if command.channel == "pet_badge" else "painted"
         return self.update(command.delivery_id, {"permitted"}, state, now, current_session=True)
 
+    def native_followup_current(self, followup, now, *, include_painted=False, mark_painted=False):
+        """Check the occurrence at paint/action time without changing its native owner."""
+        try:
+            with self._transaction() as db:
+                task = self._current(db, followup.task_id, followup.task_version, followup.occurrence, now)
+                if task is None:
+                    return False
+                row = db.execute("SELECT * FROM presentations WHERE task_id=? AND delivery_id=?",
+                                 (task.task_id, followup.delivery_id)).fetchone()
+                if row is None or native_followup_due(task, row, now) is None:
+                    return False
+                key = (task.task_id, task.occurrence)
+                if mark_painted:
+                    if not db.execute("INSERT OR IGNORE INTO native_followup_paints VALUES (?,?)", key).rowcount:
+                        return False
+                    self._event(db, followup.delivery_id, task.task_id, task.version, "pet_card",
+                                "native_followup_painted", now, row["state"])
+                elif not include_painted and db.execute("SELECT 1 FROM native_followup_paints "
+                                                       "WHERE task_id=? AND occurrence=?", key).fetchone():
+                    return False
+                return True
+        except sqlite3.OperationalError:
+            return False
+
     def record_unavailable(self, task, delivery_id, now, reason):
         try:
             with self._transaction() as db:
@@ -297,7 +344,9 @@ class PresentationLedger:
             db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.01)
             db.row_factory = sqlite3.Row
             try:
-                return [dict(row) for row in db.execute("SELECT * FROM presentations ORDER BY task_version")]
+                return [dict(row) for row in db.execute("""SELECT p.*, f.task_id IS NOT NULL AS followup_painted
+                    FROM presentations p LEFT JOIN native_followup_paints f USING(task_id, occurrence)
+                    ORDER BY task_version""")]
             finally:
                 db.close()
         except sqlite3.OperationalError:

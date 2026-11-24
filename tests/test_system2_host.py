@@ -51,7 +51,9 @@ def runtime(tmp_path):
     business.close()
 
 
-def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monkeypatch):
+@pytest.mark.parametrize("semantic_chat", ["0", "1"])
+def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monkeypatch, semantic_chat):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
     business, create = runtime
     business.auto_adjust()
     snapshot = business.publish(71)
@@ -75,12 +77,15 @@ def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monk
         assert rejection.reply_to_message_id == "reject-new"
         assert rejection.payload["status"] == "applied"
         assert rejection.payload["text"] == "已拒绝建议。"
+        assert rejection.payload["parts"] == [{"source": "program", "text": "已拒绝建议。"}]
         assert not business.phases.list_phases()
     finally:
         host.close()
 
 
-def test_background_and_overlapping_query_have_separate_authority_and_reply(runtime):
+@pytest.mark.parametrize("semantic_chat", ["0", "1"])
+def test_background_and_overlapping_query_have_separate_authority_and_reply(runtime, monkeypatch, semantic_chat):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
     business, create = runtime
     business.clock.advance(120)
     business.scheduler.poll()
@@ -113,6 +118,7 @@ def test_background_and_overlapping_query_have_separate_authority_and_reply(runt
     assert business.phases.list_phases() == []
     event, = host.ui_events()
     assert event.reply_to_message_id == "query" and event.payload["text"] == "现在没有正在运行的计时。"
+    assert event.payload["parts"] == [{"source": "model", "text": "现在没有正在运行的计时。"}]
     assert "omit me" not in json.dumps(host.decision_records(), ensure_ascii=False)
     host.close()
 
@@ -173,7 +179,9 @@ def test_start_supersession_keeps_independent_item_and_actual_results(runtime, c
     host.close()
 
 
-def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again(runtime):
+@pytest.mark.parametrize("semantic_chat", ["0", "1"])
+def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again(runtime, monkeypatch, semantic_chat):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
     business, create = runtime
 
     def kill(request, data, call):
@@ -201,6 +209,10 @@ def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again
     replies = recovered.ui_events()
     assert [reply.reply_to_message_id for reply in replies] == ["lost", "interrupted"]
     assert replies[-1].payload["status"] == "interrupted"
+    assert [reply.payload["parts"] for reply in replies] == [
+        [{"source": "program", "text": "已开始 · 25 分钟"}],
+        [{"source": "program", "text": "上一轮未完成，已核对保存的执行结果。"}],
+    ]
     assert len(business.phases.list_phases()) == 1
     recovered.close()
 
@@ -236,7 +248,9 @@ def test_explicit_parameters_and_compound_commands_use_independent_admissions(ru
     host.close()
 
 
-def test_failed_or_expired_model_request_cannot_execute_or_claim_success(runtime):
+@pytest.mark.parametrize("semantic_chat", ["0", "1"])
+def test_failed_or_expired_model_request_cannot_execute_or_claim_success(runtime, monkeypatch, semantic_chat):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
     business, create = runtime
 
     def act(_request, data, call):
@@ -254,7 +268,9 @@ def test_failed_or_expired_model_request_cannot_execute_or_claim_success(runtime
                                 ("expired", "开始 25 分钟专注")):
         host.submit_user(utterance, event_id=event_id)
         assert host.pump()
-    assert [event.payload["status"] for event in host.ui_events()] == ["model_unavailable", "failed", "expired_request"]
+    replies = [event.payload for event in host.ui_events()]
+    assert [reply["status"] for reply in replies] == ["model_unavailable", "failed", "expired_request"]
+    assert all(reply["parts"] == [{"source": "program", "text": reply["text"]}] for reply in replies)
     assert not business.phases.list_phases()
     host.close()
 
@@ -280,7 +296,9 @@ def test_completed_no_tool_model_uses_literal_timer_request_once(runtime, monkey
 
 
 
-def test_remaining_time_uses_authoritative_phase_seconds_without_model(runtime):
+@pytest.mark.parametrize("semantic_chat", ["0", "1"])
+def test_remaining_time_uses_authoritative_phase_seconds_without_model(runtime, monkeypatch, semantic_chat):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
     business, create = runtime
 
     def act(_request, data, call):
@@ -295,9 +313,11 @@ def test_remaining_time_uses_authoritative_phase_seconds_without_model(runtime):
     business.clock.advance(2.45)
     host.submit_user("还剩多久？", event_id="remaining")
     assert host.pump()
-    assert [event.payload["text"] for event in host.ui_events()] == [
+    replies = [event.payload for event in host.ui_events()]
+    assert [reply["text"] for reply in replies] == [
         "当前没有活动计时。", "已开始 · 40 分钟", "还剩 39 分 58 秒。",
     ]
+    assert all(reply["parts"] == [{"source": "program", "text": reply["text"]}] for reply in replies)
     assert len(host.engine.turns) == 1
     host.close()
 
@@ -450,6 +470,7 @@ def test_conversational_reminder_uses_message_time_and_reconciles_the_actual_wri
         event, = host.ui_events()
         assert event.payload["outcome"] == "committed"
         assert event.payload["text"] == f"已设置提醒「去趟洗手间」，{due.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}。"
+        assert event.payload["parts"] == [{"source": "program", "text": event.payload["text"]}]
     finally:
         host.close()
 
@@ -483,7 +504,9 @@ def test_real_turn_binds_two_same_tool_actions_and_resolves_recent_object(runtim
         host.submit_user("填表这事先列着，屋里的衣服过二十分钟左右叫我收进来", event_id="two")
         assert host.pump() and not host.pump()
         assert len(host.engine.turns) == 1
-        assert len(host.ui_events()[0].payload["actions"]) == 2
+        payload = host.ui_events()[0].payload
+        assert len(payload["actions"]) == 2
+        assert payload["parts"] == [{"source": "program", "text": action["text"]} for action in payload["actions"]]
         original = next(task for task in business.tasks.list_tasks() if task.draft.content == "收衣服")
         assert original.draft.target_at == requested_at + timedelta(seconds=1200)
         assert original.draft.remind_after is None and original.draft.remind_by is None
@@ -530,8 +553,11 @@ def test_semantic_hypothetical_negative_quote_and_ambiguity_produce_no_write(run
         assert len(host.engine.turns) == 4
         assert not business.tasks.list_tasks()
         assert not business.phases.list_phases()
+        local_reply = host.ui_events()[0].payload
+        assert local_reply["parts"] == [{"source": "program", "text": local_reply["text"]}]
         reply = host.ui_events()[-1].payload
-        assert reply == {"status": "clarification", "text": "是要延后提醒，还是延长当前计时？"}
+        question = "是要延后提醒，还是延长当前计时？"
+        assert reply == {"status": "clarification", "text": question, "parts": [{"source": "model", "text": question}]}
     finally:
         host.close()
 
@@ -673,6 +699,10 @@ def test_receipt_and_concrete_clarification_both_reach_chat(runtime):
         payload = host.ui_events()[0].payload
         assert payload["status"] == "partial"
         assert payload["text"] == "已创建事项。\n你想推迟收衣服的提醒，还是交材料的提醒？"
+        assert payload["parts"] == [
+            {"source": "program", "text": "已创建事项。"},
+            {"source": "model", "text": "你想推迟收衣服的提醒，还是交材料的提醒？"},
+        ]
         assert len(payload["actions"]) == 1 and payload["actions"][0]["outcome"] == "committed"
         assert len(business.tasks.list_tasks()) == 1
     finally:
@@ -722,7 +752,12 @@ def test_receipt_version_advance_does_not_adopt_another_user_change(runtime, mon
         assert host.pump()
         task, = business.tasks.list_tasks()
         assert task.draft.content == "周末买牛奶" and task.effective_issue_status == "created"
-        assert host.ui_events()[0].payload["status"] == "partial"
+        payload = host.ui_events()[0].payload
+        assert payload["status"] == "partial"
+        assert payload["parts"] == [
+            {"source": "program", "text": "已创建事项。"},
+            {"source": "program", "text": "相关事项或设置已经更新。请刷新后再确认。"},
+        ]
     finally:
         host.close()
 

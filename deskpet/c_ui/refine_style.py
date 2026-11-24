@@ -1,7 +1,7 @@
 """The cream and sage treatment shared by Mochi's desktop panels."""
 from functools import cache
 
-from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtCore import QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
@@ -166,6 +166,22 @@ class DetailPanel(_Panel):
         self._content = content
         self._scroll = _scroll_area(content)
         self.body.addWidget(self._scroll)
+        self._reveal_target = None
+
+    def reveal_on_show(self, widget):
+        self._reveal_target = widget
+        if self.isVisible():
+            self._reveal_widget()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._reveal_target is not None:
+            QTimer.singleShot(0, self._reveal_widget)
+
+    def _reveal_widget(self):
+        if self._reveal_target is not None and self.isVisible():
+            self.ensureWidgetVisible(self._reveal_target)
+            self._reveal_target = None
 
     def set_height_limit(self, max_height):
         margins = self.body.contentsMargins()

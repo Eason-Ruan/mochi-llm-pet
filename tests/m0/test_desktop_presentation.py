@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 from PyQt6.QtWidgets import QApplication
 
-from deskpet.c_ui.presentation import DesktopPresentation
+from deskpet.c_ui.presentation import DesktopPresentation, NativeReminderFollowup
+from deskpet.c_ui.refine_delivery import RefineDeliveryMixin
 from deskpet.contracts import TaskDraft
 from deskpet.mocks.clock import FakeClock
 from deskpet.settings import SettingsStore
@@ -194,6 +195,7 @@ def test_hidden_deadline_reports_permission_failure_and_unknown_after_acceptance
     notes = presenter.observe(snapshot(clock, tasks, **settings))
     assert not notifications.submissions
     assert notifications.status in notes[task.task_id]
+    assert presenter.native_followups() == []
     assert not presenter.permit(queued)
 
     notifications.available = True
@@ -216,6 +218,98 @@ def test_hidden_deadline_reports_permission_failure_and_unknown_after_acceptance
         assert "投递结果未知" in notes[task.task_id]
         assert not presenter.permit(queued)
         assert not tasks.get(task.task_id).displayed_at and not tasks.get(task.task_id).acknowledged_at
+
+
+@pytest.mark.parametrize("delivered", [False, True])
+def test_native_followup_recovers_existing_os_only_occurrence_once_at_or_after_due(business, delivered):
+    clock, delivery, tasks = business
+    notifications = NotificationProbe()
+    task = register(tasks, clock, mode="hard", due=20)
+    presenter = DesktopPresentation(path=tasks.path, notifications=notifications, synthetic=True)
+    settings = {"allow_system_notifications": True, "reminder_sound": True}
+    presenter.observe(snapshot(clock, tasks, **settings))
+    assert presenter.native_followups() == []
+    identifier, due, sound = notifications.submissions[0]
+    assert due == task.draft.hard_deadline and sound is False
+
+    # The old application left only the native ledger row. Startup both
+    # migrates the database and recovers the occurrence after its deadline.
+    with sqlite3.connect(tasks.path) as db:
+        db.execute("DROP TABLE native_followup_paints")
+    notifications.pending.clear()
+    if delivered:
+        notifications.delivered.add(identifier)
+    clock.advance(30)
+    locked = True
+    settings["allow_system_notifications"] = False
+    with SQLiteTaskService(clock, delivery, lambda *_args, **_fields: None, path=tasks.path) as restarted:
+        restarted.pump()
+        assert not delivery.commands
+        presenter = DesktopPresentation(path=tasks.path, notifications=notifications, lock_probe=lambda: locked,
+                                        synthetic=True)
+        notes = presenter.observe(snapshot(clock, restarted, **settings))
+        followup, = presenter.native_followups(include_painted=False)
+        assert (followup.task_id, followup.task_version, followup.occurrence, followup.content, followup.delivered) == (
+            task.task_id, task.version, task.occurrence, task.draft.content, delivered)
+        assert ("已送达" in notes[task.task_id]) == delivered
+        assert not presenter.native_followup_current(followup, mark_painted=True)
+        locked = False
+        assert presenter.native_followup_current(followup)
+        assert presenter.native_followup_current(followup, mark_painted=True)
+        assert not presenter.native_followup_current(followup, mark_painted=True)
+        assert presenter.native_followup_current(followup, include_painted=True)
+
+        presenter = DesktopPresentation(path=tasks.path, notifications=notifications, synthetic=True)
+        presenter.observe(snapshot(clock, restarted, **settings))
+        assert presenter.native_followups(include_painted=False) == []
+        assert presenter.native_followups() == [followup]
+        assert presenter.ledger.rows()[0]["state"] == ("delivered" if delivered else "unknown")
+        assert notifications.submissions == [(identifier, due, False)]
+        assert restarted.get(task.task_id).displayed_at is None
+        assert restarted.get(task.task_id).acknowledged_at is None
+        with sqlite3.connect(tasks.path) as db:
+            assert db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 0
+            events = db.execute("SELECT kind FROM events WHERE kind LIKE 'sound.%' OR "
+                                "kind='presentation.native_followup_painted'").fetchall()
+        assert events == [("presentation.native_followup_painted",)]
+
+        assert command(restarted, "ack").status == "applied"
+        assert not presenter.native_followup_current(followup, include_painted=True)
+        presenter.observe(snapshot(clock, restarted, **settings))
+        assert presenter.native_followups() == []
+
+
+@pytest.mark.parametrize(("seconds_remaining", "elapsed", "secondary_label", "secondary_action"), [
+    (299, 0, "查看详情", "details"),
+    (300, 0, "查看详情", "details"),
+    (301, 0, "5 分钟后", "snooze"),
+    (301, 1, "5 分钟后", "details"),
+])
+def test_native_card_uses_details_when_five_minute_snooze_would_reach_expiry(
+        seconds_remaining, elapsed, secondary_label, secondary_action):
+    clock = FakeClock()
+    followup = NativeReminderFollowup("native-id", "task", 1, 1, "Test reminder", True,
+                                      clock.wall_now() + timedelta(seconds=seconds_remaining))
+    actions = []
+    session = RefineDeliveryMixin()
+    session.production = True
+    session.presentation = SimpleNamespace(
+        now=clock.wall_now,
+        native_followups=lambda **kwargs: [followup],
+        native_followup_current=lambda *_args, **_kwargs: True,
+    )
+    session._can_show_reminder = lambda **kwargs: True
+    session._valid_command = lambda _followup: True
+    session._respond_to_reminder = lambda action, *subject, seconds=None: actions.append((action, subject, seconds))
+    session._customize_reminder_snooze = lambda *subject: actions.append(("details", subject, None))
+
+    prompt = session._native_followup_prompt()
+    assert prompt.answer_labels == ("确认收到", secondary_label)
+    clock.advance(elapsed)
+    prompt.on_answer(False)
+    prompt.on_answer(True)
+    assert actions == [(secondary_action, ("task", 1), 300 if secondary_action == "snooze" else None),
+                       ("ack", ("task", 1), None)]
 
 
 def test_hidden_deadline_retries_known_failure_with_same_platform_id(business):

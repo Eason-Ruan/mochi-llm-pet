@@ -233,6 +233,8 @@ class _Bubble(QFrame):
             for action, label_text, value in (("yes", yes, True), ("no", no, False)):
                 button = _button(self, f"refine-bubble-{action}", label_text, 52, 29)
                 button.setText(label_text)
+                button.ensurePolished()
+                button.setFixedWidth(max(52, button.fontMetrics().horizontalAdvance(label_text) + 16))
                 button.setProperty("affirmative", value)
                 button.clicked.connect(lambda _checked=False, answer=value: self._answer(answer))
                 row.addWidget(button)

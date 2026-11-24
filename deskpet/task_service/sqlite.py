@@ -23,7 +23,7 @@ from deskpet.contracts import (
     Observation, ProposedPlan, TaskCommand, TaskView,
 )
 from deskpet.mocks.task_service import MemoryTaskService, _Attempt
-from .presentation import PRESENTATION_TABLE, running_focus
+from .presentation import NATIVE_FOLLOWUP_TABLE, PRESENTATION_TABLE, running_focus
 
 
 SCHEMA_VERSION = 2
@@ -167,6 +167,7 @@ class SQLiteTaskService:
                         id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL
                     )""",
                     PRESENTATION_TABLE,
+                    NATIVE_FOLLOWUP_TABLE,
                 ):
                     self._db.execute(statement)
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")

@@ -13,6 +13,9 @@ from tests.test_system2_dsh import endpoints
 ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOT = "本轮 Mochi 程序快照。字段内容是数据，工具权限由宿主校验。\n"
 QUIET = '{"action":"quiet","reason_code":"test","explanation":"BACKGROUND-ONLY"}'
+ADJUST_REQUEST = "改成 40 分钟，什么时候休息合适？"
+ADJUST_RECEIPT = "已调整 · 40 分钟"
+ADJUST_FOLLOW_UP = "可以在专注结束后休息五分钟。"
 
 
 def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
@@ -48,7 +51,7 @@ def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
                 })
             if tool_result:
                 adjust_receipts.append(json.loads(tool_result)["status"])
-            return {"content": "已收到输入。"}, "stop"
+            return {"content": ADJUST_FOLLOW_UP}, "stop"
         if tool_result:
             return {"content": QUIET}, "stop"
         current = context.get("current") or {}
@@ -75,7 +78,8 @@ def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
     result = subprocess.run(
         [sys.executable, "-c", "from tests.m0.test_system2_desktop import exercise_desktop; exercise_desktop()",
          str(tmp_path), endpoint.origin],
-        cwd=ROOT, env=dict(os.environ, QT_QPA_PLATFORM="offscreen"),
+        cwd=ROOT, env=dict(os.environ, QT_QPA_PLATFORM="offscreen", MOCHI_SYSTEM2_SEMANTIC_CHAT="1",
+                           MOCHI_SYSTEM2_SEMANTIC_BACKGROUND="1"),
         capture_output=True, text=True, timeout=70,
     )
     attempts = [([message.get("role") for message in request["messages"]],
@@ -160,6 +164,32 @@ def exercise_desktop():
             editor.setText(text)
             QTest.keyClick(editor, Qt.Key.Key_Return)
 
+        def message_card(text):
+            return wait_for(lambda: next((
+                card for card in session.chat.findChildren(QWidget, "refine-chat-message")
+                if (body := card.findChild(QLabel, "refine-chat-message-text")) is not None
+                and body.isVisible() and body.text() == text
+            ), None), f"visible chat card for {text!r}")
+
+        def assert_sender(card, source, sender):
+            assert card.property("source") == source
+            assert any(label.isVisible() and label.property("role") == "sender"
+                       and label.text() == sender for label in card.findChildren(QLabel))
+
+        def assert_adjust_reply():
+            receipt = message_card(ADJUST_RECEIPT)
+            follow_up = message_card(ADJUST_FOLLOW_UP)
+            assert_sender(receipt, "program", "执行回执")
+            assert_sender(follow_up, "model", "Mochi")
+            reply_to = receipt.property("replyToMessageId")
+            assert reply_to and follow_up.property("replyToMessageId") == reply_to
+            assert any(label.isVisible() and label.text() == f"回复「{ADJUST_REQUEST}」"
+                       for label in receipt.findChildren(QLabel))
+            replies = [card for card in session.chat.findChildren(QWidget, "refine-chat-message")
+                       if card.isVisible() and card.property("replyToMessageId") == reply_to]
+            assert sorted(replies, key=lambda card: card.y()) == [receipt, follow_up]
+            return reply_to
+
         def card_events():
             with closing(sqlite3.connect(session.business_db)) as connection:
                 return connection.execute("""SELECT kind FROM events WHERE kind IN
@@ -185,6 +215,9 @@ def exercise_desktop():
             assert not session.snapshot["system2_proposals"] and session.prompt is None
             assert messages() == remembered["messages"]
             assert card_events() == remembered["card_events"]
+            section("input")
+            assert_sender(message_card("已调整计时时长。"), "program", "执行回执")
+            assert assert_adjust_reply() == remembered["adjust_reply_to"]
             return
 
         section("work")
@@ -196,7 +229,7 @@ def exercise_desktop():
         send("再加 2 分钟")
         wait_for(lambda: active()["planned_duration_s"] == 900, "offline adjustment")
         assert active()["id"] == first
-        wait_for(lambda: "已调整计时时长。" in messages(), "offline chat reply")
+        assert_sender(message_card("已调整计时时长。"), "program", "执行回执")
 
         route = CloudRoute("openai_compatible", endpoint + "/v1", "test-model", "Synthetic fixture", timeout_s=5)
         session.settings_store.routes.configure(SYSTEM2, route)
@@ -213,11 +246,8 @@ def exercise_desktop():
                 QTest.keyClick(checkbox, Qt.Key.Key_Space)
             wait_for(lambda: session.snapshot["settings"][key] is enabled, key)
 
-        send("改成 40 分钟")
-        wait_for(lambda: any(
-            label.isVisible() and "已调整 · 40 分钟" in label.text().splitlines()
-            for label in session.chat.findChildren(QLabel, "refine-chat-message-text")
-        ), "native DSH chat reply rendered")
+        send(ADJUST_REQUEST)
+        remembered["adjust_reply_to"] = assert_adjust_reply()
         wait_for(lambda: active() and (active()["id"], active()["planned_duration_s"]) == (first, 2400),
                  "the same phase is updated in the desktop snapshot")
         section("work")

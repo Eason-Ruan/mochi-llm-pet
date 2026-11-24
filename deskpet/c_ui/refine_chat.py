@@ -25,6 +25,13 @@ PANEL_WIDTH = 292
 DEFAULT_MAX_HEIGHT = 420
 MIN_HEIGHT = 134
 
+REPLY_TITLES = {
+    "model": "Mochi",
+    "program": "执行回执",
+    "status": "系统反馈",
+    "legacy": "历史回复",
+}
+
 
 STYLE = """
 QFrame#refine-chat-panel {
@@ -34,13 +41,20 @@ QFrame#refine-chat-shadow { background: #C8B7A1; border-radius: 13px; }
 QFrame#refine-chat-message, QFrame#refine-chat-composer {
     background: #FDFAF4; border: 1px solid #DEC8AA; border-radius: 8px;
 }
-QFrame#refine-chat-message[speaker="mochi"] {
+QFrame#refine-chat-message[source="model"] {
     background: #DDEAD7; border-color: #8EAD85;
+}
+QFrame#refine-chat-message[source="program"] {
+    background: #E7EDF4; border-color: #94A9C0; border-left: 3px solid #6D89A7;
+}
+QFrame#refine-chat-message[source="status"], QFrame#refine-chat-message[source="legacy"] {
+    background: #F2EEE7; border-color: #C7BDAF;
 }
 QLabel { background: transparent; color: #302821; border: none; font-size: 12px; }
 QLabel[role="sender"] { color: #645546; font-size: 11px; font-weight: 700; }
-QLabel[role="sender"][speaker="mochi"], QLabel[role="sender"][speaker="you"] { font-size: 10px; }
-QLabel[role="sender"][speaker="mochi"] { color: #34513A; }
+QLabel[role="sender"][source] { font-size: 10px; }
+QLabel[role="sender"][source="model"] { color: #34513A; }
+QLabel[role="sender"][source="program"] { color: #364E68; }
 QLabel#refine-chat-elapsed { color: #645546; font-size: 11px; }
 QLineEdit#refine-chat-editor {
     background: transparent; border: none; color: #302821; font-size: 12px;
@@ -68,6 +82,7 @@ class Message:
     pending: bool = False
     reply_to: str | None = None
     reply_source: str | None = None
+    source: str = "user"
 
 
 class _GestureButton(QPushButton):
@@ -247,8 +262,8 @@ class RefineChat(QWidget):
         self._route_status = None
         self._voice_available = store is None
         self._script = conversation or (DemoConversation() if store is None else LocalConversation())
-        messages, draft, pending = store.load() if store is not None else ([], "", None)
-        self._messages = [Message(*item) for item in messages]
+        _, draft, pending = store.load() if store is not None else ([], "", None)
+        self._messages: list[Message] = []
         self._pending = (pending[0], DemoTurn(**pending[1])) if pending else None
         self.recovered_event = self._pending[0] if pending else None
         self._preferred = "voice" if self._voice_available else "typing"
@@ -316,7 +331,7 @@ class RefineChat(QWidget):
         self._grip.dragged.connect(self._resize_from_grip)
         self._grip.finished.connect(self._commit_height)
         self._panel_layout.addWidget(self._grip)
-        if self._system2 is not None:
+        if self._store is not None:
             self.refresh_projection(self._store.projection_version())
 
     def sizeHint(self) -> QSize:
@@ -454,12 +469,15 @@ class RefineChat(QWidget):
             except sqlite3.Error:
                 self.storage_error.emit("暂时无法保存对话。")
                 return
-        self._messages.append(Message(speaker, value))
+        else:
+            self._messages.append(Message(speaker, value))
         self._composition = None
         self._voice_timer.stop()
         self._draft = ""
         self._follow_up = False
         if turn.action is not None:
+            if self._store is not None:
+                self._read_projection(self._store.projection_version())
             try:
                 self._pending = (self._submit(turn.action), turn)
             except (ValueError, RuntimeError):
@@ -484,16 +502,25 @@ class RefineChat(QWidget):
         self._request_typing_focus()
 
     def refresh_projection(self, version):
-        if self._system2 is None or version == self._projection_version:
+        if self._store is None or version == self._projection_version:
             return
         had_focus = bool(self._editor and self._editor.hasFocus())
-        self._messages = [Message(*row) for row in self._store.projected_messages()]
-        self._projection_version = version
+        self._read_projection(version)
         if self._messages:
             self._follow_up = True
         self._render()
         if had_focus:
             self._request_typing_focus()
+
+    def _read_projection(self, version):
+        rows = self._store.projected_messages(include_parts=True)
+        self._messages = [
+            Message(speaker, part["text"], id=message_id, pending=pending, reply_to=reply_to,
+                    reply_source=reply_source if index == 0 else None, source=part["source"])
+            for speaker, _, message_id, pending, reply_to, reply_source, parts in rows
+            for index, part in enumerate(parts)
+        ]
+        self._projection_version = version
 
     def refresh_route(self, status):
         if status != self._route_status:
@@ -510,14 +537,17 @@ class RefineChat(QWidget):
         self._supersedes_message_id = None
         self._compose("typing")
 
-    def _reply(self, text: str, follow_up: bool):
-        self._messages.append(Message("Mochi", text))
+    def _reply(self, text: str, follow_up: bool, *, source="program"):
+        if self._store is not None:
+            self._read_projection(self._store.projection_version())
+        else:
+            self._messages.append(Message("Mochi", text, source=source))
         self._follow_up = follow_up
 
     def append_message(self, text: str):
         if self._store is not None:
             self._store.append_message("Mochi", text)
-        self._reply(text, True)
+        self._reply(text, True, source="legacy")
         self._render()
 
     def _finish_turn(self, text: str, follow_up: bool):
@@ -549,33 +579,35 @@ class RefineChat(QWidget):
         self._render()
 
     @staticmethod
-    def _label(text: str, *, sender=False, speaker=None) -> QLabel:
+    def _label(text: str, *, sender=False, source=None) -> QLabel:
         label = QLabel(text)
         label.setTextFormat(Qt.TextFormat.PlainText)
         if sender:
             label.setProperty("role", "sender")
-            if speaker:
-                label.setProperty("speaker", speaker)
+            if source:
+                label.setProperty("source", source)
         else:
             label.setWordWrap(True)
             label.setObjectName("refine-chat-message-text")
         return label
 
     def _message_card(self, message: Message) -> QFrame:
-        mochi = message.speaker == "Mochi"
         card = _MessageCard()
-        if mochi:
-            card.setProperty("speaker", "mochi")
+        card.setProperty("source", message.source)
+        if message.reply_to:
+            card.setProperty("replyToMessageId", message.reply_to)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(8, 7, 8, 7)
         layout.setSpacing(2)
-        layout.addWidget(self._label(message.speaker, sender=True, speaker="mochi" if mochi else "you"))
+        title = REPLY_TITLES.get(message.source, message.speaker)
+        layout.addWidget(self._label(title, sender=True, source=message.source))
         if message.reply_to and message.reply_source:
             quotation = message.reply_source[:44] + ("…" if len(message.reply_source) > 44 else "")
             reply = self._label(f"回复「{quotation}」", sender=True)
+            reply.setWordWrap(True)
             reply.setProperty("replyToMessageId", message.reply_to)
             layout.addWidget(reply)
-        card.body = _MessageBody(message.text, markdown=mochi)
+        card.body = _MessageBody(message.text, markdown=message.source in {"model", "legacy"})
         layout.addWidget(card.body)
         if message.pending:
             status = QHBoxLayout()
@@ -702,7 +734,7 @@ class RefineChat(QWidget):
             configure.clicked.connect(self._configure_system2)
             self._extras.addWidget(configure)
         if self._pending is not None:
-            self._extras.addWidget(self._message_card(Message("Mochi", "正在更新…")))
+            self._extras.addWidget(self._message_card(Message("", "正在更新…", source="status")))
         self._history.setVisible(bool(self._messages or self._extras.count()))
 
         self.toolbar_mode_changed.emit(self._composition if not self._messages else None)

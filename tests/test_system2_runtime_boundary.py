@@ -374,7 +374,11 @@ def test_question_shaped_write_claim_is_replaced_with_host_owned_text(desktop):
         host.submit_user("记下整理实验记录", event_id="unacknowledged-write")
         assert host.pump()
         event, = host.ui_events()
-        assert event.payload == {"status": "failed", "text": "这次没有执行成功。"}
+        assert event.payload == {
+            "status": "failed",
+            "text": "这次没有执行成功。",
+            "parts": [{"source": "program", "text": "这次没有执行成功。"}],
+        }
         assert not desktop.tasks.list_tasks()
     finally:
         host.close()

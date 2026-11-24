@@ -304,22 +304,29 @@ class ReminderPanel(QGroupBox):
             else:
                 row.addWidget(button)
         management.addLayout(row)
-        row = QHBoxLayout()
         self.snooze_seconds = QSpinBox()
         self.snooze_seconds.setRange(1, 604800)
         self.snooze_seconds.setValue(300 if advanced else 600)
         self.snooze_seconds.setSuffix(" 秒后")
         self.buttons["snooze"] = QPushButton("延后提醒")
         self.buttons["snooze"].clicked.connect(lambda: self._selected_action("snooze"))
-        row.addWidget(self.snooze_seconds)
         if advanced:
             self.snooze_mode = MenuField()
             self.snooze_mode.addItem("左右", "flexible_target")
             self.snooze_mode.addItem("以后", "no_earlier")
             self.snooze_mode.addItem("准点", "exact")
-            row.addWidget(self.snooze_mode)
-        row.addWidget(self.buttons["snooze"])
-        management.addLayout(row)
+            self.snooze_controls = QWidget()
+            controls = QGridLayout(self.snooze_controls)
+            controls.setContentsMargins(0, 0, 0, 0)
+            controls.addWidget(self.snooze_seconds, 0, 0)
+            controls.addWidget(self.snooze_mode, 0, 1)
+            controls.addWidget(self.buttons["snooze"], 1, 0, 1, 2)
+            management.addWidget(self.snooze_controls)
+        else:
+            row = QHBoxLayout()
+            row.addWidget(self.snooze_seconds)
+            row.addWidget(self.buttons["snooze"])
+            management.addLayout(row)
         self.snooze_preview = label("")
         management.addWidget(self.snooze_preview)
         self.result = label("草稿确认前不会调度提醒。")
@@ -337,6 +344,13 @@ class ReminderPanel(QGroupBox):
     def selected(self):
         item = self.tasks.currentItem()
         return self.view(item.data(Qt.ItemDataRole.UserRole)) if item else None
+
+    def select_task(self, task_id):
+        for index in range(self.tasks.count()):
+            item = self.tasks.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == task_id:
+                self.tasks.setCurrentItem(item)
+                break
 
     def busy(self, task_id):
         return any(p["task_id"] == task_id for p in self.pending.values())

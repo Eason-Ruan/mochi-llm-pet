@@ -56,6 +56,8 @@ class RefineSession(RefineDeliveryMixin):
         self._pending_invite = None
         self._pending_habit = None
         self._pending_settings = None
+        self._reminder_response_events = {}
+        self._reminder_response_versions = {}
         self._invite_waiting = False
         self._closing = False
         self._last_service_error = None
@@ -147,10 +149,12 @@ class RefineSession(RefineDeliveryMixin):
         if self.production:
             self.detail_panels = self.panels.copy()
             self.overviews = {
-                "reminders": RefineReminders(timezone=user_timezone),
+                "reminders": RefineReminders(timezone=user_timezone, respond=self._respond_to_reminder,
+                                             customize=self._customize_reminder_snooze, busy=self._reminder_response_busy),
                 "work": RefineWork(),
                 "settings": RefineSettings(voice_available=False),
             }
+            self.reminders.actions_changed.connect(self.overviews["reminders"].refresh_actions)
             for key, label in (("reminders", "管理提醒"), ("work", "管理计时"), ("settings", "更多设置")):
                 self.overviews[key].add_manage_action(label, lambda checked=False, name=key: self._panel_details(name, True))
             back = QPushButton("返回摘要")
@@ -244,6 +248,42 @@ class RefineSession(RefineDeliveryMixin):
         self.panels[key] = self.detail_panels[key] if show else self.overviews[key]
         if self.section == key:
             self.pet.set_section(key, self.panels[key])
+
+    def _current_reminder_occurrence(self, task_id, occurrence):
+        task = next((task for task in active_reminders(self.snapshot) if task["task_id"] == task_id
+                     and task.get("occurrence", 1) == occurrence), None)
+        expires_at = task["draft"].get("expires_at") if task else None
+        if expires_at and self.presentation.now() >= datetime.fromisoformat(expires_at):
+            return None
+        return task
+
+    def _respond_to_reminder(self, kind, task_id, occurrence, *, seconds=None):
+        overview = self.overviews["reminders"]
+        task = self._current_reminder_occurrence(task_id, occurrence)
+        if task is None:
+            overview.set_feedback("这次提醒已更新，请查看当前安排。")
+            return None
+        if self._reminder_response_busy(task_id):
+            return None
+        payload = {"seconds": seconds, "mode": "exact"} if kind == "snooze" else None
+        event = self.reminders.request(kind, task_id, task["version"], payload)
+        overview.set_feedback(self.reminders.result.text())
+        if event:
+            self._reminder_response_events[event] = task_id
+        return event
+
+    def _reminder_response_busy(self, task_id):
+        return task_id in self._reminder_response_versions or self.reminders.busy(task_id)
+
+    def _customize_reminder_snooze(self, task_id, occurrence):
+        if self._current_reminder_occurrence(task_id, occurrence) is None:
+            self.overviews["reminders"].set_feedback("这次提醒已更新，请查看当前安排。")
+            return
+        self._show_section("reminders")
+        self.reminders.open_delivery_group(None)
+        self.reminders.select_task(task_id)
+        self.detail_panels["reminders"].reveal_on_show(self.reminders.snooze_controls)
+        self._panel_details("reminders", True)
 
     def _open_model_settings(self):
         self._show_section("settings")
@@ -339,7 +379,13 @@ class RefineSession(RefineDeliveryMixin):
         if self.production:
             self.proposal_card.complete(event)
             self.settings_panel.receive_habit_result(result)
+            reminder_id = self._reminder_response_events.pop(event, None)
+            version = result.get("actual_version")
+            if reminder_id is not None and version and result.get("status") == "applied":
+                self._reminder_response_versions[reminder_id] = version
             self.reminders.receive_result(result)
+            if reminder_id is not None:
+                self.overviews["reminders"].set_feedback(self.reminders.result.text())
             self.work.receive_result(result)
             if event and event == self._pending_settings:
                 self._pending_settings = None
@@ -370,7 +416,7 @@ class RefineSession(RefineDeliveryMixin):
         self.snapshot = snapshot
         notes = self._render_reminder_delivery(snapshot)
         if self.production:
-            self.overviews["reminders"].render_snapshot(snapshot)
+            self._render_reminder_overview(snapshot)
             self.overviews["work"].render_snapshot(snapshot)
             self.overviews["settings"].policy_badge.setText("开始前询问" if snapshot["settings"]["auto_adjust"] else "已关闭")
             self.reminders.render_snapshot({**snapshot, "presentation_pending": notes})
@@ -387,6 +433,29 @@ class RefineSession(RefineDeliveryMixin):
             self.pet.set_proactive_movement(settings["allow_proactive_movement"])
             self._render_system2(snapshot)
         self._render_toolbar()
+
+    def _render_reminder_overview(self, snapshot):
+        now = self.presentation.now(snapshot)
+        for task in snapshot.get("tasks", ()):
+            task_id = task["task_id"]
+            version = self._reminder_response_versions.get(task_id)
+            if version is not None and task["version"] >= version:
+                self._reminder_response_versions.pop(task_id)
+        pending = snapshot.get("pending_deliveries", {})
+        presented = {(row["task_id"], row["occurrence"]) for row in self.presentation.rows
+                     if row["state"] in {"painted", "badge_shown", "grouped"}}
+        presented.update((item.task_id, item.occurrence) for item in self.presentation.native_followups())
+        actionable = set()
+        for task in active_reminders(snapshot):
+            draft = task["draft"]
+            if draft.get("expires_at") and now >= datetime.fromisoformat(draft["expires_at"]):
+                continue
+            subject = (task["task_id"], task.get("occurrence", 1))
+            deadline = draft.get("remind_by") or draft.get("latest_first_delivery_at")
+            if (task.get("displayed_at") or subject in presented or pending.get(subject[0]) == task["version"]
+                    or (deadline and now >= datetime.fromisoformat(deadline))):
+                actionable.add(subject)
+        self.overviews["reminders"].render_snapshot(snapshot, actionable=actionable)
 
     def _render_system2(self, snapshot):
         semantic = semantic_background_enabled()

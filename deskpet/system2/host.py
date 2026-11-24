@@ -191,6 +191,11 @@ def _result_reply(function: str, result: dict, timezone: str | None = None) -> d
             "result_ref": result.get("subject_ref"), "delivery_id": result.get("delivery_id")}
 
 
+def _with_reply_source(reply: dict, source: str) -> dict:
+    text = reply["text"]
+    return {**reply, "parts": [{"source": source, "text": text}] if text.strip() else []}
+
+
 def _chat_attempt_target(function: str, args: dict) -> str | None:
     """Identify repeated work on the same subject without persisting untrusted arguments."""
     if function == "phase.start":
@@ -844,7 +849,7 @@ class System2Host:
         semantic = semantic_chat_enabled() and not (admission.user_intent or {}).get("proposal_button")
         if receipts:
             if not semantic:
-                return _result_reply(*receipts[-1])
+                return _with_reply_source(_result_reply(*receipts[-1]), "program")
             actions = []
             for index, (name, result) in enumerate(receipts):
                 target = result.get("_attempt_target")
@@ -859,27 +864,35 @@ class System2Host:
                 follow_up = "".join(sentence for sentence in sentences if sentence and not _UNSUPPORTED_WRITE.search(sentence)
                                     and not re.fullmatch(r"(?:好的?|明白|收到|了解|已完成|已处理|已执行|完成|quiet)[。！! ]*", sentence))
             if len(actions) == 1 and not follow_up:
-                return actions[0]
+                return _with_reply_source(actions[0], "program")
             texts = [action["text"] for action in actions]
+            parts = [{"source": "program", "text": text} for text in texts if text.strip()]
             if follow_up:
                 texts.append(follow_up)
+                parts.append({"source": "model", "text": follow_up})
             success = sum(action["status"] in _SUCCESS for action in actions)
             unresolved = follow_up.endswith(("？", "?"))
             status = ("applied" if success == len(actions) and not unresolved else
                       "partial" if success else "rejected")
-            return {"text": "\n".join(texts), "status": status, "actions": actions}
+            return {"text": "\n".join(texts), "status": status, "actions": actions, "parts": parts}
         if failure:
-            return {"text": _REASONS.get(failure, "这次判断没有完成。"), "status": failure}
+            return _with_reply_source(
+                {"text": _REASONS.get(failure, "这次判断没有完成。"), "status": failure}, "program",
+            )
         text = reply.text.strip()
         if grants and not semantic:
             if text.endswith(("？", "?")) and not _UNSUPPORTED_WRITE.search(text):
-                return {"text": "请再说明你要操作的对象或参数。", "status": "clarification"}
-            return {"text": "这次没有确认任何操作。", "status": "failed"}
-        if _UNSUPPORTED_WRITE.search(text):
-            return {"text": "这次没有执行成功。" if semantic else "这次没有确认任何操作。", "status": "failed"}
-        if text and text.casefold() != "quiet":
-            return {"text": text[:4000], "status": "clarification" if text.endswith(("？", "?")) else "answered"}
-        return {"text": "这次没有收到答复。", "status": "failed"}
+                text, status = "请再说明你要操作的对象或参数。", "clarification"
+            else:
+                text, status = "这次没有确认任何操作。", "failed"
+        elif _UNSUPPORTED_WRITE.search(text):
+            text, status = "这次没有执行成功。" if semantic else "这次没有确认任何操作。", "failed"
+        elif text and text.casefold() != "quiet":
+            status = "clarification" if text.endswith(("？", "?")) else "answered"
+            return _with_reply_source({"text": text[:4000], "status": status}, "model")
+        else:
+            text, status = "这次没有收到答复。", "failed"
+        return _with_reply_source({"text": text, "status": status}, "program")
 
     def _finish(self, admission, engine_reply, failure, grants, context, as_of, *, local_reply=None):
         current = self._store.state(admission.admission_id)
@@ -887,9 +900,10 @@ class System2Host:
         if current.state in {"superseded", "interrupted"}:
             failure = current.state
             engine_reply = EngineReply("")
-        response = local_reply if local_reply is not None and not failure else self._user_reply(
-            admission, receipts, engine_reply, failure, grants,
-        )
+        if local_reply is not None and not failure:
+            response = _with_reply_source(local_reply, "program")
+        else:
+            response = self._user_reply(admission, receipts, engine_reply, failure, grants)
         decision = self._decision(admission, as_of, receipts, engine_reply, failure, context)
         recover_wakes = None
         if (admission.source == "background" and failure in {"interrupted", "model_unavailable", "expired_request"}

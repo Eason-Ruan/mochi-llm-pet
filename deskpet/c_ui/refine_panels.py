@@ -1,13 +1,15 @@
-"""Read-only reminders and focus summaries, with an editable input preference."""
+"""Reminder, focus and settings summaries for the desktop toolbar."""
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -16,7 +18,7 @@ from PyQt6.QtWidgets import (
 
 from .refine_icons import icon
 from .refine_style import (
-    GREEN, GREEN_TINT, INK, MUTED, OUTLINE, PANEL_WIDTH, PAPER, SAND,
+    CARD_OUTLINE, GREEN, GREEN_TINT, INK, MUTED, OUTLINE, PANEL_WIDTH, PAPER, SAND,
     _Panel, _card, _font, _scroll_area, _text, _title,
 )
 from .time_format import local_time
@@ -95,9 +97,12 @@ def _size_wrapped_label(label, line_height, line_width):
 class RefineReminders(_Panel):
     """List every registered reminder, including delivered reminders awaiting action."""
 
-    def __init__(self, parent=None, *, timezone=None):
+    def __init__(self, parent=None, *, timezone=None, respond=None, customize=None, busy=None):
         super().__init__(parent)
         self.timezone = timezone
+        self._respond = respond
+        self._customize = customize
+        self._busy = busy
         self.setObjectName("refine-reminders")
         self.count = _badge("0 项")
         self.count.setObjectName("refine-reminder-count")
@@ -114,19 +119,26 @@ class RefineReminders(_Panel):
         self._scroll.setObjectName("refine-reminder-list")
         self.body.addWidget(self._scroll)
         self._scroll.hide()
+        self._feedback = _text(size=11, color=MUTED, wrap=True)
+        self._feedback.setObjectName("refine-reminder-feedback")
+        self.body.addWidget(self._feedback)
+        self._feedback.hide()
         self._rows = ()
+        self._action_buttons = {}
 
-    def render_snapshot(self, snapshot: dict):
+    def render_snapshot(self, snapshot: dict, *, actionable=()):
         reference = snapshot.get("now")
-        rows = tuple(
-            (
-                task["task_id"],
-                task["draft"]["content"],
-                _schedule(task["draft"], reference, task["draft"].get("timezone") or self.timezone),
-                bool(task.get("displayed_at")),
-            )
-            for task in active_reminders(snapshot)
-        )
+        tasks = active_reminders(snapshot)
+        if self._respond:
+            tasks.sort(key=lambda task: (task["task_id"], task.get("occurrence", 1)) not in actionable)
+        rows = []
+        for task in tasks:
+            subject = (task["task_id"], task.get("occurrence", 1))
+            draft = task["draft"]
+            can_respond = bool(self._respond and subject in actionable)
+            rows.append((subject, draft["content"], _schedule(draft, reference, draft.get("timezone") or self.timezone),
+                         can_respond or bool(task.get("displayed_at")), can_respond, draft.get("expires_at")))
+        rows = tuple(rows)
         if rows == self._rows:
             return
         self._rows = rows
@@ -134,13 +146,19 @@ class RefineReminders(_Panel):
         self._empty.setVisible(not rows)
         self._scroll.setVisible(bool(rows))
         scroll_position = self._scroll.verticalScrollBar().value()
+        self._action_buttons.clear()
         while self._cards.count():
             widget = self._cards.takeAt(0).widget()
             widget.hide()
             widget.deleteLater()
-        for _, name, schedule, pending in rows:
+        minimum_height = self._cards.spacing() * (len(rows) - 1)
+        for subject, name, schedule, pending, can_respond, expires_at in rows:
             frame, stack = _card(spacing=3)
-            frame.setMinimumHeight(53)
+            frame.setProperty("task_id", subject[0])
+            frame.setProperty("occurrence", subject[1])
+            height = 80 if can_respond else 53
+            frame.setMinimumHeight(height)
+            minimum_height += height
             row = QHBoxLayout()
             row.setSpacing(7)
             name_label = _text(name, bold=True, wrap=True)
@@ -152,15 +170,76 @@ class RefineReminders(_Panel):
             schedule_label = _text(schedule, size=11, color=MUTED, wrap=True)
             _size_wrapped_label(schedule_label, 13, 225)
             stack.addWidget(schedule_label)
+            if can_respond:
+                stack.addLayout(self._action_row(subject, name, expires_at))
             self._cards.addWidget(frame)
+        self.refresh_actions()
         if rows:
             width = PANEL_WIDTH - 26
-            minimum_height = 53 * len(rows) + self._cards.spacing() * (len(rows) - 1)
             full_height = max(minimum_height, self._cards.heightForWidth(width))
             self._scroll.setFixedHeight(min(175, full_height))
             self._cards.activate()
             self._scroll.verticalScrollBar().setValue(scroll_position)
         self.updateGeometry()
+
+    def _action_row(self, subject, name, expires_at):
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        acknowledge = QPushButton("确认收到")
+        acknowledge.setObjectName("refine-reminder-ack")
+        acknowledge.clicked.connect(lambda checked=False: self._respond("ack", *subject))
+        snooze = QPushButton("稍后提醒")
+        snooze.setObjectName("refine-reminder-snooze")
+        menu = QMenu(snooze)
+        presets = {}
+        for minutes in (5, 10, 30):
+            seconds = minutes * 60
+            action = menu.addAction(f"{minutes} 分钟后")
+            action.setObjectName(f"refine-reminder-snooze-{seconds}")
+            action.triggered.connect(lambda checked=False, delay=seconds: self._respond("snooze", *subject, seconds=delay))
+            presets[seconds] = action
+        if expires_at:
+            expiry = datetime.fromisoformat(expires_at)
+
+            def update_presets():
+                now = datetime.now(expiry.tzinfo)
+                for seconds, action in presets.items():
+                    action.setEnabled(now + timedelta(seconds=seconds) < expiry)
+
+            menu.aboutToShow.connect(update_presets)
+        menu.addSeparator()
+        menu.addAction("自定时长…", lambda: self._customize(*subject))
+        snooze.setMenu(menu)
+        for button in (acknowledge, snooze):
+            button.setAccessibleName(f"{button.text()} · {name}")
+            button.setFont(_font(11, bold=True))
+            button.setFixedHeight(23)
+            button.setStyleSheet(
+                f"QPushButton {{color: {GREEN}; background: {PAPER}; border: 1px solid {CARD_OUTLINE};"
+                "border-radius: 5px; padding: 0 9px}"
+                f"QPushButton:hover, QPushButton:focus {{background: {GREEN_TINT}}}"
+                f"QPushButton:disabled {{color: {MUTED}; background: {SAND}}}"
+                "QPushButton::menu-indicator {subcontrol-origin: padding; subcontrol-position: center right; right: 4px}"
+            )
+            row.addWidget(button)
+        row.addStretch()
+        self._action_buttons[subject[0]] = (acknowledge, snooze)
+        return row
+
+    def refresh_actions(self):
+        for task_id, buttons in self._action_buttons.items():
+            enabled = not self._busy(task_id)
+            for button in buttons:
+                button.setEnabled(enabled)
+
+    def set_feedback(self, text):
+        self._feedback.setText(text)
+        self._feedback.setVisible(bool(text))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._respond:
+            self._scroll.verticalScrollBar().setValue(0)
 
 
 def _work_duration(seconds: float) -> str:

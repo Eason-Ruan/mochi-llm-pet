@@ -123,6 +123,9 @@ try:
     wait_for(lambda: window.views['demo-milk']['version'] == milk_before['version'] + 1,
              'confirmed edit did not reach the shared task service')
     wait_for(lambda: any('已将' in text for text in messages()), 'script did not show applied result')
+    cards = [chat._message_cards.itemAt(index).widget() for index in range(chat._message_cards.count())]
+    assert [card.property('source') for card in cards] == ['user', 'program', 'user', 'program']
+    assert cards[-1].layout().itemAt(0).widget().text() == '执行回执'
     milk_after = window.views['demo-milk']
     new_due = local_time(milk_after['draft']['earliest_at'])
     assert new_due.date() == local_time(clock_start).date() + timedelta(days=1)

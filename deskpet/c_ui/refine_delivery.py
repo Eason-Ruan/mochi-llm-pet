@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Callable
 
 from PyQt6.QtCore import QTimer
@@ -28,6 +29,7 @@ class Prompt:
     valid: Callable[[], bool] | None = None
     before_paint: Callable[[], bool] | None = None
     on_painted: Callable[[], bool] | None = None
+    answer_labels: tuple[str, str] | None = None
 
     def commands(self):
         return (self.command, *self.siblings) if self.command else ()
@@ -229,6 +231,42 @@ class RefineDeliveryMixin:
             text.append(f"还有 {len(commands) - len(visible)} 条，打开列表查看")
         return "\n".join(text), visible
 
+    def _native_followup_prompt(self):
+        if not self.production or not self._can_show_reminder(collapsed_ok=True):
+            return None
+        followup = next(iter(self.presentation.native_followups(include_painted=False)), None)
+        if followup is None:
+            return None
+
+        def current():
+            return self._can_show_reminder(collapsed_ok=True) and self._valid_command(followup)
+
+        def painted():
+            return current() and self.presentation.native_followup_current(followup, mark_painted=True)
+
+        snooze_seconds = 300
+
+        def can_snooze():
+            return (followup.expires_at is None
+                    or self.presentation.now() + timedelta(seconds=snooze_seconds) < followup.expires_at)
+
+        offer_snooze = can_snooze()
+
+        def answer(yes):
+            if not current() or not self.presentation.native_followup_current(followup, include_painted=True):
+                return
+            if yes:
+                self._respond_to_reminder("ack", followup.task_id, followup.occurrence)
+            elif offer_snooze and can_snooze():
+                self._respond_to_reminder("snooze", followup.task_id, followup.occurrence, seconds=snooze_seconds)
+            else:
+                self._customize_reminder_snooze(followup.task_id, followup.occurrence)
+
+        title = "提醒" if followup.delivered else "待确认提醒"
+        return Prompt("native_reminder", f"{title}：{followup.content}", on_answer=answer, valid=current,
+                      before_paint=lambda: current() and self.presentation.native_followup_current(followup),
+                      on_painted=painted, answer_labels=("确认收到", "5 分钟后" if offer_snooze else "查看详情"))
+
     def _show_next_prompt(self):
         if self._closing:
             return
@@ -244,7 +282,7 @@ class RefineDeliveryMixin:
                     return
                 self._retire_prompt()
             elif not self.prompt.command and reminders:
-                if self.prompt.kind != "proposal":
+                if self.prompt.kind not in {"proposal", "native_reminder"}:
                     self.waiting_prompts.appendleft(self.prompt)
                 self._clear_prompt()
             else:
@@ -267,10 +305,12 @@ class RefineDeliveryMixin:
                 text = (f"提醒：{command.content}" if self.production
                         else f"现在该{command.content}了。要查看这条提醒吗？")
             item = Prompt("reminder", text, command=command, siblings=siblings, preview=preview)
-        elif self.waiting_prompts:
-            item = self.waiting_prompts.popleft()
         else:
-            return
+            item = self._native_followup_prompt()
+            if item is None:
+                if not self.waiting_prompts:
+                    return
+                item = self.waiting_prompts.popleft()
         self.prompt = item
 
         def answer(yes):
@@ -292,11 +332,11 @@ class RefineDeliveryMixin:
 
             def painted():
                 item.painted = item.on_painted()
-                if item.painted and semantic:
+                if item.painted and (semantic or item.kind == "native_reminder"):
                     self._expire_visible_prompt(item)
                 return item.painted
 
-        labels = None
+        labels = item.answer_labels
         if item.kind == "proposal":
             labels = ("接受", "拒绝") if item.direct_focus else ("查看", "稍后")
         elif self.production and item.command and not item.siblings:
@@ -397,7 +437,7 @@ class RefineDeliveryMixin:
         self._clear_prompt()
         if yes and item.command and self.production and not item.siblings:
             command = item.command
-            self.reminders.request("ack", command.task_id, command.task_version)
+            self._respond_to_reminder("ack", command.task_id, command.occurrence)
         elif yes and item.command:
             self._show_section("reminders")
             panel = getattr(self, "reminder_panel", self.reminders)
