@@ -217,13 +217,37 @@ def test_masks_only_overlap_with_excluded_windows_above_on_mixed_displays(native
         assert max(pixel(frame, 2, -250, 200)) > 100
 
 
-@pytest.mark.parametrize("changed", ["new_window", "newly_private", "display", "session"])
-def test_rejects_changed_post_capture_inventory_without_returning_pixels(native_capture, changed):
+@pytest.mark.parametrize("change", ["new", "moved"])
+def test_unrelated_excluded_window_changes_do_not_drop_ordinary_chrome(native_capture, change):
+    native_capture.windows = [_native_window(8, 80, 50, name="Google Chrome", bundle="com.google.Chrome")]
+    if change == "moved":
+        native_capture.windows.append(_native_window(9, 85, 1300, name="Bitwarden"))
+
+    def change_uncovered_window():
+        native_capture.windows[1:] = [_native_window(9, 85, 1450, name="Bitwarden")]
+
+    native_capture.after_capture = change_uncovered_window
+    sample = _sample(app_name="Google Chrome", app_id="com.google.Chrome", url="http://127.0.0.1:8000/demo")
+    result = capture_filtered_desktop(sample, platform="darwin")
+    assert result.jpeg and not result.foreground_excluded
+    assert [(display, window_ids) for display, window_ids, _ in native_capture.requested] == [(1, (8,))]
+
+
+@pytest.mark.parametrize("changed, reason", [
+    ("newly_occluded", "desktop_inventory_changed"),
+    ("new_allowed_window", "desktop_inventory_changed"),
+    ("newly_private", "desktop_inventory_changed"),
+    ("display", "desktop_inventory_changed"),
+    ("session", "desktop_session_unverified"),
+])
+def test_rejects_changed_post_capture_inventory_without_returning_pixels(native_capture, changed, reason):
     native_capture.windows = [_native_window(8, 80, 50)]
 
     def change():
-        if changed == "new_window":
-            native_capture.windows.append(_native_window(9, 85, 1300, name="Bitwarden"))
+        if changed == "newly_occluded":
+            native_capture.windows.insert(0, _native_window(9, 85, 100, name="Bitwarden"))
+        elif changed == "new_allowed_window":
+            native_capture.windows.append(_native_window(9, 85, 1300))
         elif changed == "newly_private":
             native_capture.windows[:] = [_native_window(8, 80, 50, title="Private Browsing")]
         elif changed == "display":
@@ -234,15 +258,17 @@ def test_rejects_changed_post_capture_inventory_without_returning_pixels(native_
     native_capture.after_capture = change
     with pytest.raises(DesktopCaptureRestricted, match="changed") as error:
         capture_filtered_desktop(_sample(), platform="darwin")
-    assert error.value.reason == "desktop_privacy_restricted"
+    assert error.value.reason == reason
     assert [(display, window_ids) for display, window_ids, _ in native_capture.requested] == [(1, (8,))]
 
 
 @pytest.mark.parametrize("condition, reason", [
     ("permission", "screen_recording_permission_denied"),
     ("child_filter", "filtered_desktop_unavailable"),
-    ("empty", "desktop_privacy_restricted"),
-    ("display_missing", "desktop_privacy_restricted"),
+    ("empty", "desktop_no_visible_windows"),
+    ("display_missing", "desktop_display_inventory_unverified"),
+    ("window_inventory", "desktop_window_inventory_unverified"),
+    ("session", "desktop_session_unverified"),
     ("acquisition", "filtered_desktop_unavailable"),
 ])
 def test_never_uses_unfiltered_fallback(native_capture, monkeypatch, condition, reason):
@@ -255,6 +281,10 @@ def test_never_uses_unfiltered_fallback(native_capture, monkeypatch, condition, 
         native_capture.windows[:] = [_native_window(8, 80, 50, name="1Password")]
     elif condition == "display_missing":
         native_capture.display_ids = (1, 2, 3)
+    elif condition == "window_inventory":
+        monkeypatch.setattr(sys.modules["Quartz"], "CGWindowListCopyWindowInfo", lambda _flags, _id: None)
+    elif condition == "session":
+        native_capture.session = (False, "different session")
     elif condition == "acquisition":
         native_capture.fail_image = True
     with pytest.raises(DesktopCaptureRestricted) as error:

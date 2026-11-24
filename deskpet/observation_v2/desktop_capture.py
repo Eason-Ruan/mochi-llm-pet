@@ -98,19 +98,20 @@ class _NativeResult:
 
 
 def _display_inventory(content, Quartz) -> tuple[_Display, ...]:
+    reason = "desktop_display_inventory_unverified"
     status, display_ids, count = Quartz.CGGetActiveDisplayList(_DISPLAY_LIMIT, None, None)
     if status != 0 or not 0 < count < _DISPLAY_LIMIT or len(set(display_ids)) != count:
-        raise DesktopCaptureRestricted("The active displays could not be verified")
+        raise DesktopCaptureRestricted("The active displays could not be verified", reason=reason)
     shareable = {display.displayID(): display for display in content.displays()}
     if not set(display_ids) <= shareable.keys():
-        raise DesktopCaptureRestricted("ScreenCaptureKit omitted an active display")
+        raise DesktopCaptureRestricted("ScreenCaptureKit omitted an active display", reason=reason)
     displays = []
     for display_id in display_ids:
         bounds = Quartz.CGDisplayBounds(display_id)
         rectangle = _Bounds(bounds.origin.x, bounds.origin.y, bounds.size.width, bounds.size.height)
         pixels = (Quartz.CGDisplayPixelsWide(display_id), Quartz.CGDisplayPixelsHigh(display_id))
         if min(*pixels, rectangle.width, rectangle.height) <= 0:
-            raise DesktopCaptureRestricted("An active display has invalid dimensions")
+            raise DesktopCaptureRestricted("An active display has invalid dimensions", reason=reason)
         displays.append(_Display(display_id, rectangle, pixels, shareable[display_id]))
     return tuple(displays)
 
@@ -155,7 +156,8 @@ def _window_inventory(content, Quartz, workspace, sample: ActivitySample, app_ru
         Quartz.kCGNullWindowID,
     )
     if rows is None:
-        raise DesktopCaptureRestricted("The on-screen window inventory is unavailable")
+        raise DesktopCaptureRestricted("The on-screen window inventory is unavailable",
+                                       reason="desktop_window_inventory_unverified")
     by_id = {row.get("kCGWindowNumber"): row for row in rows}
     foreground = workspace.frontmostApplication()
     front_pid = foreground.processIdentifier() if foreground is not None else None
@@ -225,6 +227,18 @@ def _inventory(shareable, Quartz, workspace, sample, app_rules, domain_rules, fo
         content, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded,
     )
     return displays, windows, front_pid, foreground, masks
+
+
+def _capture_inventory_matches(before, after) -> bool:
+    displays, windows, front_pid, foreground, masks = before
+    later_displays, later_windows, later_pid, later_foreground, later_masks = after
+    # An excluded background window is absent from the native filter. Its
+    # geometry only matters where it covers another window we could capture.
+    return (
+        (displays, front_pid, foreground, masks) == (later_displays, later_pid, later_foreground, later_masks)
+        and {window_id: window for window_id, window in windows.items() if window.allowed}
+        == {window_id: window for window_id, window in later_windows.items() if window.allowed}
+    )
 
 
 def _layout(displays: tuple[_Display, ...], foreground: _Window | None):
@@ -318,7 +332,7 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
 
     session = (False, sample.session_id)
     if _mac_session() != session:
-        raise DesktopCaptureRestricted("The desktop session could not be verified")
+        raise DesktopCaptureRestricted("The desktop session could not be verified", reason="desktop_session_unverified")
     workspace = AppKit.NSWorkspace.sharedWorkspace()
     inventory = _inventory(SCShareableContent, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded)
     displays, windows, _, foreground, masks = inventory
@@ -349,7 +363,8 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
         config.setIncludeChildWindows_(False)
         requests.append((filter_, config, _NativeResult()))
     if not any(requests):
-        raise DesktopCaptureRestricted("No eligible windows are visible on the active displays")
+        raise DesktopCaptureRestricted("No eligible windows are visible on the active displays",
+                                       reason="desktop_no_visible_windows")
     if first_label == "Active display" and foreground is not None:
         focus = _pixel_box(ordered[0], sizes[0], foreground.bounds)
         if focus is None or not _visible_after_mask(sizes[0], [focus], pixel_masks[0]):
@@ -364,8 +379,10 @@ def _capture_macos(sample: ActivitySample, app_rules: tuple[str, ...], domain_ru
     if not Quartz.CGPreflightScreenCaptureAccess():
         raise DesktopCaptureRestricted("Screen recording permission is required", reason="screen_recording_permission_denied")
     after = _inventory(SCShareableContent, Quartz, workspace, sample, app_rules, domain_rules, foreground_excluded)
-    if inventory != after or _mac_session() != session:
-        raise DesktopCaptureRestricted("The desktop inventory or session changed during capture")
+    if _mac_session() != session:
+        raise DesktopCaptureRestricted("The desktop session changed during capture", reason="desktop_session_unverified")
+    if not _capture_inventory_matches(inventory, after):
+        raise DesktopCaptureRestricted("The desktop inventory changed during capture", reason="desktop_inventory_changed")
     jpeg = _encode_montage(AppKit, images, sizes, columns, first_label, pixel_masks)
     return FilteredDesktopCapture(captured_at, jpeg, first_label != "Active display")
 
@@ -378,7 +395,7 @@ def capture_filtered_desktop(
     if platform != "darwin":
         raise DesktopCaptureRestricted("Filtered desktop capture requires macOS", reason="filtered_desktop_unavailable")
     if sample.screen_locked is not False or not sample.session_id:
-        raise DesktopCaptureRestricted("The desktop session is locked or unknown")
+        raise DesktopCaptureRestricted("The desktop session is locked or unknown", reason="desktop_session_unverified")
     try:
         return _capture_macos(
             sample, _excluded_app_rules(excluded_apps), _excluded_domain_rules(excluded_domains), foreground_excluded,

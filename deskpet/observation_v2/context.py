@@ -32,6 +32,8 @@ CAPTURE_HEALTH_REASONS = {
     "foreground_unavailable", "browser_url_unavailable", "lock_state_unavailable", "window_unavailable",
     "video_source", "recipient_unavailable", "foreground_changed_during_capture", "waiting_for_visual_change",
     "screen_recording_permission_denied", "filtered_desktop_unavailable", "desktop_privacy_restricted",
+    "desktop_display_inventory_unverified", "desktop_window_inventory_unverified", "desktop_session_unverified",
+    "desktop_inventory_changed", "desktop_no_visible_windows",
     "foreground_context_only",
 }
 CAPTURE_HEALTH_TIMES = ("last_ready_at", "last_failure_at", "last_skipped_at")
