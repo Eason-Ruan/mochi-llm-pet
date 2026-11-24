@@ -29,7 +29,7 @@ def main() -> None:
                 if request["kind"] != "run":
                     raise ValueError("Unsupported Mochi SDK worker request")
                 started = monotonic()
-                result = session.run(request["text"])
+                result = session.run(request["input"] if "input" in request else request["text"])
                 elapsed = monotonic() - started
                 answer_id = None
                 for event in reversed(result.events):

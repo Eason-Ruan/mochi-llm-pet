@@ -21,6 +21,7 @@ from deskpet.observation_v2.routes import (
 from deskpet.settings import SettingsStore
 from deskpet.system2.dsh import DSHEngine, verify_system2_route
 from deskpet.system2.dsh_projection import project_input, project_tool_result
+from deskpet.system2.tool_schema import tool_definitions
 
 SUMMARY = "SYNTHETIC-PRIVATE-ACTIVITY"
 RECENT = "SYNTHETIC-PRIVATE-RECENT"
@@ -294,8 +295,10 @@ def test_semantic_background_session_and_document_scope(tmp_path, monkeypatch, p
     try:
         request = turn()
         user = engine._select_runtime(request, configured)
+        assert user.storage is not None
         request.observation_document_query = True
         document_user = engine._select_runtime(request, configured)
+        assert document_user is user
         request.source = "background"
         background = engine._select_runtime(request, configured)
         assert background.session_id not in (user.session_id, document_user.session_id)
@@ -369,7 +372,7 @@ def test_revocation_between_tool_and_follow_up_rotates_all_history(tmp_path, end
         engine.close()
 
 
-def test_document_name_on_native_wire_before_and_after_source_revocation(tmp_path, endpoints):
+def test_document_titles_reach_the_wire_only_on_authorized_tool_queries(tmp_path, endpoints):
     endpoint = endpoints()
     settings = SettingsStore(tmp_path / "business.sqlite")
     install_route(settings, endpoint, permission=True)
@@ -377,62 +380,88 @@ def test_document_name_on_native_wire_before_and_after_source_revocation(tmp_pat
                     document_local_sources=("Word", "VS Code"), document_cloud_sources=("Word",))
     shared = "WireAcceptance.docx"
     local_only = "PrivateWorkspace.py"
-    endpoint.respond = lambda _: ({"content": RECEIPT}, "stop")
+    context = snapshot()
+    at = context["as_of"]
+    context.update(
+        current_context={"observed_at": at, "foreground_app": "Mochi", "screen_locked": False},
+        last_observed_activity={"observed_at": at, "activity_kind": "work", "relation": "previous",
+                                "document_name": shared, "document_source": "app:microsoft-word"},
+        history_1h={"segments": [{"first_observed_at": at, "last_observed_at": at,
+                                  "document_name": local_only, "document_source": "app:vscode"}]},
+    )
 
-    def ask(source="user"):
-        request = turn("刚才打开的是哪份文档？", tools=())
+    def run(text, *, source="user", include_document_source=None, read=True):
+        args = {} if include_document_source is None else {"include_document_source": include_document_source}
+
+        def respond(body):
+            last = body["messages"][-1]
+            if last["role"] == "tool":
+                visible = json.loads(last["content"])["view"]["last_observed_activity"]
+                return {"content": visible.get("document_name", RECEIPT)}, "stop"
+            if not body.get("tools"):
+                return {"content": RECEIPT}, "stop"
+            return {"tool_calls": [{
+                "index": 0, "id": "context-fixture", "type": "function",
+                "function": {"name": "context_read", "arguments": json.dumps(args)},
+            }]}, "tool_calls"
+
+        def result(name, call_id, invoked, *, step_id):
+            assert name == "context_read" and invoked == args
+            return {"status": "applied", "view": context}
+
+        endpoint.respond = respond
+        request = turn(text, tools=("context.read",) if read else ())
         request.source = source
-        request.observation_document_query = True
+        request.observation_document_query = source == "background"
         request.observation_generation = settings.read().observation_generation
-        payload = json.loads(request.input_json)
-        at = payload["context"]["as_of"]
-        payload["context"].update(
-            current_context={"observed_at": at, "foreground_app": "Mochi", "screen_locked": False},
-            last_observed_activity={"observed_at": at, "activity_kind": "work", "relation": "previous",
-                                    "document_name": shared, "document_source": "app:microsoft-word"},
-            history_1h={"segments": [{"first_observed_at": at, "last_observed_at": at,
-                                      "document_name": local_only, "document_source": "app:vscode"}]},
-        )
-        request.input_json = json.dumps(payload, ensure_ascii=False)
-        return engine.run(request, reply)
+        request.input_json = json.dumps({"user_intent": {"utterance": text}, "context": context}, ensure_ascii=False)
+        start = len(endpoint.requests)
+        response = engine.run(request, result)
+        return response.text, [json.dumps(body, ensure_ascii=False) for body in endpoint.requests[start:]]
 
-    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    engine = DSHEngine(tmp_path, settings=settings, tools=[tool for tool in tool_definitions
+                                                          if tool.canonical_name == "context.read"])
     try:
-        assert ask().text == RECEIPT
-        first = json.dumps(endpoint.requests[-1], ensure_ascii=False)
-        assert shared in first
-        assert local_only not in first and "app:microsoft-word" not in first
-        assert ask("background").text == RECEIPT
-        background = json.dumps(endpoint.requests[-1], ensure_ascii=False)
-        assert shared not in background and local_only not in background
-        assert "刚才打开的是哪份文档？" not in background
+        ordinary = "刚才在忙什么？"
+        answer, packets = run(ordinary)
+        assert answer == RECEIPT
+        assert all(shared not in body and local_only not in body for body in packets)
+
+        answer, packets = run("刚才打开的是哪份文档？", include_document_source=True)
+        assert answer == shared
+        assert shared not in packets[0] and shared in packets[-1]
+        assert all(local_only not in body and "app:microsoft-word" not in body for body in packets)
+
+        answer, packets = run("再说说别的", read=False)
+        assert answer == RECEIPT and ordinary in packets[-1]
+        assert "本轮涉及观察到的文档标题" in packets[-1]
+        assert all(shared not in body and local_only not in body for body in packets)
+
+        answer, packets = run("背景事件", source="background", include_document_source=True)
+        assert answer == RECEIPT
+        assert all(shared not in body and local_only not in body and ordinary not in body for body in packets)
+
         settings.update(expected_version=settings.read().version, document_cloud_sources=())
-        assert ask().text == RECEIPT
-        second = json.dumps(endpoint.requests[-1], ensure_ascii=False)
-        assert shared not in second and local_only not in second
+        answer, packets = run("这次打开的是哪份文档？", include_document_source=True)
+        assert answer == RECEIPT
+        assert all(shared not in body and local_only not in body for body in packets)
     finally:
         engine.close()
 
 
-def test_chat_rollback_uses_a_separate_native_session(tmp_path, endpoints, monkeypatch):
+def test_removed_chat_flag_keeps_the_same_native_session(tmp_path, endpoints, monkeypatch):
     endpoint = endpoints()
     settings = SettingsStore(tmp_path / "business.sqlite")
     install_route(settings, endpoint)
-    private_chat = "SYNTHETIC-SEMANTIC-SESSION-CHAT"
+    first_message = "SYNTHETIC-FIRST-SESSION-MESSAGE"
     monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "1")
     engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
     try:
-        semantic = engine.run(turn(private_chat, tools=()), reply)
-        assert private_chat in json.dumps(endpoint.requests[-1])
-    finally:
-        engine.close()
-
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
-    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
-    try:
-        legacy = engine.run(turn("Test legacy chat with a fresh session", tools=()), reply)
-        assert legacy.session_id != semantic.session_id
-        assert private_chat not in json.dumps(endpoint.requests[-1])
+        first = engine.run(turn(first_message, tools=()), reply)
+        monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+        follow_up = engine.run(turn("Continue the same conversation", tools=()), reply)
+        assert follow_up.session_id == first.session_id
+        assert first_message in json.dumps(endpoint.requests[-1])
     finally:
         engine.close()
 

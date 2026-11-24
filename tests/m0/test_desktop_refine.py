@@ -57,9 +57,9 @@ def editor():
     return next((widget for widget in session.chat.findChildren(QLineEdit, "refine-chat-editor")
                  if widget.isVisible()), None)
 
-def continue_button():
-    return next((widget for widget in session.chat.findChildren(QPushButton, "refine-chat-continue")
-                 if widget.isVisible()), None)
+def chat_status(text):
+    return any(label.isVisible() and label.text() == text and label.parentWidget().property("source") == "status"
+               for label in session.chat.findChildren(QLabel, "refine-chat-message-text"))
 
 
 def cat_position():
@@ -126,15 +126,19 @@ try:
     phase_id = active()["id"]
     assert active()["title"] == "专注" and active()["planned_duration_s"] == 780
     assert len(session.snapshot["phases"]) == 1
+    phase_version = active()["version"]
 
     section("input")
     wait_for(editor, "typing input")
     editor().setText("再加 2 分钟")
     QTest.keyClick(editor(), Qt.Key.Key_Return)
-    wait_for(lambda: active()["planned_duration_s"] == 900, "chat adjusted the same phase")
-    assert active()["id"] == phase_id
-    wait_for(continue_button, "chat reply")
-    QTest.mouseClick(continue_button(), left)
+    wait_for(lambda: chat_status("这次对话模型没能完成回复。"), "offline model status")
+    assert session.snapshot["system2_route_status"] == "not_configured"
+    assert (active()["id"], active()["version"], active()["planned_duration_s"]) == (phase_id, phase_version, 780)
+    user, reply = session.chat_store.projected_messages(include_parts=True)
+    assert user[1] == "再加 2 分钟" and not user[3]
+    assert reply[4] == user[2]
+    assert reply[6] == ({"source": "status", "text": "这次对话模型没能完成回复。"},)
     wait_for(editor, "draft editor")
     editor().setText("留待明天输入")
 
@@ -153,31 +157,15 @@ session = RefineSession(app, options)
 try:
     wait_for(lambda: session.window.ready_for_actions, "persistent restart")
     assert cat_position() == moved_home
-    assert active()["id"] == phase_id and active()["planned_duration_s"] == 900
+    assert (active()["id"], active()["planned_duration_s"]) == (phase_id, 780)
     assert session.snapshot["settings"]["default_focus_s"] == 780
     assert not session.snapshot["settings"]["allow_proactive_movement"]
     assert session.snapshot["tasks"][0]["draft"]["content"] == "提交实验记录"
     section("input")
     wait_for(editor, "reloaded chat")
     assert editor().text() == "留待明天输入"
-    assert any(label.isVisible() and label.text() == "已调整计时时长。"
-               for label in session.chat.findChildren(QLabel, "refine-chat-message-text"))
-    session.context.result_received.disconnect(session._receive_result)
-    editor().setText("再加 3 分钟")
-    QTest.keyClick(editor(), Qt.Key.Key_Return)
-    wait_for(lambda: active()["planned_duration_s"] == 1080, "command applied despite lost reply")
-    assert session.chat._store.load()[2] is not None
-    assert not session.window.errors
-finally:
-    session.quit()
-    wait_for(lambda: not session.window.thread.isRunning(), "restarted worker shutdown")
-
-session = RefineSession(app, options)
-try:
-    wait_for(lambda: session.window.ready_for_actions and session.chat.recovered_event is None,
-             "missing reply recovered by command ID")
-    assert session.chat._store.load()[2] is None
-    assert active()["id"] == phase_id and active()["planned_duration_s"] == 1080
+    assert chat_status("这次对话模型没能完成回复。")
+    assert session.chat_store.projected_messages(include_parts=True) == [user, reply]
 
     # Estimated timing stays unchanged during a content edit. Changing to an
     # exact reminder uses the selected absolute target and starts a new occurrence.
@@ -309,7 +297,7 @@ try:
     assert not session.window.errors
 finally:
     session.quit()
-    wait_for(lambda: not session.window.thread.isRunning(), "recovered worker shutdown")
+    wait_for(lambda: not session.window.thread.isRunning(), "restarted worker shutdown")
 '''
 
 

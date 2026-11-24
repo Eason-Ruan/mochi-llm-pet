@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .http_cancellation import CancellableRequest
 from .usage import ObservationUsage, report_usage
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
@@ -69,19 +70,30 @@ class OllamaClient:
 
     def complete(
         self, *, system: str, prompt: str, schema: dict, image: bytes | None = None,
+        send_permitted: Callable[[], bool] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> dict:
         message = {"role": "user", "content": prompt}
         if image is not None:
             message["images"] = [base64.b64encode(image).decode("ascii")]
+
         try:
-            response = self._http.post("/api/chat", json={
-                "model": self.model,
-                "messages": [{"role": "system", "content": system}, message],
-                "format": schema,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": 0, "num_predict": 512},
-            })
+            with CancellableRequest(cancelled) as cancellation:
+                def trace(event: str, info: dict) -> None:
+                    cancellation.trace(event, info)
+                    if (event in {"http11.send_request_headers.started", "http11.send_request_body.started"}
+                            and send_permitted is not None and not send_permitted()):
+                        raise OllamaError("Local Observation capture is no longer eligible for inference")
+
+                response = self._http.post("/api/chat", json={
+                    "model": self.model,
+                    "messages": [{"role": "system", "content": system}, message],
+                    "format": schema,
+                    "stream": False,
+                    "think": False,
+                    "options": {"temperature": 0, "num_predict": 512},
+                }, extensions={"trace": trace} if send_permitted is not None or cancelled is not None else None,
+                    headers={"Connection": "close"} if cancelled is not None else None)
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict):

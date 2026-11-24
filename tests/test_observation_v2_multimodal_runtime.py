@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import json
@@ -12,6 +13,7 @@ import pytest
 
 from deskpet.observation_v2 import __main__ as cli, media, openai_cloud, pipeline, vision as vision_module
 from deskpet.observation_v2.activity import ActivitySample
+from deskpet.observation_v2.routes import OLLAMA, VISION, CloudRoute, ObservationCloudSettings
 from deskpet.observation_v2.sampling import CaptureSchedule, frame_thumbnail
 from deskpet.observation_v2.state import StateObserver
 
@@ -148,6 +150,39 @@ def test_production_cli_uses_local_state_without_a_text_transport(tmp_path, monk
         ]
         assert conn.execute("SELECT app_name, screen_locked FROM realtime_observation_head").fetchone() == ("Browser", 0)
         assert conn.execute("SELECT count(*) FROM screen_observations").fetchone() == (0,)
+
+
+def test_live_vision_runtime_failure_keeps_native_observation_and_never_calls_ollama_directly(tmp_path, monkeypatch):
+    attempts, direct_calls = [], []
+
+    class UnavailableRuntime:
+        def complete(self, **kwargs):
+            attempts.append(kwargs["model"])
+            raise RuntimeError("Synthetic runtime failure")
+
+        def close(self):
+            pass
+
+    def direct_call(*args, **kwargs):
+        direct_calls.append(kwargs)
+        raise AssertionError("The production loop must own the vision request")
+
+    FakeRuntime(monkeypatch)
+    database = tmp_path / "desktop.sqlite"
+    monkeypatch.setattr(cli, "ObservationDSH", UnavailableRuntime)
+    monkeypatch.setattr(cli.OllamaClient, "complete", direct_call)
+    monkeypatch.setattr(sys, "argv", [
+        "observation_v2", "live", "--database", str(database), "--duration-s", "6", "--capture-screen",
+    ])
+    cli.main()
+
+    assert attempts == ["qwen3-vl:2b-instruct"] and direct_calls == []
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT status FROM observation_capture_health").fetchone() == ("model_failed",)
+        assert conn.execute("SELECT status, model_id FROM screen_observations").fetchone() == (
+            "failed", "qwen3-vl:2b-instruct",
+        )
+        assert conn.execute("SELECT app_name, screen_locked FROM realtime_observation_head").fetchone() == ("Editor", 0)
 
 
 def test_stable_material_change_has_one_call_each_and_keeps_capture_time(tmp_path, monkeypatch):
@@ -322,6 +357,78 @@ def test_late_result_uses_original_activity_and_cannot_replace_current(tmp_path,
         assert frame[:4] == ("Editor", _time(3), "redacted_out" if revoked else "ready", 0)
         assert frame[4] is None if revoked else "page canvas" in frame[4]
         assert conn.execute("SELECT app_name FROM realtime_observation_head").fetchone() == ("Mochi",)
+
+
+@pytest.mark.parametrize("change", ["cloud_revoke", "local_switch", "authorized"])
+def test_collector_rechecks_recipient_after_vision_result_validation(tmp_path, monkeypatch, change):
+    class CompletedRuntime:
+        def complete(self, **kwargs):
+            assert kwargs["model"] == "original-model"
+            return {"screen_kind": "ide", "activity_kind": "work", "scene_elements": ["code editor"],
+                    "visible_changes": [], "next_check": None}
+
+    FakeRuntime(monkeypatch)
+    settings = ObservationCloudSettings(tmp_path / "settings.sqlite")
+    route = CloudRoute(
+        "openai_compatible" if change == "cloud_revoke" else OLLAMA,
+        "http://127.0.0.1:9", "original-model", "Synthetic provider",
+    )
+    snapshot = settings.configure(VISION, route)
+    if route.is_cloud:
+        snapshot = settings.set_permission(VISION, True, expected=snapshot)
+    settings.record_result(snapshot, probe=True)
+    vision = openai_cloud.RoutedObservationModel(VISION, settings, Vision(), vision_runtime=CompletedRuntime())
+    original = vision_module.analyze_multimodal
+
+    def change_authorization(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert result.status == "ready"
+        current = settings.snapshot(VISION)
+        if route.is_cloud:
+            settings.set_permission(VISION, False, expected=current)
+        elif change == "local_switch":
+            replacement = CloudRoute(OLLAMA, route.base_url, "different-model", route.display_name)
+            settings.record_result(settings.configure(VISION, replacement, expected=current), probe=True)
+        return result
+
+    monkeypatch.setattr(vision_module, "analyze_multimodal", change_authorization)
+    commits = []
+    save_screen = pipeline.ObservationStore.save_screen
+    save_observation = pipeline.ObservationStore.save_observation
+
+    def verify_privacy_gate(operation):
+        gate = settings.path.with_name(settings.path.name + ".observation-privacy-lock")
+        with closing(sqlite3.connect(gate, timeout=0)) as lock:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                lock.execute("BEGIN IMMEDIATE")
+        commits.append(operation)
+
+    def save_scoped_screen(store, screen, **kwargs):
+        if screen.status == "ready":
+            verify_privacy_gate("screen")
+        save_screen(store, screen, **kwargs)
+
+    def publish_scoped_screen(store, observation, **kwargs):
+        if observation.activity_kind == "work":
+            verify_privacy_gate("publication")
+        save_observation(store, observation, **kwargs)
+
+    monkeypatch.setattr(pipeline.ObservationStore, "save_screen", save_scoped_screen)
+    monkeypatch.setattr(pipeline.ObservationStore, "save_observation", publish_scoped_screen)
+    database = tmp_path / "desktop.sqlite"
+    report = pipeline.run_live_multimodal(database, vision, duration_s=6, capture_screen=True)
+
+    with sqlite3.connect(database) as conn:
+        stored = conn.execute("""
+            SELECT status, model_id, realtime_eligible, screen_summary, scene_elements FROM screen_observations
+        """).fetchone()
+    if change == "authorized":
+        assert report["state_runs"]["model"] == 1
+        assert commits == ["screen", "publication"]
+        assert stored[:3] == ("ready", "original-model", 1)
+    else:
+        assert report["state_runs"].get("model", 0) == 0 and commits == []
+        assert stored == ("redacted_out", "original-model", 0, None, None)
 
 
 @pytest.mark.parametrize("allow_title", [True, False])

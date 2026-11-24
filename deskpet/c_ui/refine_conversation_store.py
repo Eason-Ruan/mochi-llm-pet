@@ -15,9 +15,9 @@ def _part(source, text):
 def _answer_parts(parts):
     if not isinstance(parts, (list, tuple)) or not parts:
         raise ValueError("A structured answer requires at least one part")
-    if any(not isinstance(part, dict) or part.get("source") not in ("program", "model")
+    if any(not isinstance(part, dict) or part.get("source") not in ("program", "model", "status")
            or not isinstance(part.get("text"), str) or not part["text"].strip() for part in parts):
-        raise ValueError("Each answer part requires a program or model source and text")
+        raise ValueError("Each answer part requires a recognized source and nonempty text")
     return tuple(_part(part["source"], part["text"]) for part in parts)
 
 
@@ -175,8 +175,8 @@ class ConversationStore:
                              (message_id,)).fetchone()
         return row[0] if row else None
 
-    def record_program_answer(self, answer_id, reply_to_message_id, text):
-        self.record_answer(answer_id, reply_to_message_id, parts=(_part("program", text),))
+    def record_status(self, answer_id, reply_to_message_id, text):
+        self.record_answer(answer_id, reply_to_message_id, parts=(_part("status", text),))
 
     def record_answer(self, answer_id, reply_to_message_id, text=None, *, parts=None):
         """Store a host answer once, accepting flat text from pre-parts outbox rows."""

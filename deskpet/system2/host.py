@@ -6,8 +6,6 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 import json
 import logging
-from math import ceil
-import re
 from pathlib import Path
 import sqlite3
 from threading import Event, Lock, Thread
@@ -25,14 +23,12 @@ from deskpet.timezones import resolve_timezone
 from .admission import AdmissionStore, json_text, stable_id, timestamp
 from .dsh_projection import include_candidate_timing_context, project_business_result
 from .intent import (
-    READ_TOOLS, bind_tool_args, chat_grants, describe_grants, deterministic_command, independent_intents,
-    literal_chat_reminder, literal_start_cancellation, materialize_chat_times, normalized, ref_id, ref_kind, start_request,
-    timer_query_language, without_cancellation,
+    chat_grants, materialize_chat_times, proposal_button_grants, ref_id, ref_kind,
 )
 from .prompt import PROMPT_VERSION, SYSTEM_PROMPT
 from .protocol import EngineReply, ToolAuthority, TurnRequest
-from .semantic_policy import semantic_background_enabled, semantic_chat_enabled, text_sharing_allowed
-from .tool_schema import canonical_tool_name, validate_tool_args
+from .semantic_policy import background_grants, semantic_background_enabled, text_sharing_allowed
+from .tool_schema import READ_TOOLS, canonical_tool_name, validate_tool_args
 
 
 log = logging.getLogger(__name__)
@@ -80,45 +76,7 @@ _REASONS = {
     "interrupted": "上一轮未完成，已核对保存的执行结果。",
     "expired_request": "这条请求已超过可执行时限。",
 }
-_CHAT_CANDIDATE_LIMIT = 20
 _STALE = {"STALE_TASK", "STALE_CONTEXT", "STALE_VERSION", "STALE_PROPOSAL"}
-_CAPABILITY_QUESTION = re.compile(r"(?:请问\s*)?(?:你)?(?:现在|当前)?有(?:操作)?权限吗[?。！!]*")
-_CHAT_CAPABILITY_QUESTION = re.compile(
-    r"(?:请问\s*)?(?:你)?(?:能|可以|会|能不能|可不可以)(?:帮人)?(?:设(?:置|定)?提醒|记事项)(?:吗[?。！! ]*|[?])"
-    r"|(?:can|could) you (?:set reminders|save tasks)[?.! ]*",
-)
-_ACTIVITY_QUESTION = re.compile(
-    r"(?:刚才|刚刚|方才|之前|上一|过去|近一小时|这段时间|此前).{0,20}(?:做|干|改|看|打开|活动|那个|哪)"
-    r"|(?:哪|第[一二三四五六七八九十\d]+)(?:一)?(?:份|个|篇|段)(?:文档|文件|活动|[呢吗？?])?"
-    r"|(?:现在|正在).{0,15}(?:做什么|干嘛|看什么|改什么|开着什么)"
-    r"|(?:最近|之前|过去|刚才).{0,10}(?:活动|观测|观察)"
-    r"|^(?:那份|另一份|另一个|那另一个|另一个呢|那第二个).{0,8}[呢吗？?]?$"
-    r"|\b(?:what|which|second|third)\b.{0,55}\b(?:document|file|activity|doing|working on|looking at|editing|opened)\b"
-    r"|\b(?:last hour|just now|earlier|previous activity|last activity)\b"
-    r"|^(?:what about )?(?:the )?(?:other|next|second|third) one[?.]?$", re.IGNORECASE,
-)
-_ITEM_LIST_QUERY = re.compile(
-    r"^(?:请(?:帮我)?|帮我)?\s*(?:(?:查看|列出|显示|看看)(?:我(?:的)?)?\s*(?:所有|全部|现有|当前)?"
-    r"\s*(?:待办事项|事项|待办|任务|提醒)(?:列表)?[？?。！! ]*$"
-    r"|(?:我)?(?:还有|有)(?:什么|哪些|多少)(?:待办事项|事项|待办|任务|提醒))"
-    r"|^(?:please\s+)?(?:list|show|what are|how many)\b.{0,30}\b(?:items|issues|tasks|reminders)\b",
-)
-_HABIT_LIST_QUERY = re.compile(
-    r"^(?:请(?:帮我)?|帮我)?\s*(?:(?:查看|列出|显示|看看)(?:我(?:的)?)?\s*(?:所有|全部|现有|当前)?"
-    r"\s*习惯(?:列表)?[？?。！! ]*$|(?:我)?(?:还有|有)(?:什么|哪些)习惯)"
-    r"|^(?:please\s+)?(?:list|show|what are)\b.{0,30}\bhabits\b",
-)
-_UNSUPPORTED_WRITE = re.compile(
-    r"(?:已经?|成功|给你|帮你|替你|按你的要求|为你).{0,12}?"
-    r"(?:开始|启动|暂停|恢复|继续|结束|创建|新建|添加|记下|记录|保存|归档|取消|完成|更改|修改|删除|调整|设置|推迟|确认)"
-    r"|(?:开始|启动|暂停|恢复|继续|结束|创建|添加|新建|记录|保存|删除|调整|推迟)(?:好)?了"
-    r"|(?:给|帮|替|为)你.{0,12}(?:做好了|弄好了|安排好了|处理好了|整理好了|办好了|搞定了)"
-    r"|(?:^|[。！？!?]\s*)已(?:经)?(?:开始|开启|启动|暂停|恢复|结束|创建|新建|记录|保存|添加|取消|调整|推迟|安排|归档|修改|设好)"
-    r"|\b(?:i(?:'ve| have)?|we(?:'ve| have)?|successfully|just)\s+"
-    r"(?:started|created|updated|saved|added|completed|cancelled|deleted|paused|resumed|stopped|adjusted|scheduled)\b"
-    r"|^\s*(?:started|created|updated|saved|added|completed|cancelled|deleted|paused|resumed|done)\b",
-    re.IGNORECASE,
-)
 
 
 def _as_dict(value) -> dict:
@@ -253,26 +211,6 @@ def _chat_attempt_target(function: str, args: dict) -> str | None:
     return None
 
 
-def _timer_reply(result: dict, language: str) -> dict:
-    phase = result.get("view")
-    if result["status"] != "applied":
-        text = "I couldn't read the timer." if language == "en" else "这次未能读取当前计时。"
-        return {"text": text, "status": "failed"}
-    if not isinstance(phase, dict):
-        text = "No timer is currently active." if language == "en" else "当前没有活动计时。"
-    else:
-        minutes, seconds = divmod(ceil(phase["remaining_s"]), 60)
-        if language == "en":
-            text = f"{minutes}m {seconds:02d}s remaining."
-            if phase.get("state") == "paused":
-                text = "Paused. " + text
-        else:
-            text = f"还剩 {minutes} 分 {seconds:02d} 秒。"
-            if phase.get("state") == "paused":
-                text = "计时已暂停，" + text
-    return {"text": text, "status": "answered", "result_ref": result.get("subject_ref")}
-
-
 class System2Host:
     def __init__(
         self, data_dir: Path | str, *, scheduler, gateway, engine=None, context_reader=None,
@@ -342,20 +280,13 @@ class System2Host:
         intent = {"utterance": utterance, "message_id": event_id, "selected_ref": selected_ref,
                   "reply_to_proposal_id": ref_id(reply_to_proposal_id),
                   "reply_to_proposal_version": reply_to_proposal_version}
-        semantic = semantic_chat_enabled()
-        parts = (utterance,) if semantic or reply_to_proposal_id else independent_intents(utterance)
-        messages = []
-        for index, part in enumerate(parts):
-            trigger_id = event_id if index == 0 else "s2sub-" + stable_id(event_id, str(index))
-            user = intent if len(parts) == 1 else {**intent, "utterance": part, "original_utterance": utterance}
-            event = self._user_event(trigger_id, created_at, "user_message", selected_ref)
-            event.update(semantic_chat=semantic, timezone=self.timezone)
-            messages.append((event, user, start_request(part)))
-        admission_ids = self._store.submit_many(
-            messages, created_at, self._ttl, explicit_supersedes=supersedes_admission_id,
+        event = self._user_event(event_id, created_at, "user_message", selected_ref)
+        event.update(semantic_chat=True, timezone=self.timezone)
+        admission_id = self._store.submit(
+            event, intent, created_at, self._ttl, explicit_supersedes=supersedes_admission_id,
         )
         self._awake.set()
-        return admission_ids[0]
+        return admission_id
 
     def resolve_proposal(self, proposal_id, answer, *, version, event_id=None, amendments=None):
         """Enqueue a versioned Qt proposal action without consulting the model."""
@@ -501,7 +432,7 @@ class System2Host:
         options = {"coalesce": True} if semantic_background_enabled() and hasattr(self.scheduler, "retry_wakes") else {}
         return self._wake_event(self.scheduler.claim_wakes(ids, now=now, db=db, **options), now)
 
-    def _business_context(self, admission, as_of) -> dict:
+    def _business_context(self, admission, as_of, catalog=None) -> dict:
         with self._store.connect() as db:
             db.execute("BEGIN")
             settings = self.settings.read(db=db)
@@ -512,7 +443,6 @@ class System2Host:
                 phase = json.loads(current[0]) if current else None
             items = []
             intent = admission.user_intent or {}
-            original = normalized(intent.get("utterance") or "")
             selected_ref = intent.get("selected_ref")
             selected = ref_id(selected_ref)
             selection = {}
@@ -522,7 +452,7 @@ class System2Host:
                 predecessor = json.loads(latest[0]) if latest else None
                 if predecessor and predecessor.get("state") == "elapsed":
                     selection["phase_predecessor"] = {key: predecessor[key] for key in ("id", "version", "kind")}
-            semantic = admission.source == "user" and semantic_chat_enabled() and not intent.get("proposal_button")
+            semantic = admission.source == "user" and not intent.get("proposal_button")
             recent = self._store.decisions(6, user_only=True, db=db) if semantic else ()
             recent_actions = [{key: action[key] for key in ("action", "subject_ref", "outcome")}
                               for decision in recent for action in decision.get("action_results", ())
@@ -533,8 +463,9 @@ class System2Host:
                     if receipt and _tool_outcome(name, receipt) == "committed" and (subject := receipt.get("subject_ref")):
                         turn_refs.add(ref_id(subject))
             recent_refs = {ref_id(action["subject_ref"]) for action in recent_actions}
-            list_items = _ITEM_LIST_QUERY.search(original) is not None
-            list_habits = _HABIT_LIST_QUERY.search(original) is not None
+            catalog = catalog or {}
+            listed_items = catalog.get("items", ())
+            listed_habits = catalog.get("habits", ())
             selector = {
                 "phase": ("phase_views", "view", "selected_phase"),
                 "interval": ("phase_intervals", "interval", "selected_interval"),
@@ -552,42 +483,29 @@ class System2Host:
                     draft = task["draft"]
                     identity = task["task_id"]
                     occurrence = f'{identity}:{task["occurrence"]}'
-                    named = (selected in (identity, occurrence) or normalized(draft["content"]) in original
-                             or identity in original)
-                    recent_candidate = semantic and (identity in turn_refs or (not selected and identity in recent_refs))
-                    if task.get("archived_at") or not (named or list_items or recent_candidate):
+                    visible = selected in (identity, occurrence) or identity in turn_refs or identity in listed_items
+                    recent_candidate = semantic and not selected and identity in recent_refs
+                    if (task.get("archived_at") and identity not in listed_items) or not (visible or recent_candidate):
                         continue
                     item = {"id": identity, "version": task["version"], "type": draft["item_type"],
                             "status": task.get("issue_status") or task["status"]}
-                    if named or list_items or identity in turn_refs:
+                    if visible:
                         item["title"] = draft["content"]
-                    if not semantic or draft.get("reminder_enabled", draft["item_type"] == "reminder"):
+                    if draft.get("reminder_enabled", draft["item_type"] == "reminder"):
                         item["occurrence_id"] = occurrence
-                    if semantic:
-                        item["updated_at"] = task.get("updated_at") or task.get("confirmed_at") or task.get("created_at")
-                        item["mentioned"] = named
+                    item["updated_at"] = task.get("updated_at") or task.get("confirmed_at") or task.get("created_at")
                     items.append(item)
             habits = []
             if admission.source == "user" and "pet_habits" in tables:
                 for row in db.execute("SELECT habit FROM pet_habits WHERE user_scope = ?", (self.user_scope,)):
                     habit = json.loads(row[0])
                     identity = habit["id"]
-                    named = selected == identity or normalized(habit["title"]) in original or identity in original
-                    if named or list_habits or (semantic and identity in turn_refs):
+                    if identity == selected or identity in turn_refs or identity in listed_habits:
                         habits.append(habit)
                     elif semantic and not selected and identity in recent_refs:
                         habits.append({key: habit[key] for key in ("id", "version", "status")})
             if semantic:
-                items.sort(key=lambda item: (item["id"] in turn_refs, item.pop("mentioned"),
-                                             item["id"] in recent_refs, item.get("updated_at") or ""), reverse=True)
-                habits.sort(key=lambda habit: (habit["id"] in turn_refs, "title" in habit), reverse=True)
-                selection.update(recent_user_actions=recent_actions,
-                                 candidate_items_truncated=len(items) > _CHAT_CANDIDATE_LIMIT and not list_items,
-                                 candidate_habits_truncated=len(habits) > _CHAT_CANDIDATE_LIMIT and not list_habits)
-                if not list_items:
-                    items = items[:_CHAT_CANDIDATE_LIMIT]
-                if not list_habits:
-                    habits = habits[:_CHAT_CANDIDATE_LIMIT]
+                selection["recent_user_actions"] = recent_actions
         enabled = {key: value for key, value in settings.to_dict().items()
                    if not key.startswith(("observation_", "document_")) and key != "input_mode"}
         return {"current_phase": phase, "items": items, "habits": habits, "enabled_settings": enabled, **selection}
@@ -628,10 +546,10 @@ class System2Host:
             self.settings.read(), self.settings.routes.snapshot(SYSTEM2), self._observation_privacy_marker()[2],
         )
 
-    def _snapshot(self, admission, as_of, **observation_options):
+    def _snapshot(self, admission, as_of, *, catalog=None, **observation_options):
         schedule = self.scheduler.snapshot(as_of) if self.scheduler is not None else {}
         observation = self._observation(as_of, **observation_options)
-        domain = self._business_context(admission, as_of)
+        domain = self._business_context(admission, as_of, catalog)
         relevant_ids = {item["id"] for item in domain["items"] if "title" in item}
         eligible = [item for value in schedule.get("eligible_items", ()) if
                     (item := _as_dict(value)) and (admission.source == "background" or item.get("id") in relevant_ids)]
@@ -694,7 +612,8 @@ class System2Host:
                 if identity is not None and type(version) is int:
                     versions[f"{kind}:{identity}"] = version
                     versions.setdefault(identity, version)
-                    if occurrence := value.get("occurrence_id"):
+                    occurrence = value.get("occurrence_id") or (value.get("occurrence") or {}).get("id")
+                    if occurrence:
                         versions[f"occurrence:{occurrence}"] = version
         observed = context["current"] or {}
         return {
@@ -707,24 +626,22 @@ class System2Host:
         }
 
     def _call(self, admission, bound, context, grants, name, native_call_id, args, *,
-              step_id=None, check_model_policy=None):
+              step_id=None, check_model_policy=None, catalog=None):
         if (not isinstance(name, str) or not isinstance(native_call_id, str) or not native_call_id
                 or not isinstance(args, dict)):
             return {"call_id": native_call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
         name = canonical_tool_name(name)
         now = self.clock.wall_now()
         step_id = step_id or admission.step_id
-        args = bind_tool_args(grants, name, args)
         semantic = grants.get(name, {}).get("semantic_chat") is True
         invalid_fields = None
         try:
-            if name != "decision.list":
-                args = validate_tool_args(name, args, relative_time=semantic)
-                _validate_timing_context(args, (admission.user_intent or {}).get("utterance") or "")
-                if semantic:
-                    args = materialize_chat_times(name, args, admission.created_at,
-                                                  admission.event.get("timezone", self.timezone))
-                    args = validate_tool_args(name, args)
+            args = validate_tool_args(name, args, relative_time=semantic)
+            _validate_timing_context(args, (admission.user_intent or {}).get("utterance") or "")
+            if semantic:
+                args = materialize_chat_times(name, args, admission.created_at,
+                                              admission.event.get("timezone", self.timezone))
+                args = validate_tool_args(name, args)
         except ValidationError as exc:
             invalid_fields = [{"field": ".".join(map(str, error["loc"])), "code": error["type"]}
                               for error in exc.errors(include_url=False, include_context=False, include_input=False)][:8]
@@ -758,7 +675,7 @@ class System2Host:
             expected_versions=bound["expected_versions"],
             check_model_policy=check_model_policy,
         )
-        result = self._execute(name, args, authority, context, admission)
+        result = self._execute(name, args, authority, context, admission, catalog)
         if name not in READ_TOOLS:
             result.setdefault("outcome", _tool_outcome(name, result))
         # Observation and other private read views need not survive the turn.
@@ -773,25 +690,28 @@ class System2Host:
         """Limit model reads to current-context objects or a user-selected record."""
         intent = admission.user_intent or {}
         selected = ref_id(intent.get("selected_ref"))
-        utterance = intent.get("utterance", "")
         target = ref_id(args.get("id"))
         if name in {"item.get", "item.list"}:
-            items = context["items"] + context["eligible_items"] + context.get("recheck_items", [])
-            permitted = {ref_id(view.get("id")) for view in items}
-            return permitted if name == "item.list" else target in permitted
+            if name == "item.list" and admission.source == "user":
+                return True
+            visible = {ref_id(view.get("id")) for key in ("items", "eligible_items", "recheck_items")
+                       for view in context.get(key, ())}
+            return visible if name == "item.list" else target in visible
         if name in {"habit.get", "habit.list"} or (name == "settings.get" and args["scope"] == "habit"):
-            permitted = {ref_id(view.get("id")) for view in context["habits"]}
-            return permitted if name == "habit.list" else target in permitted
+            if name == "habit.list" and admission.source == "user":
+                return True
+            visible = {ref_id(view.get("id")) for view in context["habits"]}
+            return visible if name == "habit.list" else target in visible
         if name == "phase.get" or (name == "settings.get" and args["scope"] == "current"):
-            return not target or target in {selected, (context["current_phase"] or {}).get("id")} or target in utterance
+            return not target or target in {selected, (context["current_phase"] or {}).get("id")}
         if name == "command.get_result":
             command_id = args["command_id"]
-            return command_id == selected or command_id in utterance or any(
+            return command_id == selected or any(
                 call[0] == command_id for call in self._store.calls(admission.admission_id)
             )
         return True
 
-    def _execute(self, name, args, authority, context, admission):
+    def _execute(self, name, args, authority, context, admission, catalog):
         try:
             if name == "context.read":
                 query_now = self.clock.wall_now()
@@ -802,7 +722,9 @@ class System2Host:
                     history_end or at
                 ) <= at:
                     return {"call_id": authority.call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
-                observation_options = {"document_query": admission.source == "user" or semantic_background_enabled(),
+                document_query = (args.get("include_document_source") is True if admission.source == "user"
+                                  else semantic_background_enabled())
+                observation_options = {"document_query": document_query,
                                        "history_start": history_start,
                                        "history_end": history_end,
                                        "include_capture_health": args.get("include_capture_health") is True}
@@ -810,10 +732,8 @@ class System2Host:
                     view = {**context, **self._observation(at, historical=True, **observation_options),
                             "as_of": at.isoformat()}
                 else:
-                    view, _ = self._snapshot(admission, at, **observation_options)
+                    view, _ = self._snapshot(admission, at, catalog=catalog, **observation_options)
                 return {"call_id": authority.call_id, "status": "applied", "view": view}
-            if name == "decision.list":
-                return {"call_id": authority.call_id, "status": "applied", "view": context["recent_decisions"]}
             permitted = self._read_scope(name, args, context, admission) if name in READ_TOOLS else True
             if permitted is False:
                 return {"call_id": authority.call_id, "status": "rejected", "error_code": "NOT_AUTHORIZED"}
@@ -901,67 +821,55 @@ class System2Host:
                     | {"action": name, "outcome": _tool_outcome(name, result)} for name, result in receipts
                 ]}
 
-    def _user_reply(self, admission, receipts, reply, failure, grants):
+    def _user_reply(self, admission, receipts, reply, failure):
         if admission.source != "user":
             return None
-        semantic = semantic_chat_enabled() and not (admission.user_intent or {}).get("proposal_button")
-        if receipts:
-            if not semantic:
-                return _with_reply_source(_result_reply(*receipts[-1]), "program")
-            actions = []
-            for index, (name, result) in enumerate(receipts):
-                target = result.get("_attempt_target")
-                corrected = (target is not None and result.get("error_code") in _STALE | {"INVALID_ARGUMENT", "NOT_AUTHORIZED"}
-                             and any(later.get("_attempt_target") == target and _original_status(later) in _SUCCESS
-                                     for _, later in receipts[index + 1:]))
-                if not corrected:
-                    actions.append(_result_reply(name, result, admission.event.get("timezone", self.timezone)))
-            follow_up = ""
-            if not failure:
-                sentences = re.split(r"(?<=[。！？!?])\s*", reply.text.strip()[:4000])
-                follow_up = "".join(sentence for sentence in sentences if sentence and not _UNSUPPORTED_WRITE.search(sentence)
-                                    and not re.fullmatch(r"(?:好的?|明白|收到|了解|已完成|已处理|已执行|完成|quiet)[。！! ]*", sentence))
-            if len(actions) == 1 and not follow_up:
-                return _with_reply_source(actions[0], "program")
-            texts = [action["text"] for action in actions]
-            parts = [{"source": "program", "text": text} for text in texts if text.strip()]
-            if follow_up:
-                texts.append(follow_up)
-                parts.append({"source": "model", "text": follow_up})
-            success = sum(action["status"] in _SUCCESS for action in actions)
-            unresolved = follow_up.endswith(("？", "?"))
-            status = ("applied" if success == len(actions) and not unresolved else
-                      "partial" if success else "rejected")
-            return {"text": "\n".join(texts), "status": status, "actions": actions, "parts": parts}
-        if failure:
-            return _with_reply_source(
-                {"text": _REASONS.get(failure, "这次判断没有完成。"), "status": failure}, "program",
+        timezone = admission.event.get("timezone", self.timezone)
+        if (admission.user_intent or {}).get("proposal_button") and receipts:
+            return _with_reply_source(_result_reply(*receipts[-1], timezone), "program")
+        actions = []
+        parts = []
+        for index, (name, result) in enumerate(receipts):
+            target = result.get("_attempt_target")
+            corrected = (
+                target is not None
+                and result.get("error_code") in _STALE | {"INVALID_ARGUMENT", "NOT_AUTHORIZED"}
+                and any(later.get("_attempt_target") == target and _original_status(later) in _SUCCESS
+                        for _, later in receipts[index + 1:])
             )
-        text = reply.text.strip()
-        if grants and not semantic:
-            if text.endswith(("？", "?")) and not _UNSUPPORTED_WRITE.search(text):
-                text, status = "请再说明你要操作的对象或参数。", "clarification"
+            if corrected:
+                continue
+            action = _result_reply(name, result, timezone)
+            actions.append(action)
+            source = "program" if action["status"] in _SUCCESS else "status"
+            parts.append({"source": source, "text": action["text"]})
+        if failure:
+            parts.append({"source": "status", "text": _REASONS.get(failure, "这次判断没有完成。")})
+        elif reply.text.strip():
+            parts.append({"source": "model", "text": reply.text})
+        if not parts:
+            parts.append({"source": "status", "text": "这次没有收到答复。"})
+        if not failure and len(actions) == len(parts) == 1:
+            return {**actions[0], "parts": parts}
+        status = failure
+        if not status:
+            if actions:
+                successes = sum(action["status"] in _SUCCESS for action in actions)
+                status = "applied" if successes == len(actions) else "partial" if successes else "rejected"
             else:
-                text, status = "这次没有确认任何操作。", "failed"
-        elif _UNSUPPORTED_WRITE.search(text):
-            text, status = "这次没有执行成功。" if semantic else "这次没有确认任何操作。", "failed"
-        elif text and text.casefold() != "quiet":
-            status = "clarification" if text.endswith(("？", "?")) else "answered"
-            return _with_reply_source({"text": text[:4000], "status": status}, "model")
-        else:
-            text, status = "这次没有收到答复。", "failed"
-        return _with_reply_source({"text": text, "status": status}, "program")
+                status = "answered" if reply.text.strip() else "failed"
+        return {"text": "\n".join(part["text"] for part in parts), "status": status,
+                **({"actions": actions} if actions else {}), "parts": parts}
 
-    def _finish(self, admission, engine_reply, failure, grants, context, as_of, *, local_reply=None):
+    def _finish(self, admission, engine_reply, failure, context, as_of, *, button_result=None):
         current = self._store.state(admission.admission_id)
         receipts = self._receipts(admission.admission_id)
+        if not receipts and button_result is not None:
+            receipts = [("proposal.resolve", button_result)]
         if current.state in {"superseded", "interrupted"}:
             failure = current.state
             engine_reply = EngineReply("")
-        if local_reply is not None and not failure:
-            response = _with_reply_source(local_reply, "program")
-        else:
-            response = self._user_reply(admission, receipts, engine_reply, failure, grants)
+        response = self._user_reply(admission, receipts, engine_reply, failure)
         decision = self._decision(admission, as_of, receipts, engine_reply, failure, context)
         recover_wakes = None
         if (admission.source == "background" and failure in {"interrupted", "model_unavailable", "expired_request"}
@@ -975,8 +883,8 @@ class System2Host:
         self._store.finish(admission, decision, response, engine_reply.session_id, PROMPT_VERSION,
                            expected_state=current.state, recover_wakes=recover_wakes)
 
-    def _chat_after_commit(self, admission, intent, bound, subject_ref, version):
-        context, schedule = self._snapshot(admission, self.clock.wall_now())
+    def _chat_after_commit(self, admission, intent, bound, subject_ref, version, catalog):
+        context, schedule = self._snapshot(admission, self.clock.wall_now(), catalog=catalog)
         versions = self._authority_context(context, schedule)["expected_versions"]
         kind, _, identity = subject_ref.partition(":")
 
@@ -996,121 +904,87 @@ class System2Host:
 
     def _run(self, admission, as_of):
         if not admission.created_at <= as_of < admission.expires_at:
-            self._finish(admission, EngineReply(""), "expired_request", {}, {}, as_of)
+            self._finish(admission, EngineReply(""), "expired_request", {}, as_of)
             return
         intent = admission.user_intent if admission.source == "user" else None
-        semantic_chat = bool(intent is not None and semantic_chat_enabled())
+        button = intent.get("proposal_button") if intent else None
+        semantic_chat = intent is not None and not button
         semantic_background = admission.source == "background" and semantic_background_enabled()
-        document_query = semantic_background or bool(intent and _ACTIVITY_QUESTION.search(intent.get("utterance") or ""))
         observation_generation = self.settings.read().observation_generation
         observation_marker = self._observation_privacy_marker()
-        context, schedule = self._snapshot(admission, as_of, document_query=document_query)
-        if intent and intent.get("utterance") and not intent.get("reply_to_proposal_id"):
-            non_cancelled = without_cancellation(intent["utterance"])
-            literal_cancel = literal_start_cancellation(intent["utterance"])
-            if non_cancelled != intent["utterance"]:
-                if not non_cancelled and (not semantic_chat or literal_cancel and admission.supersedes):
-                    old = self._receipts(admission.supersedes) if admission.supersedes else ()
-                    committed = any(name == "phase.start" and _original_status(result) in _SUCCESS
-                                    for name, result in old)
-                    if committed:
-                        text = "先前的开始请求已生效。"
-                    elif admission.supersedes:
-                        text = "已取消尚未生效的开始请求。"
-                    else:
-                        text = "你想取消哪一次开始请求？"
-                    self._finish(admission, EngineReply(""), None, {}, context, as_of,
-                                 local_reply={"text": text, "status": "answered"})
-                    return
-        timezone = admission.event.get("timezone", self.timezone)
-        if intent is not None:
+        context, schedule = self._snapshot(admission, as_of, document_query=semantic_background)
+        if semantic_chat:
+            timezone = admission.event.get("timezone", self.timezone)
             intent = {**intent, "requested_at": admission.created_at.astimezone(resolve_timezone(timezone)).isoformat(),
                       "timezone": timezone}
-        grants = chat_grants(intent, context) if semantic_chat else describe_grants(intent, context, requested_at=admission.created_at)
+            grants = chat_grants(intent, context)
+        elif button:
+            grants = proposal_button_grants(button)
+        else:
+            grants = background_grants(context)
         bound = self._authority_context(context, schedule)
         if not self._store.bind(admission, grants, bound):
             return
+        if button:
+            result = self._call(admission, bound, context, grants, "proposal.resolve", intent["message_id"], button,
+                                step_id=f'ui:{intent["message_id"]}')
+            self._finish(admission, EngineReply(""), None, context, as_of, button_result=result)
+            return
         tool_lock = Lock()
         cached = {}
-        needs_refresh = refreshed = attempted_write = False
+        catalog = {"items": set(), "habits": set()}
+        needs_refresh = refreshed = False
+
+        def bind(current, updated, new_grants):
+            nonlocal context, bound
+            if self._store.bind(admission, new_grants, updated):
+                context, bound = current, updated
+                grants.clear()
+                grants.update(new_grants)
 
         def call_tool(name, call_id, args, *, step_id=None, check_model_policy=None):
-            nonlocal bound, context, needs_refresh, refreshed, attempted_write
+            nonlocal needs_refresh, refreshed
             with tool_lock:
-                if isinstance(name, str) and canonical_tool_name(name) not in READ_TOOLS:
-                    attempted_write = True
                 try:
                     key = name, call_id, json_text(args)
+                    previous = cached.get(key)
+                    function = canonical_tool_name(name)
                 except (TypeError, ValueError):
                     return {"call_id": call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
-                if key in cached:
-                    return cached[key]
-                if (needs_refresh and not refreshed and canonical_tool_name(name) == "context.read"
+                if previous is not None:
+                    return previous
+                if (needs_refresh and not refreshed and function == "context.read"
                         and isinstance(args, dict) and not args.get("as_of")):
-                    current, current_schedule = self._snapshot(admission, self.clock.wall_now())
-                    new_grants = (chat_grants(intent, current) if semantic_chat else
-                                  describe_grants(intent, current, requested_at=admission.created_at))
+                    current, current_schedule = self._snapshot(admission, self.clock.wall_now(), catalog=catalog)
+                    new_grants = chat_grants(intent, current) if semantic_chat else background_grants(current)
                     if semantic_chat or semantic_background or new_grants == grants:
-                        updated = self._authority_context(current, current_schedule)
-                        # The native tool inventory is admitted at the start of the turn.
-                        # Retain only initially available functions during the replan.
-                        new_grants = {name: value for name, value in new_grants.items() if name in grants}
-                        if self._store.bind(admission, new_grants, updated):
-                            context, bound = current, updated
-                            grants.clear()
-                            grants.update(new_grants)
+                        # Refresh guards only for functions offered in the original turn.
+                        bind(current, self._authority_context(current, current_schedule),
+                             {name: value for name, value in new_grants.items() if name in grants})
                     refreshed = True
                 result = self._call(admission, bound, context, grants, name, call_id, args, step_id=step_id,
-                                    check_model_policy=check_model_policy)
+                                    check_model_policy=check_model_policy, catalog=catalog)
                 cached[key] = result
-                if (semantic_chat and canonical_tool_name(name) not in READ_TOOLS and result.get("outcome") == "committed"
+                if semantic_chat and result.get("status") == "applied" and function in {"item.list", "habit.list"}:
+                    field = "items" if function == "item.list" else "habits"
+                    candidates = {view["id"]: view for view in context[field]}
+                    views = result.get("view") or []
+                    catalog[field].update(view["id"] for view in views)
+                    candidates.update((view["id"], view) for view in views)
+                    current = {**context, field: list(candidates.values())}
+                    updates = self._authority_context(current, {})["expected_versions"]
+                    # A catalog read adds newly seen identities. Existing write guards
+                    # change only after an explicit refresh or this turn's own writes.
+                    updated = {**bound, "expected_versions": updates | bound["expected_versions"]}
+                    bind(current, updated, chat_grants(intent, current))
+                if (semantic_chat and function not in READ_TOOLS and result.get("outcome") == "committed"
                         and (subject_ref := result.get("subject_ref"))):
-                    current, updated, new_grants = self._chat_after_commit(
-                        admission, intent, bound, subject_ref, result.get("actual_version"),
-                    )
-                    if self._store.bind(admission, new_grants, updated):
-                        context, bound = current, updated
-                        grants.clear()
-                        grants.update(new_grants)
+                    bind(*self._chat_after_commit(
+                        admission, intent, bound, subject_ref, result.get("actual_version"), catalog,
+                    ))
                 needs_refresh = needs_refresh or result.get("error_code") in _STALE
                 return result
 
-        if intent and (button := intent.get("proposal_button")):
-            call_tool("proposal.resolve", intent["message_id"], button, step_id=f'ui:{intent["message_id"]}')
-            self._finish(admission, EngineReply(""), None, grants, context, as_of)
-            return
-        if intent and (language := timer_query_language(intent.get("utterance") or "")):
-            result = call_tool("phase.get", "local:time-remaining", {}, step_id=admission.step_id)
-            self._finish(admission, EngineReply(""), None, grants, context, as_of,
-                         local_reply=_timer_reply(result, language))
-            return
-        command = None
-        if semantic_chat:
-            if intent.get("utterance") and not intent.get("reply_to_proposal_id"):
-                args = literal_chat_reminder(intent["utterance"], admission.created_at, timezone)
-                if args is not None:
-                    command = "item.create", args
-        else:
-            command = deterministic_command(intent, grants)
-        if command and command[0] == "item.create":
-            # A literal short delay can expire while the cloud model is thinking.
-            function, args = command
-            due = datetime.fromisoformat(args["reminder_rule"]["remind_by"])
-            if due <= self.clock.wall_now():
-                self._finish(admission, EngineReply(""), "expired_request", grants, context, as_of)
-            else:
-                call_tool(function, "explicit:" + function, args, step_id=admission.step_id)
-                self._finish(admission, EngineReply(""), None, grants, context, as_of)
-            return
-        utterance = normalized((intent or {}).get("utterance") or "")
-        if (intent and not intent.get("reply_to_proposal_id")
-                and (((not grants or semantic_chat) and _CAPABILITY_QUESTION.fullmatch(utterance))
-                     or (semantic_chat and _CHAT_CAPABILITY_QUESTION.fullmatch(utterance)))):
-            self._finish(admission, EngineReply(""), None, grants, context, as_of, local_reply={
-                "text": "可以直接叫我设提醒、记事项或开始专注。比如「一分钟后提醒我喝水」。我会告诉你这件事是否已办成。",
-                "status": "answered",
-            })
-            return
         request = TurnRequest(
             admission.admission_id, admission.step_id, SYSTEM_PROMPT, json_text({
                 "origin": admission.source,
@@ -1123,7 +997,7 @@ class System2Host:
             }), self.user_scope, PROMPT_VERSION, admission.source,
             allowed_tools=tuple(sorted(READ_TOOLS | grants.keys())), expires_at=admission.expires_at,
             observation_generation=observation_generation, observation_privacy_marker=observation_marker,
-            observation_document_query=document_query,
+            observation_document_query=semantic_background,
         )
         failure = None
         try:
@@ -1135,10 +1009,7 @@ class System2Host:
         if not admission.created_at <= self.clock.wall_now() < admission.expires_at:
             reply, failure = EngineReply(""), "expired_request"
         if not self._stopping.is_set():
-            if not semantic_chat and failure is None and not attempted_write and command:
-                function, args = command
-                call_tool(function, "explicit:" + function, args, step_id=admission.step_id)
-            self._finish(admission, reply, failure, grants, context, as_of)
+            self._finish(admission, reply, failure, context, as_of)
 
     def pump(self) -> bool:
         """Run one admitted turn. Qt uses start() and consumes the durable UI outbox."""
@@ -1147,7 +1018,7 @@ class System2Host:
         try:
             now = self.clock.wall_now()
             for interrupted in self._store.interrupted():
-                self._finish(interrupted, EngineReply(""), interrupted.state, {}, {}, now)
+                self._finish(interrupted, EngineReply(""), interrupted.state, {}, now)
             background = self._background(now)
             admission = self._store.claim(
                 now, background=background, ack_wakes=self.scheduler.ack_wakes if background else None,
@@ -1161,7 +1032,7 @@ class System2Host:
                 self._run(admission, as_of)
             except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
                 log.warning("System 2 admission could not run (%s)", type(exc).__name__)
-                self._finish(admission, EngineReply(""), "interrupted", {}, {}, as_of)
+                self._finish(admission, EngineReply(""), "interrupted", {}, as_of)
             return True
         finally:
             self._pump_lock.release()

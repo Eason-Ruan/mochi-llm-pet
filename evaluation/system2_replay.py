@@ -37,10 +37,10 @@ from evaluation.interruption_replay import SimulatedNotifications, score_interru
 
 
 FIXTURES = Path(__file__).with_name("data") / "system2-semantic-replay.json"
-VARIANTS = {"baseline": "0", "semantic": "1"}
+BACKGROUND_POLICIES = {"legacy_background": "0", "semantic_background": "1"}
 DISPLAY_EFFECTS = frozenset({"reminder_shown", "proposal_shown", "pet_shown"})
 FAILURES = frozenset({"model_unavailable", "expired_request", "superseded", "interrupted", "parse_failed"})
-VALID_TOOLS = {tool.canonical_name for tool in tool_definitions} | {"decision.list"}
+VALID_TOOLS = {tool.canonical_name for tool in tool_definitions}
 
 
 def read_cases():
@@ -855,13 +855,15 @@ def summarize(cases, mode):
     }
 
 
-def run_comparison(cases, *, recordings=None):
+def run_replay(cases, *, recordings=None):
     mode = "scripted_fixture" if recordings is None else "offline_recorded_model"
-    report = {"schema": 1, "engine_behavior_source": mode, "presentation_source": "simulated",
-              "input_source": "synthetic_fixtures", "variants": {}}
-    for variant, flag in VARIANTS.items():
-        with patch.dict(os.environ, {"MOCHI_SYSTEM2_SEMANTIC_CHAT": flag, "MOCHI_SYSTEM2_SEMANTIC_BACKGROUND": flag}):
-            runs = [run_case(case, None if recordings is None else recordings.get(variant, {}).get(case["id"], {}))
+    report = {"schema": 2, "engine_behavior_source": mode, "presentation_source": "simulated",
+              "input_source": "synthetic_fixtures", "chat_policy": "semantic", "variants": {}}
+    for variant, flag in BACKGROUND_POLICIES.items():
+        if recordings is not None and variant not in recordings:
+            continue
+        with patch.dict(os.environ, {"MOCHI_SYSTEM2_SEMANTIC_BACKGROUND": flag}):
+            runs = [run_case(case, None if recordings is None else recordings[variant].get(case["id"], {}))
                     for case in cases]
         report["variants"][variant] = {"metrics": summarize(runs, mode), "scenarios": runs}
     return report
@@ -869,10 +871,15 @@ def run_comparison(cases, *, recordings=None):
 
 def blind_review(cases, report, seed):
     """Randomize run labels independently for each case. Keep the key separate."""
+    variants = report["variants"]
+    if len(variants) != 2:
+        raise ValueError("Blind review requires recordings for both background policies")
+    if any(run["metrics"]["missing_or_mismatched_recorded_turns"] for run in variants.values()):
+        raise ValueError("Blind review requires matching recorded turns for both background policies")
     rng = Random(seed)
     review, key = [], {}
     for index, case in enumerate(cases):
-        order = list(VARIANTS)
+        order = list(variants)
         rng.shuffle(order)
         key[case["id"]] = dict(zip(("A", "B"), order))
         review.append({
@@ -884,7 +891,7 @@ def blind_review(cases, report, seed):
                     for effect in step["effects"]],
                     "reply_statuses": [reply["status"] for reply in step["replies"]],
                     "proposed": [proposal["action"] for turn in step["turns"] for proposal in turn["proposed"]],
-                } for step in report["variants"][variant]["scenarios"][index]["steps"]]
+                } for step in variants[variant]["scenarios"][index]["steps"]]
                 for label, variant in key[case["id"]].items()
             },
         })
@@ -894,11 +901,19 @@ def blind_review(cases, report, seed):
 
 def load_recordings(path):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if data.get("schema") != 1 or data.get("synthetic_inputs_only") is not True:
-        raise ValueError("Expected schema 1 recordings captured from synthetic inputs only")
+    if (not isinstance(data, dict) or data.get("schema") not in (1, 2)
+            or data.get("synthetic_inputs_only") is not True):
+        raise ValueError("Expected schema 1 or 2 recordings captured from synthetic inputs only")
     variants = data["variants"]
-    if set(variants) != set(VARIANTS):
-        raise ValueError("Recordings must supply both variants")
+    if not isinstance(variants, dict):
+        raise ValueError("Expected recorded variants keyed by policy name")
+    if data["schema"] == 1:
+        # Its baseline was captured with the removed chat policy.
+        if "semantic" not in variants:
+            raise ValueError("Schema 1 recordings must include the semantic variant")
+        variants = {"semantic_background": variants["semantic"]}
+    elif "semantic_background" not in variants or variants.keys() - BACKGROUND_POLICIES.keys():
+        raise ValueError("Schema 2 recordings require semantic_background and may include legacy_background")
     for cases in variants.values():
         for steps in cases.values():
             for turns in steps.values():

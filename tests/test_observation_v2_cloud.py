@@ -6,11 +6,15 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.util import find_spec
 from io import BytesIO
 import json
 import logging
+import socket
 import sqlite3
+import sys
 from threading import Event, Thread
+import time
 from types import SimpleNamespace
 
 import h11
@@ -178,6 +182,79 @@ def _route(base, model="test", credential_ref=None):
 
 def _state_request(model, window):
     return model.complete(system="OS_TITLE_PRIVATE_SYSTEM_MARKER", prompt=json.dumps(window), schema={})
+
+
+def test_managed_live_collector_uses_native_dsh_with_the_existing_vision_recipient(tmp_path, monkeypatch):
+    from deskpet.observation_v2 import __main__ as cli, media, pipeline
+    from deskpet.observation_v2.desktop import DesktopObserver
+
+    if find_spec("deepseek_harness") is None:
+        pytest.skip("Pinned DSH runtime is unavailable")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", 0))
+        except PermissionError:
+            pytest.skip("Loopback bind is unavailable")
+
+    class Sampler:
+        platform = "darwin"
+        errors = {}
+
+        def __init__(self, **kwargs):
+            pass
+
+        def sample(self):
+            return ActivitySample(
+                datetime.now(UTC), time.monotonic(), app_name="Editor", window_id=1,
+                window_title="Synthetic window title", idle_s=0, screen_locked=False,
+                session_id="synthetic-session", private_window=False,
+            )
+
+    with BytesIO() as buffer:
+        Image.new("RGB", (48, 32), "#334455").save(buffer, "JPEG")
+        jpeg = buffer.getvalue()
+    attempts = []
+    native_complete = cli.ObservationDSH.complete
+
+    def complete(runtime, **kwargs):
+        attempts.append(kwargs["model"])
+        return native_complete(runtime, **kwargs)
+
+    monkeypatch.setattr(cli.ObservationDSH, "complete", complete)
+    monkeypatch.setattr(pipeline, "NativeActivitySampler", Sampler)
+    monkeypatch.setattr(media, "capture_window", lambda *_args, **_kwargs: (datetime.now(UTC), jpeg))
+    observer = DesktopObserver(tmp_path)
+    prefs = observer.settings.update(expected_version=0, observation_screenshots=True)
+    with _server(monkeypatch) as (base, seen, behavior, _, _):
+        behavior["vision_result"] = {
+            "screen_kind": "ide", "activity_kind": "work", "scene_elements": ["code editor"],
+            "visible_changes": [], "next_check": None,
+        }
+        route = replace(_route(base + "/v1", model="qwen3.7-flash"), timeout_s=5)
+        allowed = observer.settings.routes.configure(VISION, route)
+        allowed = observer.settings.routes.set_permission(VISION, True, expected=allowed)
+        allowed = observer.settings.routes.record_result(allowed, probe=True)
+        command = [arg for arg in observer._arguments(prefs)[3:] if arg != "--until-stopped"]
+        monkeypatch.setattr(sys, "argv", ["observation_v2", *command, "--duration-s", "8"])
+        cli.main()
+
+    assert attempts == ["qwen3.7-flash"]
+    [(path, _, request)] = seen
+    assert path == "/v1/chat/completions" and request["model"] == "qwen3.7-flash"
+    assert not request.get("tools")
+    text, image = request["messages"][-1]["content"]
+    assert "Synthetic window title" not in json.dumps(request) and "system_signals" not in text["text"]
+    assert base64.b64decode(image["image_url"]["url"].split(",", 1)[1]) == jpeg
+    current = observer.settings.routes.snapshot(VISION)
+    assert (current.route, current.route_generation, current.consent_generation) == (
+        allowed.route, allowed.route_generation, allowed.consent_generation,
+    )
+    assert current.verified and current.permission and not current.vision_signals_permission
+    with sqlite3.connect(observer.database) as db:
+        assert db.execute("SELECT status, model_id, realtime_eligible FROM screen_observations").fetchone() == (
+            "ready", "qwen3.7-flash", 1,
+        )
+        assert db.execute("SELECT status FROM observation_capture_health").fetchone() == ("ready",)
 
 
 def test_cloud_state_projects_only_typed_inputs_and_explicitly_approved_text(tmp_path, caplog, monkeypatch):

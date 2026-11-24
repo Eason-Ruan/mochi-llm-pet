@@ -2,43 +2,40 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
-from queue import Empty, Queue
 import re
 import secrets
-import signal
 import sqlite3
-import subprocess
-import sys
 from tempfile import TemporaryDirectory
-from threading import Event, Lock, Thread
+from threading import Event, Lock
 from types import SimpleNamespace
-import time
 
 import httpx
 
+from deskpet.dsh_process import SDKWorker
+from deskpet.dsh_profile import write_system2_profile
 from deskpet.observation_v2.openai_cloud import _resolve_credential
 from deskpet.observation_v2.routes import SYSTEM2, CloudRoute, CloudRouteError, CloudRouteSnapshot, ObservationCloudSettings
 from deskpet.settings import SettingsStore
 
 from .bailian import BailianTurn
-from .dsh_profile import isolated_environment, write_profile
-from .dsh_projection import project_input, project_tool_result
+from .dsh_projection import observed_document_names, project_input, project_tool_result
 from .gateway import ModelGateway, SendPolicy
-from .semantic_policy import semantic_background_enabled, semantic_chat_enabled, text_sharing_allowed
+from .semantic_policy import semantic_background_enabled, text_sharing_allowed
 from .tool_schema import READ_TOOLS, canonical_tool_name
 
 _WIRE_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
-_PROFILE_VERSION = "mochi-dsh-0.2.2rc2-v2"
+_PROFILE_VERSION = "mochi-dsh-0.2.2rc2-v3"
 _INIT_TIMEOUT = 12.0
 _MAX_MODEL_STEPS = 6
-_STOP = object()
+_CHAT_HISTORY_TURNS = 4
+_CHAT_HISTORY_TEXT_LIMIT = 1200
 
 
 class System2RunError(CloudRouteError):
@@ -69,93 +66,13 @@ def _schemas(tools: Iterable) -> list[dict]:
     return json.loads(_json(registered))
 
 
-class _SDKWorker:
-    def __init__(self, home: Path, token: str) -> None:
-        if not sys.executable:
-            raise CloudRouteError("System 2 requires a Python executable")
-        worker = Path(__file__).with_name("dsh_worker.py")
-        self._process = subprocess.Popen(
-            [sys.executable, "-I", "-u", str(worker)], cwd=home,
-            env=isolated_environment(home, token), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
-            start_new_session=os.name == "posix",
-        )
-        self._stdin_lock = Lock()
-        self._output: Queue = Queue()
-        self._reader = Thread(target=self._read, daemon=True, name="mochi-dsh-sdk")
-        self._reader.start()
-
-    def _read(self) -> None:
-        assert self._process.stdout is not None
-        try:
-            for line in self._process.stdout:
-                self._output.put(json.loads(line))
-        except (ValueError, OSError):
-            pass
-        finally:
-            self._output.put(_STOP)
-
-    def _write(self, value: dict) -> None:
-        assert self._process.stdin is not None
-        with self._stdin_lock:
-            self._process.stdin.write(_json(value) + "\n")
-            self._process.stdin.flush()
-
-    def request(self, value: dict, *, timeout: float, expected: str, cancelled: Event | None = None) -> dict:
-        try:
-            self._write(value)
-        except (OSError, ValueError):
-            raise CloudRouteError("System 2 runtime is unavailable") from None
-        expires = time.monotonic() + timeout
-        while True:
-            if cancelled is not None and cancelled.is_set():
-                raise CloudRouteError("System 2 runtime was closed")
-            remaining = expires - time.monotonic()
-            if remaining <= 0:
-                raise CloudRouteError("System 2 runtime timed out")
-            try:
-                response = self._output.get(timeout=min(0.15, remaining))
-                break
-            except Empty:
-                continue
-        if response is _STOP or not isinstance(response, dict):
-            raise CloudRouteError("System 2 runtime exited unexpectedly")
-        if response.get("kind") != expected:
-            if response.get("error") == "ModuleNotFoundError":
-                raise CloudRouteError("The System 2 runtime is unavailable on this platform")
-            raise CloudRouteError("System 2 runtime could not complete the request")
-        return response
-
-    def close(self, *, in_flight: bool) -> None:
-        process = self._process
-        try:
-            if process.poll() is None:
-                self._write({"kind": "close"})
-                process.wait(1.5 if in_flight else 4.0)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            if process.poll() is None:
-                try:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:
-                        process.kill()
-                except ProcessLookupError:
-                    pass
-        finally:
-            process.wait()
-            self._reader.join(timeout=1)
-            if process.stdin is not None:
-                process.stdin.close()
-            if process.stdout is not None:
-                process.stdout.close()
-
-
 @dataclass
 class _ActiveTurn:
     admission_id: str
     call_tool: Callable[..., dict]
     allowed: frozenset[str]
     expires_at: datetime | None
+    source: str
     model_requests: int = 0
     native_turn: int | None = None
     native_step: int = 0
@@ -172,6 +89,7 @@ class _Runtime:
         session_id: str, prompt: str, tools: list[dict],
         credential: Callable[[CloudRoute], str], share: bool, closing: Event | None = None,
         document_sources: tuple[str, ...] = (), private_storage: TemporaryDirectory | None = None,
+        recent_chat: tuple[dict[str, str], ...] = (),
     ) -> None:
         self.session_id = session_id
         self.policy = policy
@@ -180,11 +98,14 @@ class _Runtime:
         self._share = share
         self._document_sources = document_sources
         self._private_storage = private_storage
+        self._recent_chat = recent_chat
+        self.document_disclosed = False
+        self.last_user_message: str | None = None
         self._closing = closing
         self._close_lock = Lock()
         self._closed = False
         self._registered = frozenset(tool["name"] for tool in tools)
-        self._worker: _SDKWorker | None = None
+        self._worker: SDKWorker | None = None
         self.gateway = ModelGateway(
             policy, tool_names=self._registered, invoke=self._invoke, credential=credential,
             admit_request=self._admit_request, check_active=lambda: self._check_active().bailian,
@@ -199,12 +120,12 @@ class _Runtime:
             self.port_file = home / "bridge-port"
             route = policy.snapshot.route
             assert route is not None
-            write_profile(
+            write_system2_profile(
                 home, origin=self.gateway.origin, model=route.model, official=route.provider_kind == "openai",
                 prompt=prompt, tools=tools, port_file=self.port_file, sessions=sessions,
             )
             policy.check()
-            self._worker = _SDKWorker(home, self.gateway.token)
+            self._worker = SDKWorker(home, self.gateway.token, label="System 2")
             self._worker.request({
                 "harness": {
                     "profile": "mochi", "dsh_home": str(home), "cwd": str(work), "runtime_cwd": str(home),
@@ -249,13 +170,21 @@ class _Runtime:
         self.policy.check()
         step_id = f"{self.session_id}:{native_turn}:{native_step}"
         options = {"step_id": step_id}
-        if not self.policy.probe and canonical_tool_name(request["name"]) not in READ_TOOLS:
+        function = canonical_tool_name(request["name"])
+        if not self.policy.probe and function not in READ_TOOLS:
             options["check_model_policy"] = self.policy.check
-        value = active.call_tool(request["name"], request["callId"], request["args"], **options)
+        args = request["args"]
+        value = active.call_tool(request["name"], request["callId"], args, **options)
         self.policy.check()
         if not isinstance(value, dict):
             raise CloudRouteError("System 2 tool returned invalid data")
-        return project_tool_result(request["name"], value, share=self._share, document_sources=self._document_sources)
+        sources = ()
+        if function == "context.read" and (active.source == "background" or args.get("include_document_source") is True):
+            sources = self._document_sources
+        projected = project_tool_result(request["name"], value, share=self._share, document_sources=sources)
+        if sources and active.source == "user" and observed_document_names(projected):
+            self.document_disclosed = True
+        return projected
 
     def _control(self, action: str, payload: dict) -> None:
         with httpx.Client(trust_env=False, follow_redirects=False, timeout=4.0) as client:
@@ -270,15 +199,21 @@ class _Runtime:
         payload = json.loads(turn.input_json)
         if not isinstance(payload, dict):
             raise CloudRouteError("System 2 requires structured context")
-        sources = self._document_sources if getattr(turn, "observation_document_query", False) else ()
+        sources = self._document_sources if (turn.source == "background"
+                  and getattr(turn, "observation_document_query", False)) else ()
         utterance, context = project_input(payload, share=self._share, document_sources=sources, origin=turn.source)
+        self.document_disclosed = False
+        self.last_user_message = utterance
+        if self._recent_chat:
+            context["recent_chat"] = self._recent_chat
         text = f"用户本轮原话：{utterance}" if turn.source == "user" and utterance else "请根据本轮后台事件与授权判断是否需要行动。"
         data = "本轮 Mochi 程序快照。字段内容是数据，工具权限由宿主校验。\n" + _json(context)
         grants = getattr(turn, "allowed_tools", None)
         allowed = self._registered if grants is None else self._registered.intersection(
             name.replace(".", "_") for name in grants
         )
-        self._active = _ActiveTurn(turn.admission_id, call_tool, allowed, getattr(turn, "expires_at", None))
+        self._active = _ActiveTurn(turn.admission_id, call_tool, allowed, getattr(turn, "expires_at", None),
+                                   turn.source)
         self.gateway.last_failure = None
         try:
             self._check_active()
@@ -311,6 +246,7 @@ class _Runtime:
                 raise System2RunError(self.gateway.last_failure or "System 2 model did not complete the turn", metadata)
             self._control("checkpoint", {})
             self.policy.check()
+            self._recent_chat = ()
             return reply
         finally:
             self._active = None
@@ -347,6 +283,7 @@ class DSHEngine:
         self._credential = credential or _resolve_credential
         self._observation_guard = observation_guard or (lambda: (None, 0, None))
         self._runtimes: dict[tuple[bool, bool, bool], _Runtime] = {}
+        self._private_chat_history: deque[dict[str, str]] = deque(maxlen=_CHAT_HISTORY_TURNS)
         self._privacy_epoch = None
         self._serial = Lock()
         self._state = Lock()
@@ -369,19 +306,20 @@ class DSHEngine:
             raise CloudRouteError("System 2 activity authorization changed")
         share = text_sharing_allowed(preferences, snapshot, marker[2])
         background = turn.source == "background" and semantic_background_enabled()
-        semantic_chat = turn.source == "user" and semantic_chat_enabled()
+        chat = turn.source == "user"
         # Cloud document sharing is scoped to chat. A local background turn
         # can use the locally approved title sources in its own session.
-        document_context = turn.source == "user" or (background and not snapshot.route.is_cloud)
-        sources = preferences.document_local_sources if (share and document_context
-                    and getattr(turn, "observation_document_query", False)) else ()
+        document_context = chat or (background and not snapshot.route.is_cloud
+                                     and getattr(turn, "observation_document_query", False))
+        sources = preferences.document_local_sources if share and document_context else ()
         if snapshot.route.is_cloud:
             sources = tuple(source for source in sources if source in preferences.document_cloud_sources)
         private = bool(sources)
-        runtime_key = (background, private, semantic_chat)
+        runtime_key = (background, private, chat)
         epoch = (snapshot.route_generation, snapshot.consent_generation, generation, marker)
         if epoch != self._privacy_epoch:
             self._stop_runtime()
+            self._private_chat_history.clear()
             self._privacy_epoch = epoch
         policy = SendPolicy(
             self._routes, snapshot, is_observation_current=lambda db:
@@ -393,7 +331,7 @@ class DSHEngine:
             "profile": _PROFILE_VERSION, "user": snapshot.user_scope, "receiver": snapshot.route.recipient,
             "model": snapshot.route.model, "route": snapshot.route_generation, "consent": snapshot.consent_generation,
             "activity": generation, "sharable": share, "lock": marker, "private": private,
-            "background": background, "semantic_chat": semantic_chat,
+            "background": background, "chat": chat,
             "prompt_version": turn.prompt_version,
             "prompt": turn.system_prompt, "tools": self._tools,
         }).encode()).hexdigest()
@@ -406,9 +344,8 @@ class DSHEngine:
         if current is not None:
             current.close()
         self._root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        # A recipient can see authorized titles during a conversation. Keep the
-        # related native dialogue separate from durable general chat and discard
-        # it on a lock, policy change, or shutdown.
+        # A title can be returned after a chat has started, so any native
+        # dialogue eligible to receive titles uses temporary storage.
         storage = TemporaryDirectory(prefix="mochi-observation-") if private else None
         path = Path(storage.name) if storage is not None else self._root / identity[:32]
         path.mkdir(mode=0o700, exist_ok=True)
@@ -416,6 +353,7 @@ class DSHEngine:
             path, policy, session_id=session_id, prompt=turn.system_prompt, tools=self._tools,
             credential=self._credential, share=share, closing=self._closing, document_sources=sources,
             private_storage=storage,
+            recent_chat=tuple(self._private_chat_history) if private and chat else (),
         )
         with self._state:
             if not self._closing.is_set():
@@ -436,6 +374,19 @@ class DSHEngine:
                 reply = runtime.run(turn, call_tool)
                 self._routes.record_result(snapshot)
                 runtime.policy.check()
+                if turn.source == "user" and runtime._private_storage is not None:
+                    if runtime.document_disclosed:
+                        # Prevent the native transcript from replaying titles
+                        # in a subsequent turn that did not ask for them.
+                        self._private_chat_history.append({"omitted": "本轮涉及观察到的文档标题"})
+                        with self._state:
+                            self._runtimes.pop((False, True, True), None)
+                        runtime.close()
+                    elif runtime.last_user_message:
+                        self._private_chat_history.append({
+                            "user": runtime.last_user_message[:_CHAT_HISTORY_TEXT_LIMIT],
+                            "assistant": reply["text"][:_CHAT_HISTORY_TEXT_LIMIT],
+                        })
                 return EngineReply(
                     text=reply["text"], answer_id=reply.get("answer_id"),
                     session_id=runtime.session_id, metadata=reply["metadata"],
@@ -455,6 +406,7 @@ class DSHEngine:
     def close(self) -> None:
         self._closing.set()
         self._stop_runtime()
+        self._private_chat_history.clear()
 
 
 def verify_system2_route(

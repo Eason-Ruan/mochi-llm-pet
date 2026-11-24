@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -23,9 +23,10 @@ from .context import _timestamp
 from .documents import is_mochi_app
 from .media import capture_desktop, recording_frames
 from .realtime import boot_id as system_boot_id, clocks_agree
+from .routes import CloudRouteError, CloudRouteSnapshot
 from .sampling import ACTIVITY_POLL_S, CaptureSchedule, frame_thumbnail, known_video_source
 from .state import Observation, StateObserver, context_revision, local_outcome
-from .vision import ScreenModel, ScreenObservation, analyze_screen
+from .vision import MultimodalScreenObservation, ScreenModel, ScreenObservation, analyze_screen
 
 REPLAY_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
 LIVE_UPDATE_INTERVAL_S = 30.0
@@ -489,6 +490,7 @@ def run_live(
     stop_event: Event | None = None, capture_policy: Callable[[], int | None] | None = None,
     producer_policy: Callable[[], int | None] | None = None, policy_generation: int | None = None,
 ) -> dict:
+    """Exercise the legacy two-model pipeline with injected evaluation fixtures."""
     if (not math.isfinite(model_interval_s) or model_interval_s <= 0
             or duration_s is not None and (not math.isfinite(duration_s) or duration_s <= 0)):
         raise ValueError("Live duration and model interval must be positive")
@@ -800,10 +802,24 @@ def run_live(
 class _MultimodalJob:
     activity_id: int
     document_source: str | None
-    deadline_s: float
     video_hint: bool
     permitted: Callable[[], bool]
+    owns_scene: Callable[[], bool]
+    scope: CloudRouteSnapshot | None
     future: Future[ScreenObservation]
+
+
+@dataclass(frozen=True)
+class _ScopedScreen:
+    screen: MultimodalScreenObservation
+    scope: CloudRouteSnapshot | None
+
+    def comparable_to(self, scope: CloudRouteSnapshot | None) -> bool:
+        if self.scope is None or scope is None:
+            return self.scope is scope
+        return (self.scope.route_generation, self.scope.consent_generation) == (
+            scope.route_generation, scope.consent_generation,
+        )
 
 
 def run_live_multimodal(
@@ -815,10 +831,11 @@ def run_live_multimodal(
     document_local_sources: tuple[str, ...] = (), stop_event: Event | None = None,
     capture_policy: Callable[[], int | None] | None = None,
     producer_policy: Callable[[], int | None] | None = None, policy_generation: int | None = None,
+    close_vision: Callable[[], None] | None = None,
 ) -> dict:
     """Publish a local desk state and sample stable, materially changed views."""
     from .media import DesktopCaptureRestricted, capture_filtered_desktop, capture_window, cloud_window_eligible
-    from .openai_cloud import LOCAL_CAPTURE, prepare_vision_capture
+    from .openai_cloud import LOCAL_CAPTURE, RoutedObservationModel, prepare_vision_capture
     from .vision import VisionSignals, analyze_multimodal
 
     if (not math.isfinite(model_interval_s) or model_interval_s <= 0
@@ -827,7 +844,13 @@ def run_live_multimodal(
     if screen_scope not in ("foreground_window", "all_displays"):
         raise ValueError("Invalid live screen scope")
     all_displays = screen_scope == "all_displays"
+    routed_vision = vision if isinstance(vision, RoutedObservationModel) else None
     protected_foreground_reasons = {"privacy_excluded", "private_window", "browser_url_unavailable", "mochi_foreground"}
+
+    def admit_scope(scope: CloudRouteSnapshot | None):
+        if routed_vision is None or scope is None:
+            return nullcontext(True)
+        return routed_vision.admit_vision_result(scope)
 
     def capture_stamp() -> int | None:
         try:
@@ -868,7 +891,10 @@ def run_live_multimodal(
     with (
         ThreadPoolExecutor(max_workers=1) as workers,
         _live_writer(database), ObservationStore(database, live=True) as store,
+        ExitStack() as vision_lifetime,
     ):
+        if close_vision is not None:
+            vision_lifetime.callback(close_vision)
         revision_base = store.begin_live_run(
             datetime.now(UTC), poll_interval_s=ACTIVITY_POLL_S, policy_generation=policy_generation,
         )
@@ -941,8 +967,8 @@ def run_live_multimodal(
                     latest = None
                 return
             activities = activities_at(at)
-            screens = [visual] if visual is not None else []
-            activity_kind = visual.activity_kind if visual is not None else "unknown"
+            screens = [visual.screen] if visual is not None else []
+            activity_kind = visual.screen.activity_kind if visual is not None else "unknown"
             estimate = local_outcome(observer.features(activities, screens, as_of=at, live=True), activity_kind)
             if latest is not None:
                 published = (latest.activity_kind, latest.state, latest.summary, latest.reason_codes)
@@ -959,6 +985,13 @@ def run_live_multimodal(
                 latest = replace(result, context_revision=result.context_revision + revision_base)
                 store.save_observation(latest, published_at=at, monotonic_s=mono)
                 outcomes[outcome] += 1
+
+        def refresh_with_cached_screen(*, publish: bool) -> None:
+            nonlocal visual, previous_visual
+            with admit_scope(visual.scope if visual is not None else None) as authorized:
+                if not authorized:
+                    visual = previous_visual = None
+                refresh(publish=publish)
 
         def acquire(sample: ActivitySample) -> None:
             nonlocal immediate_update, job, uploads, visual, previous_visual
@@ -1000,6 +1033,12 @@ def run_live_multimodal(
                 return not stopped() and capture_stamp() == stamp
 
             grant = prepare_vision_capture(vision, permitted=permitted)
+            scope = None
+            if grant is not None and routed_vision is not None:
+                try:
+                    scope = routed_vision.capture_result_scope(grant)
+                except (CloudRouteError, OSError, sqlite3.Error, ValueError):
+                    grant = None
             if grant is None or not permitted():
                 store.save_capture_health("source_restricted", sample.observed_at, reason="recipient_unavailable")
                 return
@@ -1065,7 +1104,8 @@ def run_live_multimodal(
                 foreground_run_s=signals["current_foreground_run_s"],
                 foreground_switches=signals["foreground_switches"], screen_locked=signals["screen_locked"],
                 recent_os_input=signals["recent_os_input"] if signals["idle_s"] is not None else None,
-                previous=previous_visual,
+                previous=(previous_visual.screen if previous_visual is not None and previous_visual.comparable_to(scope)
+                          else None),
             )
             capture_id = uuid4().hex
             deadline_s = after.monotonic_s + observer.ttl_seconds - (after.observed_at - acquired_at).total_seconds()
@@ -1081,13 +1121,18 @@ def run_live_multimodal(
             if grant is not LOCAL_CAPTURE:
                 grant = replace(grant, send_permitted=still_owns_scene)
 
+            def permitted_to_send() -> bool:
+                return permitted() and still_owns_scene()
+
             def request() -> ScreenObservation:
-                if not permitted() or not still_owns_scene():
+                if not permitted_to_send():
                     return ScreenObservation(capture_id, activity.activity_id, acquired_at, "failed", vision.model)
                 return analyze_multimodal(
                     vision, image=image, activity_id=activity.activity_id, capture_id=capture_id,
                     captured_at=acquired_at, image_grant=None if grant is LOCAL_CAPTURE else grant,
                     signals=evidence, document_source=document_source, all_displays=all_displays,
+                    local_permitted=permitted_to_send, deadline_s=min(deadline_s, end_at),
+                    scoped_snapshot=scope,
                 )
 
             store.record_upload(datetime.now(UTC), now)
@@ -1096,20 +1141,25 @@ def run_live_multimodal(
                 schedule.recommend(None, now, video=True)
             uploads += 1
             job = _MultimodalJob(
-                activity.activity_id, document_source, deadline_s, video_hint, permitted, workers.submit(request),
+                activity.activity_id, document_source, video_hint, permitted, still_owns_scene, scope,
+                workers.submit(request),
             )
 
         def collect(*, finishing: bool = False) -> None:
-            nonlocal job, visual, previous_visual
+            nonlocal job
             if job is None or not (job.future.done() or finishing):
                 return
             finished, job = job, None
             result = finished.future.result()
+            with admit_scope(finished.scope) as authorized:
+                accept(finished, result, finishing=finishing, permission=authorized and finished.permitted())
+
+        def accept(finished: _MultimodalJob, result: ScreenObservation, *, finishing: bool, permission: bool) -> None:
+            nonlocal visual, previous_visual
             at, mono = datetime.now(UTC), time.monotonic()
-            permission = finished.permitted()
             same_activity = finished.activity_id == activity_id
-            realtime = (not finishing and permission and same_activity and coverage_current(at, mono)
-                        and mono < finished.deadline_s and at < result.captured_at + timedelta(seconds=observer.ttl_seconds))
+            realtime = (not finishing and permission and finished.owns_scene()
+                        and at < result.captured_at + timedelta(seconds=observer.ttl_seconds))
             if not permission:
                 result = ScreenObservation(result.capture_id, result.activity_id, result.captured_at, "redacted_out", result.model_id)
             store.save_screen(result, processed_at=max(at, result.captured_at), realtime_eligible=realtime,
@@ -1119,10 +1169,10 @@ def run_live_multimodal(
                 if getattr(result, "filtered_fields", ()):
                     health = "filtered"
                 store.save_capture_health(health, at)
-            if result.status == "ready" and same_activity:
-                previous_visual = result
+            if isinstance(result, MultimodalScreenObservation) and result.status == "ready" and same_activity:
+                previous_visual = _ScopedScreen(result, finished.scope)
                 if realtime:
-                    visual = result
+                    visual = previous_visual
                     # Only a native foreground hint can enable the slower video cadence for a desktop composite.
                     video = finished.video_hint if all_displays else (
                         result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
@@ -1144,7 +1194,7 @@ def run_live_multimodal(
                         recorder.close()
                     observe_sample(sample)
                     periodic = mono >= next_update
-                    refresh(publish=periodic or immediate_update)
+                    refresh_with_cached_screen(publish=periodic or immediate_update)
                     immediate_update = False
                     if periodic:
                         next_update = mono + model_interval_s
@@ -1165,6 +1215,9 @@ def run_live_multimodal(
         if halted:
             store.invalidate_current(datetime.now(UTC))
             latest = None
+        # Interrupt pending runtime work before the executor joins its thread.
+        if job is not None and not job.future.done():
+            vision_lifetime.close()
         if not halted or (job is not None and job.future.done()):
             collect(finishing=True)
         as_of = datetime.now(UTC)

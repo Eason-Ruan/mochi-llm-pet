@@ -299,8 +299,8 @@ def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
 
 @pytest.mark.parametrize("platform,scope,flags,error", [
     ("darwin", "all-displays", [], "requires --capture-screen"),
-    ("darwin", "all-displays", ["--capture-screen", "--split-models"], "requires the multimodal collector"),
-    ("darwin", "foreground-window", ["--capture-screen", "--split-models"], "requires the multimodal collector"),
+    ("darwin", "all-displays", ["--capture-screen", "--split-models"], "Use replay without --multimodal"),
+    ("darwin", "foreground-window", ["--capture-screen", "--split-models"], "Use replay without --multimodal"),
     ("win32", "all-displays", ["--capture-screen"], "requires macOS 14.2 or later"),
     ("darwin", "all-displays", ["--capture-screen"], None),
 ])

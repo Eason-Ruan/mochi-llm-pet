@@ -150,9 +150,11 @@ def _register(name, summary, **fields):
 
 _register("context.read", "Read decision evidence. Optional history_start and history_end select a time range "
           "within the last hour of as_of. Request capture health for observation diagnostics. "
+          "Set include_document_source only when the user asks which document was observed. "
           "Historical evidence never authorizes an early reminder.",
           as_of=(AwareDatetime | None, None), history_start=(AwareDatetime | None, None),
-          history_end=(AwareDatetime | None, None), include_capture_health=(bool | None, None))
+          history_end=(AwareDatetime | None, None), include_capture_health=(bool | None, None),
+          include_document_source=(StrictBool | None, None))
 _register("item.get", "Read one reminder or issue by ID.", **Identified)
 _register("item.list", "List reminders or issues.", filter=(ItemFilter | None, None))
 _register("item.create", "Create a reminder or an issue that tracks a work goal or to-do. "

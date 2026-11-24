@@ -156,13 +156,13 @@ def _remove_document_text(value, names: set[str]):
             _remove_document_text(data, names)
 
 
-def _document_names(value) -> set[str]:
+def observed_document_names(value) -> set[str]:
     if isinstance(value, dict):
         return {item.casefold() for key, item in value.items() if key == "document_name" and isinstance(item, str) and item} | {
-            name for item in value.values() for name in _document_names(item)
+            name for item in value.values() for name in observed_document_names(item)
         }
     if isinstance(value, (tuple, list)):
-        return {name for item in value for name in _document_names(item)}
+        return {name for item in value for name in observed_document_names(item)}
     return set()
 
 
@@ -287,7 +287,7 @@ def project_context(value: dict, *, share: bool, document_sources: tuple[str, ..
                 "reason": _enum(status.get("reason"), CAPTURE_HEALTH_REASONS, None),
                 **{key: _stamp(status.get(key)) for key in CAPTURE_HEALTH_TIMES},
             }
-    _remove_document_text(result, _document_names(value))
+    _remove_document_text(result, observed_document_names(value))
     return result
 
 

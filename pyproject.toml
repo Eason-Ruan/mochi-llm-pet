@@ -44,6 +44,7 @@ include = ["deskpet*"]
 
 [tool.setuptools.package-data]
 "deskpet.system2" = ["dsh_bridge.mjs"]
+"deskpet.observation_v2" = ["dsh_image.mjs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

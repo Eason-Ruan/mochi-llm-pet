@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import math
 import re
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args
 
 if TYPE_CHECKING:
     from .openai_cloud import VisionImageGrant
+    from .routes import CloudRouteSnapshot
 
 
 ScreenKind = Literal["document", "ide", "meeting", "video", "game", "browser", "unknown"]
@@ -526,9 +528,12 @@ def analyze_multimodal(
     client: ScreenModel, *, image: bytes, capture_id: str, activity_id: int, captured_at: datetime,
     image_grant: VisionImageGrant | None = None, signals: VisionSignals | None = None,
     document_source: str | None = None, all_displays: bool = False,
+    local_permitted: Callable[[], bool] | None = None, deadline_s: float | None = None,
+    scoped_snapshot: CloudRouteSnapshot | None = None,
 ) -> MultimodalScreenObservation:
     """Run one visual request and validate each observation field independently."""
-    route = image_grant.snapshot.route if image_grant is not None else None
+    snapshot = image_grant.snapshot if image_grant is not None else scoped_snapshot
+    route = snapshot.route if snapshot is not None else None
     comparison_scope = image_grant.comparison_scope if image_grant is not None else None
     result = MultimodalScreenObservation(
         capture_id, activity_id, captured_at, "failed", route.model if route is not None else client.model,
@@ -548,6 +553,8 @@ def analyze_multimodal(
             output = client.complete_multimodal_image(
                 image_grant, image=image, signals=signals, captured_at=captured_at, activity_id=activity_id,
                 allow_document_title=bool(document_source), all_displays=all_displays,
+                local_permitted=local_permitted, deadline_s=deadline_s,
+                scoped_snapshot=scoped_snapshot,
             )
         elif image_grant is None:
             output = client.complete(image=image, **_multimodal_request(

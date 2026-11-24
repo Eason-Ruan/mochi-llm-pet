@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from .refine_dialogue import DemoConversation, DemoTurn, LocalConversation, MILK_CONFIRM, MILK_REQUEST
+from .refine_dialogue import DemoConversation, DemoTurn, MILK_CONFIRM, MILK_REQUEST
 from .refine_icons import icon
 from .refine_style import _font, _scroll_area
 
@@ -260,8 +260,8 @@ class RefineChat(QWidget):
         self._proposal_context = None
         self._projection_version = None
         self._route_status = None
-        self._voice_available = store is None
-        self._script = conversation or (DemoConversation() if store is None else LocalConversation())
+        self._voice_available = store is None and system2 is None
+        self._script = (conversation or DemoConversation()) if self._voice_available else None
         _, draft, pending = store.load() if store is not None else ([], "", None)
         self._messages: list[Message] = []
         self._pending = (pending[0], DemoTurn(**pending[1])) if pending else None
@@ -450,34 +450,25 @@ class RefineChat(QWidget):
         self._send(sample, simulated=True)
 
     def _send(self, raw: str, *, simulated: bool = False):
-        value = raw.strip()
-        if not value or self._pending is not None:
+        if not raw.strip():
             return
         if self._system2 is not None:
-            snapshot = self._snapshot()
-            offline = snapshot.get("system2_route_status") != "verified"
-            if not (offline and not self._supersedes_message_id and not self._proposal_context
-                    and (turn := self._script.reply(value, snapshot)) is not None):
-                self._send_system2(value)
-                return
-        else:
-            turn = self._script.reply(value, self._snapshot())
+            self._send_system2(raw)
+            return
+        if self._script is None:
+            self.storage_error.emit("对话模型暂不可用。")
+            return
+        if self._pending is not None:
+            return
+        value = raw.strip()
+        turn = self._script.reply(value, self._snapshot())
         speaker = "你 · 模拟语音" if simulated else "你"
-        if self._store is not None:
-            try:
-                self._store.begin_turn(speaker, value, turn)
-            except sqlite3.Error:
-                self.storage_error.emit("暂时无法保存对话。")
-                return
-        else:
-            self._messages.append(Message(speaker, value))
+        self._messages.append(Message(speaker, value))
         self._composition = None
         self._voice_timer.stop()
         self._draft = ""
         self._follow_up = False
         if turn.action is not None:
-            if self._store is not None:
-                self._read_projection(self._store.projection_version())
             try:
                 self._pending = (self._submit(turn.action), turn)
             except (ValueError, RuntimeError):

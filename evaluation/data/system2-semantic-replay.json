@@ -50,7 +50,7 @@
             {"action":"phase.start","utterance_contains":"专注","args":{"planned_duration_s":900}}
           ]},"expect":{"effects":["created_reminder","started_focus"]}},
         {"id":"ambiguous","offset_s":1,"events":[{"chat":{"text":"把那个提醒延十分钟。"}}],
-          "engine":{"reply":"你想推迟哪条提醒？"},"expect":{"effects":[],"reply":["clarification"]}}
+          "engine":{"reply":"你想推迟哪条提醒？"},"expect":{"effects":[],"reply":["answered"],"question_contains":["哪条提醒"]}}
       ]
     },
     {
@@ -74,7 +74,7 @@
       "steps": [{"id":"write-and-ask","offset_s":0,"events":[{"chat":{"text":"记下买牛奶，再把收衣服或交材料的那个提醒推迟十分钟"}}],
         "engine":{"calls":[{"action":"item.create","utterance_contains":"买牛奶","args":{"type":"issue","title":"买牛奶"}}],
                   "reply":"你想推迟收衣服的提醒，还是交材料的提醒？"},
-        "expect":{"effects":["created_issue"],"reply":["partial"],"item":{"title":"买牛奶"},"question_contains":["收衣服","交材料"]}}]
+        "expect":{"effects":["created_issue"],"reply":["applied"],"item":{"title":"买牛奶"},"question_contains":["收衣服","交材料"]}}]
     },
     {
       "id": "single-reference-snooze",

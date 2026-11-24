@@ -37,7 +37,7 @@ def test_expired_chat_outbox_reconciles_existing_admission_without_resending(tmp
     assert not user[3] and not store.queued_turns()
     assert acknowledgements == ([1] if admitted else [])
     assert ("原操作已生效" if admitted else "已过期") in reply[1]
-    assert reply[6] == ({"source": "legacy" if admitted else "program", "text": reply[1]},)
+    assert reply[6] == ({"source": "legacy" if admitted else "status", "text": reply[1]},)
 
 
 def test_desktop_pump_projects_parts_for_chat_and_proposal_answers(tmp_path):
@@ -67,5 +67,60 @@ def test_desktop_pump_projects_parts_for_chat_and_proposal_answers(tmp_path):
     assert not user[3] and reply[4:7] == (message_id, user[1], parts)
     assert reply[1] == "\n".join(part["text"] for part in parts)
     assert proposal[4:7] == ("proposal-button", None, proposal_parts)
-    assert invalid[4:7] == ("other-message", None, ({"source": "program", "text": invalid[1]},))
+    assert invalid[4:7] == ("other-message", None, ({"source": "status", "text": invalid[1]},))
     assert "无法显示" in invalid[1]
+
+
+@pytest.mark.parametrize("route_status", ["not_configured", "unverified", "verified"])
+def test_qt_always_passes_production_input_to_system2_without_rewriting(tmp_path, route_status):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from deskpet.c_ui.refine_chat import RefineChat
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    store = ConversationStore(tmp_path / "business.sqlite3")
+
+    def unexpected_local_action(*_):
+        pytest.fail("Production chat treated typed text as a local action")
+
+    def enqueue(message_id, text, **context):
+        store.queue_turn(message_id, text, context)
+
+    chat = RefineChat(unexpected_local_action, lambda: {"system2_route_status": route_status},
+                      store=store, system2=enqueue)
+    try:
+        chat.refresh_route(route_status)
+        message = "  开始25分钟专注  "
+        chat._send(message)
+        queued, = store.queued_turns()
+        assert queued[1] == message
+        assert store.projected_messages()[0][2:4] == (queued[0], 1)
+    finally:
+        chat.close()
+
+
+def test_production_chat_without_a_system2_callback_cannot_use_the_demo_script(tmp_path):
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtWidgets import QApplication
+
+    from deskpet.c_ui.refine_chat import RefineChat
+    from deskpet.c_ui.refine_dialogue import DemoConversation
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+    store = ConversationStore(tmp_path / "business.sqlite3")
+
+    def unexpected_local_action(*_):
+        pytest.fail("Production chat treated typed text as a local action")
+
+    chat = RefineChat(unexpected_local_action, lambda: {}, store=store, conversation=DemoConversation())
+    errors = []
+    chat.storage_error.connect(errors.append)
+    try:
+        chat._send("开始25分钟专注")
+        assert errors == ["对话模型暂不可用。"]
+        assert not store.projected_messages()
+    finally:
+        chat.close()

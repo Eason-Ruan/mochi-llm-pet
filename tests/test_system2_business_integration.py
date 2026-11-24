@@ -12,7 +12,7 @@ from deskpet.c_ui.presentation import DesktopPresentation
 from deskpet.c_ui.refine_conversation_store import ConversationStore
 from deskpet.observation_v2.routes import SYSTEM2, CloudRoute
 from deskpet.system2.host import System2Host
-from deskpet.system2.intent import describe_grants
+from deskpet.system2.semantic_policy import background_grants
 from deskpet.system2.protocol import EngineReply
 from deskpet.system2.tools import System2ToolExecutor
 from deskpet.work_sessions import PersistentWorkSessionService
@@ -380,8 +380,7 @@ def test_legacy_rechecks_estimated_window_without_changing_absolute_target(busin
     ("15:00整点提醒我喝水", ("remind_after", "remind_by")),
     ("只在今天有空时提醒我喝水", ("expires_at",)),
 ])
-def test_chat_binds_the_users_literal_reminder_times(business, message, fields, monkeypatch):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_chat_accepts_the_models_typed_reminder_times(business, message, fields):
     zone = ZoneInfo("Asia/Shanghai")
     today = business.clock.wall_now().astimezone(zone).date()
     due = datetime.combine(today, time(15), tzinfo=zone)
@@ -393,11 +392,8 @@ def test_chat_binds_the_users_literal_reminder_times(business, message, fields, 
     def turn(data, invoke):
         assert "item.create" in data["grants"]
         reminder = {"type": "reminder", "title": "喝水"}
-        shifted = (due + timedelta(minutes=1)).isoformat()
+        assert data["user_intent"]["utterance"] == message
         results.append(invoke("item_create", "omitted", reminder))
-        results.append(invoke("item_create", "shifted", reminder | {
-            "reminder_rule": dict.fromkeys(fields, shifted),
-        }))
         results.append(invoke("item_create", "explicit", reminder | {
             "reminder_rule": dict.fromkeys(fields, expected),
         }))
@@ -406,9 +402,9 @@ def test_chat_binds_the_users_literal_reminder_times(business, message, fields, 
     try:
         host.submit_user(message)
         assert host.pump()
-        assert [result["error_code"] for result in results[:2]] == ["NOT_AUTHORIZED", "NOT_AUTHORIZED"]
-        assert results[2]["status"] == "applied"
-        rule = results[2]["view"]["rule"]
+        assert results[0]["error_code"] == "INVALID_ARGUMENT"
+        assert results[1]["status"] == "applied"
+        rule = results[1]["view"]["rule"]
         assert rule["timezone"] == "Asia/Shanghai"
         for name in ("remind_after", "target_at", "remind_by", "expires_at"):
             stored = datetime.fromisoformat(rule[name]) if rule[name] is not None else None
@@ -423,11 +419,20 @@ def test_chat_binds_the_users_literal_reminder_times(business, message, fields, 
     ("过十分钟提醒我去上厕所", "去上厕所", 10),
     ("请过１０分钟后准时提醒我起身。", "起身", 10),
 ])
-def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(business, request_text, title, minutes):
-    def unexpected_model(*_):
-        pytest.fail("literal reminder and capability question should run locally")
+def test_chat_relies_on_the_model_but_anchors_reminders_to_the_user_event(business, request_text, title, minutes):
+    seen = []
 
-    host = host_for(business, unexpected_model)
+    def turn(data, invoke):
+        text = data["user_intent"]["utterance"]
+        seen.append(text)
+        if text == request_text:
+            offset = minutes * 60
+            result = invoke("item_create", "relative", {"type": "reminder", "title": title, "reminder_rule": {
+                "remind_after_offset_s": offset, "remind_by_offset_s": offset,
+            }})
+            assert result["status"] == "applied"
+
+    host = host_for(business, turn)
     try:
         start = business.clock.wall_now()
         host.submit_user(request_text, event_id="relative-reminder")
@@ -441,16 +446,8 @@ def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(b
 
         host.submit_user("你现在有权限吗", event_id="capability-question")
         assert host.pump()
+        assert seen == [request_text, "你现在有权限吗"]
         assert len(business.tasks.list_tasks()) == 1
-        created, capability = host.ui_events()
-        assert created.payload["text"] == f"已设置提醒「{title}」，{due.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}。"
-        assert "可以直接叫我设提醒" in capability.payload["text"]
-
-        host.submit_user("1秒后提醒我休息", event_id="elapsed-reminder")
-        business.clock.advance(2)
-        assert host.pump()
-        assert len(business.tasks.list_tasks()) == 1
-        assert host.ui_events()[-1].payload["status"] == "expired_request"
 
         business.clock.advance((due - business.clock.wall_now()).total_seconds())
         business.tasks.pump()
@@ -467,12 +464,12 @@ def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(b
     ("fresh", "available", None, False),
     ("fresh", "available", "break", True),
 ])
-def test_legacy_background_pet_presentation_requires_a_current_opportunity(business, status, state, opportunity, allowed, monkeypatch):
+def test_legacy_background_pet_presentation_requires_a_current_opportunity(status, state, opportunity, allowed, monkeypatch):
     monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "0")
-    grants = describe_grants(None, {
+    grants = background_grants({
         "eligible_items": [], "enabled_settings": {}, "current_status": status,
         "current": {"state": state}, "opportunity_id": opportunity,
-    }, requested_at=business.clock.wall_now())
+    })
     assert ("pet.present" in grants) == allowed
 
 
@@ -481,8 +478,7 @@ def test_legacy_background_pet_presentation_requires_a_current_opportunity(busin
     ("五分钟内别提醒", "no_earlier"),
     ("五分钟后准时", "exact"),
 ])
-def test_chat_snooze_binds_the_mode_and_durable_user_event_time(business, monkeypatch, message, mode):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_chat_snooze_uses_the_tool_mode_and_durable_user_event_time(business, monkeypatch, message, mode):
     original_due = business.clock.wall_now() + timedelta(minutes=1)
     item = create_reminder(business, "喝水", remind_after=original_due.isoformat(), remind_by=original_due.isoformat())
     occurrence = item["occurrence"]["id"]
@@ -492,10 +488,8 @@ def test_chat_snooze_binds_the_mode_and_durable_user_event_time(business, monkey
         assert "reminder.snooze" in data["grants"]
         assert datetime.fromisoformat(data["event"]["at"]) == submitted_at
         business.clock.advance(12)
-        snooze = {"occurrence_id": occurrence, "delay_s": 300}
-        mismatched = "exact" if mode == "flexible_target" else "flexible_target"
-        results.append(invoke("reminder_snooze", "wrong mode", snooze | {"mode": mismatched}))
-        correct = snooze | {"mode": mode}
+        assert data["user_intent"]["utterance"] == message
+        correct = {"occurrence_id": occurrence, "delay_s": 300, "mode": mode}
         results.append(invoke("reminder_snooze", "model clock", correct | {"snoozed_at": original_due.isoformat()}))
         results.append(invoke("reminder_snooze", "correct mode", correct))
         assert invoke("reminder_snooze", "correct mode", correct) == results[-1]
@@ -511,13 +505,13 @@ def test_chat_snooze_binds_the_mode_and_durable_user_event_time(business, monkey
         business.clock.advance(3)
         DesktopSystem2.pump(desktop)
         assert host.pump()
-        assert [result["error_code"] for result in results[:2]] == ["NOT_AUTHORIZED", "INVALID_ARGUMENT"]
-        assert results[2]["status"] == "applied"
-        updated = results[2]["view"]
+        assert results[0]["error_code"] == "INVALID_ARGUMENT"
+        assert results[1]["status"] == "applied"
+        updated = results[1]["view"]
         assert updated["occurrence"]["id"] != occurrence
         assert updated["version"] == item["version"] + 1
         assert datetime.fromisoformat(updated["occurrence"]["last_snoozed_at"]) == submitted_at
-        receipt = business.gateway().get_result(results[2]["call_id"])
+        receipt = business.gateway().get_result(results[1]["call_id"])
         assert receipt.status == "applied" and receipt.actual_version == updated["version"]
         assert receipt.view["rule"] == updated["rule"] and receipt.view["occurrence"] == updated["occurrence"]
         rule = updated["rule"]

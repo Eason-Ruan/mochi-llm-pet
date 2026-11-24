@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from math import ceil
 from zoneinfo import ZoneInfo
 import json
 from threading import Event
@@ -51,9 +52,7 @@ def runtime(tmp_path):
     business.close()
 
 
-@pytest.mark.parametrize("semantic_chat", ["0", "1"])
-def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monkeypatch, semantic_chat):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
+def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monkeypatch):
     business, create = runtime
     business.auto_adjust()
     snapshot = business.publish(71)
@@ -83,9 +82,7 @@ def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monk
         host.close()
 
 
-@pytest.mark.parametrize("semantic_chat", ["0", "1"])
-def test_background_and_overlapping_query_have_separate_authority_and_reply(runtime, monkeypatch, semantic_chat):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
+def test_background_and_overlapping_query_have_separate_authority_and_reply(runtime):
     business, create = runtime
     business.clock.advance(120)
     business.scheduler.poll()
@@ -100,7 +97,8 @@ def test_background_and_overlapping_query_have_separate_authority_and_reply(runt
             return EngineReply('{"action":"quiet","reason_code":"busy","explanation":"omit me"}')
         assert data["user_intent"]["utterance"] == "目前是什么状态，还剩多久？"
         assert data["context"]["recent_decisions"][0]["reason_code"] == "busy"
-        outcomes.append(call("phase_start", "bad", {"planned_duration_s": 1500}, step_id="dsh:2:1"))
+        result = call("phase_get", "phase", {}, step_id="dsh:2:1")
+        assert result["status"] == "applied" and result.get("view") is None
         return EngineReply("现在没有正在运行的计时。", answer_id="native-2")
 
     host = create(act)
@@ -114,7 +112,8 @@ def test_background_and_overlapping_query_have_separate_authority_and_reply(runt
         assert background.result(timeout=4)
     assert not host.ui_events()
     assert host.pump()
-    assert [outcome["error_code"] for outcome in outcomes] == ["NOT_AUTHORIZED", "NOT_AUTHORIZED"]
+    denied, = outcomes
+    assert denied["error_code"] == "NOT_AUTHORIZED"
     assert business.phases.list_phases() == []
     event, = host.ui_events()
     assert event.reply_to_message_id == "query" and event.payload["text"] == "现在没有正在运行的计时。"
@@ -135,8 +134,7 @@ def test_background_and_overlapping_query_have_separate_authority_and_reply(runt
 
 
 @pytest.mark.parametrize("commit_before_cancel", [False, True])
-def test_start_supersession_keeps_independent_item_and_actual_results(runtime, commit_before_cancel, monkeypatch):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_ui_supersession_and_compound_replacement_keep_actual_results(runtime, commit_before_cancel):
     business, create = runtime
     entered, release = Event(), Event()
 
@@ -145,18 +143,18 @@ def test_start_supersession_keeps_independent_item_and_actual_results(runtime, c
         if text.startswith("能帮我"):
             assert "phase.start" in request.allowed_tools
             if commit_before_cancel:
-                result = call("phase_start", "start", {"planned_duration_s": 100}, step_id="dsh:1:2")
+                result = call("phase_start", "start", {"planned_duration_s": 1500}, step_id="dsh:1:2")
                 assert result["status"] == "applied"
             entered.set()
             assert release.wait(4)
-            result = call("phase_start", "start", {"planned_duration_s": 100}, step_id="dsh:1:2")
+            result = call("phase_start", "start", {"planned_duration_s": 1500}, step_id="dsh:1:2")
             assert result["status"] == "applied" if commit_before_cancel else result["error_code"] == "SUPERSEDED"
             return "已经开了。"
-        assert text == "记一下整理数据"
+        assert text == "先别开钟，记一下整理数据"
         first = call("item_create", "write", {"type": "issue", "title": "整理数据"}, step_id="dsh:2:1")
         duplicate = call("item_create", "unnecessary-new-id", {"type": "issue", "title": "整理数据"}, step_id="dsh:2:2")
         assert first["status"] == "applied" and first == duplicate
-        return "已建两个事项。"
+        return "我记下整理数据了。"
 
     host = create(act)
     start_id = host.submit_user("能帮我开个25分钟的番茄钟吗？", event_id="start")
@@ -166,22 +164,25 @@ def test_start_supersession_keeps_independent_item_and_actual_results(runtime, c
         host.submit_user("先别开钟，记一下整理数据", event_id="compound", supersedes_admission_id=start_id)
         release.set()
         assert pending.result(timeout=4)
-    assert host.pump()
-    assert host.pump()
-    assert not host.pump()
+    assert host.pump() and not host.pump()
     assert [task.draft.content for task in business.tasks.list_tasks()] == ["整理数据"]
     phases = business.phases.list_phases()
     assert [phase.planned_duration_s for phase in phases] == ([1500] if commit_before_cancel else [])
     replies = host.ui_events()
-    assert [reply.reply_to_message_id for reply in replies] == ["start", "compound", "compound"]
-    assert replies[0].payload["status"] == ("applied" if commit_before_cancel else "superseded")
-    assert replies[2].payload["text"] == "已创建事项。"
+    assert [reply.reply_to_message_id for reply in replies] == ["start", "compound"]
+    assert replies[0].payload["status"] == "superseded"
+    assert replies[0].payload["parts"] == (
+        ([{"source": "program", "text": "已开始 · 25 分钟"}] if commit_before_cancel else [])
+        + [{"source": "status", "text": "这条请求已经被后续操作替代。"}]
+    )
+    assert replies[1].payload["parts"] == [
+        {"source": "program", "text": "已创建事项。"},
+        {"source": "model", "text": "我记下整理数据了。"},
+    ]
     host.close()
 
 
-@pytest.mark.parametrize("semantic_chat", ["0", "1"])
-def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again(runtime, monkeypatch, semantic_chat):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
+def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again(runtime):
     business, create = runtime
 
     def kill(request, data, call):
@@ -200,7 +201,7 @@ def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again
     restored.submit_user("开始35分钟专注", event_id="interrupted")
     with pytest.raises(ProcessLost):
         restored.pump()
-    assert restored.ui_events()[0].payload["text"] == "已开始 · 25 分钟"
+    assert restored.ui_events()[0].payload["parts"][0] == {"source": "program", "text": "已开始 · 25 分钟"}
     assert len(business.phases.list_phases()) == 1
 
     recovered = create(lambda *_: pytest.fail("Recovery called the model with an interrupted write"))
@@ -209,48 +210,49 @@ def test_committed_lost_reply_is_reconciled_and_timed_out_start_never_runs_again
     replies = recovered.ui_events()
     assert [reply.reply_to_message_id for reply in replies] == ["lost", "interrupted"]
     assert replies[-1].payload["status"] == "interrupted"
+    interrupted = {"source": "status", "text": "上一轮未完成，已核对保存的执行结果。"}
     assert [reply.payload["parts"] for reply in replies] == [
-        [{"source": "program", "text": "已开始 · 25 分钟"}],
-        [{"source": "program", "text": "上一轮未完成，已核对保存的执行结果。"}],
+        [{"source": "program", "text": "已开始 · 25 分钟"}, interrupted],
+        [interrupted],
     ]
     assert len(business.phases.list_phases()) == 1
     recovered.close()
 
 
-def test_explicit_parameters_and_compound_commands_use_independent_admissions(runtime, monkeypatch):
+def test_compound_message_and_explicit_parameters_go_through_the_model(runtime, monkeypatch):
     monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
     business, create = runtime
+    message = "  开25分钟＋记下整理数据  "
 
     def act(_request, data, call):
         text = data["user_intent"]["utterance"]
-        if text.startswith("开"):
-            result = call("phase_start", "native", {"kind": "focus", "planned_duration_s": 99})
-            assert result["status"] == "applied"
-        elif text.startswith("记"):
-            assert call("item_create", "native", {"type": "issue", "title": "整理数据"})["status"] == "applied"
+        if text == message:
+            assert call("phase_start", "start", {"kind": "focus", "planned_duration_s": 1500})["status"] == "applied"
+            assert call("item_create", "note", {"type": "issue", "title": "整理数据"})["status"] == "applied"
         else:
+            assert text == "改成 40 分钟"
             phase_id = data["context"]["current_phase"]["id"]
-            result = call("phase_adjust", "native", {"id": phase_id, "add_s": 2000})
+            result = call("phase_adjust", "adjust", {"id": phase_id, "total_s": 2400})
             assert result["status"] == "applied" and result["view"]["planned_duration_s"] == 2400
-        return "随意的模型文案"
+        return "好的。"
 
     host = create(act)
-    host.submit_user("开25分钟＋记下整理数据", event_id="batch")
-    assert host.pump() and host.pump()
+    host.submit_user(message, event_id="batch")
+    assert host.pump() and not host.pump()
     host.submit_user("改成 40 分钟", event_id="adjust")
     assert host.pump()
-    assert [request.source for request in host.engine.turns] == ["user", "user", "user"]
-    assert len({request.admission_id for request in host.engine.turns}) == 3
+    assert [request.source for request in host.engine.turns] == ["user", "user"]
+    assert len({request.admission_id for request in host.engine.turns}) == 2
     replies = host.ui_events()
-    assert [reply.reply_to_message_id for reply in replies] == ["batch", "batch", "adjust"]
-    assert [reply.payload["text"] for reply in replies] == ["已开始 · 25 分钟", "已创建事项。", "已调整 · 40 分钟"]
+    assert [reply.reply_to_message_id for reply in replies] == ["batch", "adjust"]
+    assert [reply.payload["text"] for reply in replies] == [
+        "已开始 · 25 分钟\n已创建事项。\n好的。", "已调整 · 40 分钟\n好的。",
+    ]
     assert business.phases.current_phase().planned_duration_s == 2400
     host.close()
 
 
-@pytest.mark.parametrize("semantic_chat", ["0", "1"])
-def test_failed_or_expired_model_request_cannot_execute_or_claim_success(runtime, monkeypatch, semantic_chat):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
+def test_failed_or_expired_model_cannot_commit_and_unverified_text_stays_model_output(runtime):
     business, create = runtime
 
     def act(_request, data, call):
@@ -269,41 +271,52 @@ def test_failed_or_expired_model_request_cannot_execute_or_claim_success(runtime
         host.submit_user(utterance, event_id=event_id)
         assert host.pump()
     replies = [event.payload for event in host.ui_events()]
-    assert [reply["status"] for reply in replies] == ["model_unavailable", "failed", "expired_request"]
-    assert all(reply["parts"] == [{"source": "program", "text": reply["text"]}] for reply in replies)
+    assert [reply["status"] for reply in replies] == ["model_unavailable", "answered", "expired_request"]
+    assert [reply["parts"] for reply in replies] == [
+        [{"source": "status", "text": "这次对话模型没能完成回复。"}],
+        [{"source": "model", "text": "已开始 25 分钟。"}],
+        [{"source": "status", "text": "这条请求已超过可执行时限。"}],
+    ]
     assert not business.phases.list_phases()
     host.close()
 
 
-
-def test_completed_no_tool_model_uses_literal_timer_request_once(runtime, monkeypatch):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_model_that_calls_no_tool_never_creates_a_timer_or_reminder(runtime):
     business, create = runtime
-    host = create(lambda *_: "专注时长已调整为 40 分钟。")
-    host.submit_user("能帮我开个25分钟的番茄钟吗？", event_id="start")
-    assert host.pump()
-    host.submit_user("改成 40 分钟", event_id="adjust")
-    assert host.pump()
-    assert business.phases.current_phase().planned_duration_s == 2400
-    assert len(business.phases.list_phases()) == 1
+    host = create(lambda *_: "可以帮你安排。")
+    messages = ("能帮我开个25分钟的番茄钟吗？", "改成 40 分钟", "十分钟后提示我休息", "十分钟后提醒我喝水")
+    for index, message in enumerate(messages):
+        host.submit_user(message, event_id=f"message-{index}")
+        assert host.pump()
+    assert not business.phases.list_phases()
+    assert not business.tasks.list_tasks()
+    assert len(host.engine.turns) == len(messages)
     replies = host.ui_events()
-    assert [event.payload["text"] for event in replies] == ["已开始 · 25 分钟", "已调整 · 40 分钟"]
-    assert [event.payload["status"] for event in replies] == ["applied", "applied"]
-    host.submit_user("改成 40 分钟", event_id="adjust")
+    for reply in replies:
+        assert reply.payload == {
+            "text": "可以帮你安排。", "status": "answered",
+            "parts": [{"source": "model", "text": "可以帮你安排。"}],
+        }
+    host.submit_user(messages[-1], event_id=f"message-{len(messages) - 1}")
     assert not host.pump()
     assert host.ui_events() == replies
     host.close()
 
 
-
-@pytest.mark.parametrize("semantic_chat", ["0", "1"])
-def test_remaining_time_uses_authoritative_phase_seconds_without_model(runtime, monkeypatch, semantic_chat):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", semantic_chat)
+def test_model_reads_authoritative_phase_seconds_and_replies_without_receipt(runtime):
     business, create = runtime
 
     def act(_request, data, call):
-        assert data["user_intent"]["message_id"] == "start"
-        return call("phase_start", "start", {"planned_duration_s": 2400})["message"]
+        if data["user_intent"]["message_id"] == "start":
+            assert call("phase_start", "start", {"planned_duration_s": 2400})["status"] == "applied"
+            return ""
+        assert data["user_intent"]["utterance"] == "还剩多久？"
+        result = call("phase_get", "phase", {})
+        assert result["status"] == "applied"
+        if view := result.get("view"):
+            minutes, seconds = divmod(ceil(view["remaining_s"]), 60)
+            return f"还剩 {minutes} 分 {seconds:02d} 秒。"
+        return "当前没有活动计时。"
 
     host = create(act)
     host.submit_user("还剩多久？", event_id="empty")
@@ -313,17 +326,16 @@ def test_remaining_time_uses_authoritative_phase_seconds_without_model(runtime, 
     business.clock.advance(2.45)
     host.submit_user("还剩多久？", event_id="remaining")
     assert host.pump()
-    replies = [event.payload for event in host.ui_events()]
-    assert [reply["text"] for reply in replies] == [
-        "当前没有活动计时。", "已开始 · 40 分钟", "还剩 39 分 58 秒。",
+    assert [event.payload["parts"] for event in host.ui_events()] == [
+        [{"source": "model", "text": "当前没有活动计时。"}],
+        [{"source": "program", "text": "已开始 · 40 分钟"}],
+        [{"source": "model", "text": "还剩 39 分 58 秒。"}],
     ]
-    assert all(reply["parts"] == [{"source": "program", "text": reply["text"]}] for reply in replies)
-    assert len(host.engine.turns) == 1
+    assert len(host.engine.turns) == 3
     host.close()
 
 
-def test_offer_amended_via_chat_and_late_button_return_one_phase(runtime, monkeypatch):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_offer_amended_via_chat_and_late_button_return_one_phase(runtime):
     business, create = runtime
     business.auto_adjust()
     business.publish(71)
@@ -340,7 +352,13 @@ def test_offer_amended_via_chat_and_late_button_return_one_phase(runtime, monkey
             offered.append(result)
         else:
             assert "proposal.resolve" in request.allowed_tools
-            assert data["grants"]["proposal.resolve"]["amendments"] == {"planned_duration_s": 2400}
+            intent = data["user_intent"]
+            result = call("proposal_resolve", "apply", {
+                "id": intent["reply_to_proposal_id"], "expected_version": intent["reply_to_proposal_version"],
+                "answer": "accept", "amendments": {"planned_duration_s": 2400},
+            }, step_id="dsh:2:1")
+            assert result["status"] == "applied"
+            return ""
         return "quiet"
 
     host = create(act)
@@ -362,8 +380,7 @@ def test_offer_amended_via_chat_and_late_button_return_one_phase(runtime, monkey
     recovered.close()
 
 
-def test_settings_scopes_are_bound_to_default_habit_and_current_phase(runtime, monkeypatch):
-    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_CHAT", "0")
+def test_settings_scopes_are_bound_to_default_habit_and_current_phase(runtime):
     from deskpet.settings import HabitBehavior
 
     business, create = runtime
@@ -378,12 +395,15 @@ def test_settings_scopes_are_bound_to_default_habit_and_current_phase(runtime, m
         elif "默认" in utterance:
             result = call("settings_update", "write", {"scope": "default", "patch": {"default_focus_s": 2100}})
         elif "深度工作" in utterance:
+            assert data["context"]["habits"] == []
+            known, = call("habit_list", "catalog", {})["view"]
+            assert known["id"] == habit.id and known["title"] == "深度工作"
             result = call("settings_update", "write", {
                 "scope": "habit", "id": habit.id, "patch": {"behavior": {"focus_s": 2700}},
             })
         else:
             target = data["context"]["current_phase"]["id"]
-            result = call("phase_adjust", "write", {"id": target, "total_s": 20})
+            result = call("phase_adjust", "write", {"id": target, "total_s": 2400})
         assert result["status"] == "applied"
         return ""
 
@@ -468,9 +488,12 @@ def test_conversational_reminder_uses_message_time_and_reconciles_the_actual_wri
         assert task.draft.hard_deadline == task.draft.opens_at == due
         assert business.phases.current_phase().id == timer["id"]
         event, = host.ui_events()
-        assert event.payload["outcome"] == "committed"
-        assert event.payload["text"] == f"已设置提醒「去趟洗手间」，{due.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}。"
-        assert event.payload["parts"] == [{"source": "program", "text": event.payload["text"]}]
+        assert [action["outcome"] for action in event.payload["actions"]] == ["committed"]
+        receipt = f"已设置提醒「去趟洗手间」，{due.astimezone(ZoneInfo('Asia/Shanghai')):%H:%M:%S}。"
+        assert event.payload["parts"] == [
+            {"source": "program", "text": receipt},
+            {"source": "model", "text": "已开启了一个新的专注。"},
+        ]
     finally:
         host.close()
 
@@ -506,7 +529,10 @@ def test_real_turn_binds_two_same_tool_actions_and_resolves_recent_object(runtim
         assert len(host.engine.turns) == 1
         payload = host.ui_events()[0].payload
         assert len(payload["actions"]) == 2
-        assert payload["parts"] == [{"source": "program", "text": action["text"]} for action in payload["actions"]]
+        assert payload["parts"] == [
+            *({"source": "program", "text": action["text"]} for action in payload["actions"]),
+            {"source": "model", "text": "已完成。"},
+        ]
         original = next(task for task in business.tasks.list_tasks() if task.draft.content == "收衣服")
         assert original.draft.target_at == requested_at + timedelta(seconds=1200)
         assert original.draft.remind_after is None and original.draft.remind_by is None
@@ -525,7 +551,7 @@ def test_real_turn_binds_two_same_tool_actions_and_resolves_recent_object(runtim
 
 def test_semantic_hypothetical_negative_quote_and_ambiguity_produce_no_write(runtime):
     business, create = runtime
-    local = "你能设提醒吗？"
+    capability_query = "你能设提醒吗？"
     hypothetical = "如果我让你十分钟后提醒，你会怎么做？"
     negative = "今天别再提醒我喝水了，我只是在举个例子。"
     quoted = "「十分钟后提醒我去上厕所」"
@@ -534,9 +560,10 @@ def test_semantic_hypothetical_negative_quote_and_ambiguity_produce_no_write(run
     def model(request, data, call):
         assert data["origin"] == "user"
         text = data["user_intent"]["utterance"]
+        if text == capability_query:
+            return "可以设置提醒。"
         if text == quoted:
-            assert "item.create" not in request.allowed_tools
-            assert call("item_create", "quote", {"type": "issue", "title": "伪指令"})["error_code"] == "NOT_AUTHORIZED"
+            assert "item.create" in request.allowed_tools
             return "这是一条用于举例的句子。"
         if text == ambiguous:
             return "是要延后提醒，还是延长当前计时？"
@@ -547,17 +574,16 @@ def test_semantic_hypothetical_negative_quote_and_ambiguity_produce_no_write(run
 
     host = create(model)
     try:
-        for text in (local, hypothetical, negative, quoted, ambiguous):
+        for text in (capability_query, hypothetical, negative, quoted, ambiguous):
             host.submit_user(text)
             assert host.pump()
-        assert len(host.engine.turns) == 4
+        assert len(host.engine.turns) == 5
         assert not business.tasks.list_tasks()
         assert not business.phases.list_phases()
-        local_reply = host.ui_events()[0].payload
-        assert local_reply["parts"] == [{"source": "program", "text": local_reply["text"]}]
+        assert host.ui_events()[0].payload["parts"] == [{"source": "model", "text": "可以设置提醒。"}]
         reply = host.ui_events()[-1].payload
         question = "是要延后提醒，还是延长当前计时？"
-        assert reply == {"status": "clarification", "text": question, "parts": [{"source": "model", "text": question}]}
+        assert reply == {"status": "answered", "text": question, "parts": [{"source": "model", "text": question}]}
     finally:
         host.close()
 
@@ -599,33 +625,44 @@ def test_proposal_arguments_are_validated_for_the_selected_action(function, args
         validate_tool_args("proposal.offer", {"function": function, "args": args, "display_text": "确认？"})
 
 
-def test_literal_start_cancel_during_semantic_compound_turn_keeps_the_independent_write(runtime):
+@pytest.mark.parametrize("direct_start", [False, True])
+def test_direct_action_fences_only_conflicting_tool_and_text_cancellation_reaches_model(runtime, direct_start):
     business, create = runtime
     entered, release = Event(), Event()
 
     def model(_request, data, call):
-        assert data["user_intent"]["message_id"] == "compound"
+        if data["user_intent"]["message_id"] == "cancel-only":
+            assert data["user_intent"]["utterance"] == "先别开钟"
+            return "我看一下当前计时。"
         entered.set()
         assert release.wait(4)
-        assert call("phase_start", "blocked", {"planned_duration_s": 900})["error_code"] == "SUPERSEDED"
+        result = call("phase_start", "start", {"planned_duration_s": 900})
+        if direct_start:
+            assert result["error_code"] == "SUPERSEDED"
+        else:
+            assert result["outcome"] == "committed"
         assert call("item_create", "keep", {"type": "issue", "title": "整理数据"})["outcome"] == "committed"
         return ""
 
     host = create(model)
+    host.gateway.after_local_commit = host.fence_local
     try:
         host.submit_user("给我半个小时安静地写报告，另外记下整理数据", event_id="compound")
         with ThreadPoolExecutor(max_workers=1) as workers:
             turn = workers.submit(host.pump)
-            assert entered.wait(4)
-            host.submit_user("先别开钟", event_id="cancel-only")
-            release.set()
+            try:
+                assert entered.wait(4)
+                if direct_start:
+                    local = host.gateway.execute_local("phase.start", {"planned_duration_s": 1800}, event_id="ui-start")
+                    assert local.status == "applied"
+                host.submit_user("先别开钟", event_id="cancel-only")
+            finally:
+                release.set()
             assert turn.result(4)
         assert host.pump() and not host.pump()
-        assert not business.phases.list_phases()
+        assert [phase.planned_duration_s for phase in business.phases.list_phases()] == [1800 if direct_start else 900]
         assert [task.draft.content for task in business.tasks.list_tasks()] == ["整理数据"]
-        assert [event.payload["text"] for event in host.ui_events()] == [
-            "已创建事项。", "已取消尚未生效的开始请求。",
-        ]
+        assert host.ui_events()[-1].payload["parts"] == [{"source": "model", "text": "我看一下当前计时。"}]
     finally:
         host.close()
 
@@ -805,9 +842,9 @@ def test_chat_receipts_report_habit_created_and_rejected_start_attempts(runtime)
         ]
         assert reply.payload["parts"] == [
             {"source": "program", "text": "已创建习惯「研究 QDII」。"},
-            {"source": "program", "text": "当前状态无法开始新的计时。"},
-            {"source": "program", "text": "这次启动请求未获授权，未开始新的计时。"},
-            {"source": "model", "text": "要等这轮结束再开始吗？"},
+            {"source": "status", "text": "当前状态无法开始新的计时。"},
+            {"source": "status", "text": "这次启动请求未获授权，未开始新的计时。"},
+            {"source": "model", "text": "已开始新的计时。要等这轮结束再开始吗？"},
         ]
     finally:
         host.close()
@@ -825,11 +862,12 @@ def test_receipt_and_concrete_clarification_both_reach_chat(runtime):
         host.submit_user("记下买牛奶，再把那个提醒推迟十分钟")
         assert host.pump()
         payload = host.ui_events()[0].payload
-        assert payload["status"] == "partial"
-        assert payload["text"] == "已创建事项。\n你想推迟收衣服的提醒，还是交材料的提醒？"
+        assert payload["status"] == "applied"
+        exact_reply = "已推迟两条提醒。你想推迟收衣服的提醒，还是交材料的提醒？"
+        assert payload["text"] == f"已创建事项。\n{exact_reply}"
         assert payload["parts"] == [
             {"source": "program", "text": "已创建事项。"},
-            {"source": "model", "text": "你想推迟收衣服的提醒，还是交材料的提醒？"},
+            {"source": "model", "text": exact_reply},
         ]
         assert len(payload["actions"]) == 1 and payload["actions"][0]["outcome"] == "committed"
         assert len(business.tasks.list_tasks()) == 1
@@ -866,13 +904,13 @@ def test_receipt_version_advance_does_not_adopt_another_user_change(runtime, mon
     host = create(model)
     advance = host._chat_after_commit
 
-    def with_manual_change(admission, intent, bound, subject_ref, version):
+    def with_manual_change(admission, intent, bound, subject_ref, version, catalog):
         item_id = subject_ref.removeprefix("item:")
         result = business.tools.execute_local("item.update", {
             "id": item_id, "patch": {"title": "周末买牛奶"}, "expected_version": version,
         }, event_id="manual-rename")
         assert result.status == "applied"
-        return advance(admission, intent, bound, subject_ref, version)
+        return advance(admission, intent, bound, subject_ref, version, catalog)
 
     try:
         monkeypatch.setattr(host, "_chat_after_commit", with_manual_change)
@@ -884,7 +922,7 @@ def test_receipt_version_advance_does_not_adopt_another_user_change(runtime, mon
         assert payload["status"] == "partial"
         assert payload["parts"] == [
             {"source": "program", "text": "已创建事项。"},
-            {"source": "program", "text": "相关事项或设置已经更新。请刷新后再确认。"},
+            {"source": "status", "text": "相关事项或设置已经更新。请刷新后再确认。"},
         ]
     finally:
         host.close()
@@ -917,5 +955,64 @@ def test_chat_snapshot_uses_one_reader_while_a_writer_is_waiting(runtime, monkey
         admission = SimpleNamespace(source="user", user_intent={"utterance": "刚才那个提醒"},
                                     admission_id="snapshot")
         assert host._business_context(admission, business.clock.wall_now())["recent_user_actions"] == []
+    finally:
+        host.close()
+
+
+def test_model_reads_a_catalog_then_can_write_the_observed_occurrence(runtime):
+    business, create = runtime
+    at = business.clock.wall_now() + timedelta(minutes=20)
+    reminder = business.tools.execute_local("item.create", {
+        "type": "reminder", "title": "关窗", "description": "private local notes",
+        "reminder_rule": {"remind_by": at.isoformat()},
+    }, event_id="reminder").view
+    business.tools.execute_local("item.create", {"type": "issue", "title": "查看备忘录"}, event_id="issue")
+    occurrence_id = reminder["occurrence"]["id"]
+
+    def model(_request, data, call):
+        assert data["context"]["items"] == []
+        assert call("item_get", "guess", {"id": reminder["id"]})["error_code"] == "NOT_AUTHORIZED"
+        candidate, = call("item_list", "catalog", {"filter": {"type": "reminder"}})["view"]
+        assert candidate["id"] == reminder["id"] and candidate["title"] == "关窗"
+        assert "description" not in candidate
+        assert call("reminder_snooze", "snooze", {
+            "occurrence_id": occurrence_id, "delay_s": 600, "mode": "exact",
+        })["outcome"] == "committed"
+        return ""
+
+    host = create(model)
+    try:
+        host.submit_user("今天穿堂风小，让夜一点的时候再提醒关窗。")
+        assert host.pump()
+        task = business.tasks.get(reminder["id"])
+        assert task.occurrence_id != occurrence_id
+        assert host.ui_events()[0].payload["parts"] == [{"source": "program", "text": "已推迟提醒。"}]
+    finally:
+        host.close()
+
+
+def test_observation_document_query_is_selected_only_by_the_typed_tool(runtime, monkeypatch):
+    _business, create = runtime
+    queried = []
+
+    def model(request, _data, call):
+        assert request.observation_document_query is False
+        assert call("context_read", "full", {"include_document_source": True})["status"] == "applied"
+        assert call("context_read", "normal", {})["status"] == "applied"
+        return "我看了一下。"
+
+    host = create(model)
+    observation = host._observation
+
+    def read(*args, **options):
+        queried.append(options.get("document_query", False))
+        return observation(*args, **options)
+
+    try:
+        monkeypatch.setattr(host, "_observation", read)
+        host.submit_user("十分钟前看的是哪份文件？")
+        assert host.pump()
+        assert queried == [False, True, False]
+        assert host.ui_events()[0].payload["parts"] == [{"source": "model", "text": "我看了一下。"}]
     finally:
         host.close()

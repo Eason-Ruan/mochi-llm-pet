@@ -1,19 +1,24 @@
-"""Synthetic shadow decisions exercise the two production policy paths offline."""
+"""Synthetic decisions exercise current chat and both background policies offline."""
 
 import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from evaluation.interruption_replay import score_interruption_case
-from evaluation.system2_replay import blind_review, load_recordings, read_cases, run_comparison
+from evaluation.system2_replay import blind_review, load_recordings, read_cases, run_replay
 
 
-def test_comparison_preserves_times_and_measures_commits_and_display():
+def test_replay_preserves_times_and_measures_commits_and_display():
     cases = read_cases()
-    report = run_comparison(cases)
-    baseline = report["variants"]["baseline"]["metrics"]
-    semantic = report["variants"]["semantic"]["metrics"]
-    assert baseline["missed_actions"] > semantic["missed_actions"] == 0
+    report = run_replay(cases)
+    assert report["chat_policy"] == "semantic"
+    legacy = report["variants"]["legacy_background"]
+    current = report["variants"]["semantic_background"]
+    semantic = current["metrics"]
+    assert legacy["metrics"]["missed_actions"] > semantic["missed_actions"] == 0
     assert semantic["false_actions"] == semantic["unnecessary_interruptions"] == semantic["failed_checks"] == 0
     assert semantic["duplicate_reminder_displays"] == semantic["provider_requests_during_replay"] == 0
     assert semantic["recorded_provider_cost_usd"] is None
@@ -30,10 +35,18 @@ def test_comparison_preserves_times_and_measures_commits_and_display():
     assert set(semantic["wake_kinds"]) == {"tick", "reminder_ready", "recheck", "observation_ready", "resume"}
     assert {"model_unavailable", "parse_failed", "expired_request", "display_layer_blocked", "user_rejected"} <= set(
         semantic["denial_causes"])
-    observed = {case["id"]: case["steps"] for case in report["variants"]["semantic"]["scenarios"]}
+    observed = {case["id"]: case["steps"] for case in current["scenarios"]}
     colloquial, = observed["colloquial-original-timestamp"]
+    colloquial_turn, = colloquial["turns"]
     assert colloquial["effects"][0]["deadline"] == "2026-11-22T08:46:16+00:00"
-    assert colloquial["turns"][0]["at"].startswith("2026-11-22T08:36:16")
+    assert colloquial_turn["at"].startswith("2026-11-22T08:36:16")
+    legacy_colloquial, = next(
+        case["steps"] for case in legacy["scenarios"] if case["id"] == "colloquial-original-timestamp"
+    )
+    legacy_chat_turn, = legacy_colloquial["turns"]
+    assert legacy_chat_turn == colloquial_turn
+    assert legacy_colloquial["effects"][0]["deadline"] == colloquial["effects"][0]["deadline"]
+    assert legacy_colloquial["score"] == colloquial["score"]
     assert observed["meeting-flexible-and-hard-deadline"][2]["turns"] == []
     assert observed["pet-bubble-respects-preferences"][0]["simulated_deliveries"][0]["animation"] == "idle"
     by_id = {step["id"]: step for step in observed["interruption-stale-native-button"]}
@@ -42,7 +55,7 @@ def test_comparison_preserves_times_and_measures_commits_and_display():
     packet, key = blind_review(cases, report, 12)
     assert all(set(case["outputs"]) == {"A", "B"} for case in packet["cases"])
     assert set(key) == {case["id"] for case in cases}
-    assert {mapping["A"] for mapping in key.values()} == {"baseline", "semantic"}
+    assert {mapping["A"] for mapping in key.values()} == {"legacy_background", "semantic_background"}
     assert "semantic" not in json.dumps(packet)
 
 
@@ -69,13 +82,15 @@ def test_recorded_model_usage_is_separate_and_raw_reply_is_omitted(tmp_path):
     case = next(case for case in read_cases() if case["id"] == "colloquial-original-timestamp")
     turn = {"reply": "TEST-RAW-CAPTURED-REPLY", "origin": "user", "trigger_reasons": ["user_message"],
             "usage": {"requests": 2, "latency_ms": 700, "cost_usd": 0.02}}
-    captures = {variant: {case["id"]: {"request": [turn]}} for variant in ("baseline", "semantic")}
+    captures = {"baseline": {case["id"]: {"request": [{"reply": "obsolete baseline"}]}},
+                "semantic": {case["id"]: {"request": [turn]}}}
     artifact = tmp_path / "recorded.json"
     value = {"schema": 1, "synthetic_inputs_only": True, "variants": captures}
     artifact.write_text(json.dumps(value), encoding="utf-8")
-    report = run_comparison([case], recordings=load_recordings(artifact))
+    report = run_replay([case], recordings=load_recordings(artifact))
     assert "TEST-RAW-CAPTURED-REPLY" not in json.dumps(report)
-    metrics = report["variants"]["semantic"]["metrics"]
+    assert set(report["variants"]) == {"semantic_background"}
+    metrics = report["variants"]["semantic_background"]["metrics"]
     assert metrics["engine_behavior_source"] == "offline_recorded_model"
     assert metrics["provider_requests_during_replay"] == metrics["replay_provider_cost_usd"] == 0
     assert metrics["recorded_provider_requests"] == 2
@@ -85,6 +100,37 @@ def test_recorded_model_usage_is_separate_and_raw_reply_is_omitted(tmp_path):
     artifact.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(ValueError, match="cannot define local user events"):
         load_recordings(artifact)
+
+
+def test_cli_blinds_two_current_background_captures_and_rejects_a_single_arm(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    case_id = "colloquial-original-timestamp"
+    turn = {"origin": "user", "trigger_reasons": ["user_message"], "calls": [{
+        "action": "item.create",
+        "args": {"type": "reminder", "title": "去趟洗手间", "reminder_rule": {"remind_by_offset_s": 600}},
+    }]}
+    captures = {"schema": 2, "synthetic_inputs_only": True, "variants": {
+        "semantic_background": {case_id: {"request": [turn]}},
+    }}
+    artifact = tmp_path / "recorded.json"
+    output = tmp_path / "review"
+    command = [sys.executable, str(root / "scripts/system2_semantic_replay.py"), "--scenario", case_id,
+               "--output", str(output), "--recorded-model", str(artifact), "--blind-seed", "12",
+               "--check-semantic"]
+
+    artifact.write_text(json.dumps(captures), encoding="utf-8")
+    single = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=20)
+    assert single.returncode == 1
+    assert "requires schema 2 captures for both background policies" in single.stderr
+    assert not output.exists()
+
+    captures["variants"]["legacy_background"] = {case_id: {"request": [turn]}}
+    artifact.write_text(json.dumps(captures), encoding="utf-8")
+    paired = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=20)
+    assert paired.returncode == 0, paired.stderr
+    key = json.loads((output / "blind-key.json").read_text(encoding="utf-8"))
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert set(key[case_id].values()) == set(report["variants"]) == {"legacy_background", "semantic_background"}
 
 
 def test_oracle_counts_a_committed_rogue_write_even_when_no_effect_is_expected():
@@ -97,8 +143,8 @@ def test_oracle_counts_a_committed_rogue_write_even_when_no_effect_is_expected()
         }]}
 
     # The explicit request provides a committed control even if the runtime rejects the injected read-only case.
-    report = run_comparison([scenario("control", "关掉提醒声音"), scenario("rogue", "你觉得今天怎么样？")])
-    explicit, rogue = [case["steps"][0] for case in report["variants"]["semantic"]["scenarios"]]
+    report = run_replay([scenario("control", "关掉提醒声音"), scenario("rogue", "你觉得今天怎么样？")])
+    explicit, rogue = [case["steps"][0] for case in report["variants"]["semantic_background"]["scenarios"]]
     assert explicit["effects"] == [{"action": "changed_settings", "fields": ["reminder_sound"]}]
     assert explicit["score"]["false_actions"] == ["changed_settings"]
     committed = any(receipt.get("outcome") == "committed" for receipt in rogue["tool_receipts"])

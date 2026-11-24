@@ -67,14 +67,14 @@ def test_dialogue_and_desktop_messages_are_labeled_on_restart(tmp_path):
     reopened.finish_turn("business-action", "重复完成")
     reopened.append_message("Mochi", "本地更新", source="program")
     reopened.append_message("Mochi", "来源不详")
-    reopened.record_program_answer("expired-desktop", "desktop", "消息已过期。")
+    reopened.record_status("expired-desktop", "desktop", "消息已过期。")
     rows = ConversationStore(path).projected_messages(include_parts=True)
     assert [row[6][0] for row in rows] == [
         {"source": "user", "text": "调整计时"},
         {"source": "program", "text": "已调整计时。"},
         {"source": "program", "text": "本地更新"},
         {"source": "legacy", "text": "来源不详"},
-        {"source": "program", "text": "消息已过期。"},
+        {"source": "status", "text": "消息已过期。"},
     ]
     assert rows[1][4:6] == ("business-action", "调整计时")
 

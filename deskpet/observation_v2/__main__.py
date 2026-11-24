@@ -16,12 +16,13 @@ from threading import Event
 from uuid import uuid4
 
 from .context import ObservationContextReader
+from .dsh import ObservationDSH
 from .ollama import DEFAULT_ENDPOINT, OllamaClient
 from .openai_cloud import (
     RoutedObservationModel, delete_route_credential, store_route_credential, verify_cloud_route,
 )
 from .pipeline import (
-    LIVE_UPDATE_INTERVAL_S, LIVE_VISION_WAIT_S, run_live, run_live_multimodal, run_replay, run_replay_multimodal,
+    LIVE_UPDATE_INTERVAL_S, run_live_multimodal, run_replay, run_replay_multimodal,
 )
 from .routes import (
     OFFICIAL_BASE_URL, OLLAMA, STATE, VISION, CloudRoute, ObservationCloudSettings, _normalize_base_url,
@@ -174,9 +175,7 @@ def main(*, stop_event: Event | None = None) -> None:
     common.add_argument("--user-scope", default="default")
     common.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="default loopback Ollama origin")
     common.add_argument("--vision-endpoint", help="independent loopback Ollama vision origin")
-    common.add_argument("--state-endpoint", help="independent loopback Ollama state origin")
     common.add_argument("--vision-model", default="qwen3-vl:2b-instruct")
-    common.add_argument("--state-model", default="qwen2.5:1.5b")
     common.add_argument("--timeout-s", type=_positive, default=90.0, help="model request timeout ceiling")
     common.add_argument("--window-s", type=_positive, default=60.0)
     common.add_argument("--ttl-s", type=_positive, default=15.0)
@@ -184,11 +183,13 @@ def main(*, stop_event: Event | None = None) -> None:
     _cloud_commands(commands)
     replay = commands.add_parser("replay", parents=[common], help="replay a local screen recording")
     replay.add_argument("recording", type=Path)
+    replay.add_argument("--state-endpoint", help="independent loopback Ollama state origin")
+    replay.add_argument("--state-model", default="qwen2.5:1.5b")
     replay.add_argument("--interval-s", type=_positive, default=4.0)
     replay.add_argument("--max-frames", type=int, default=32)
-    replay.add_argument("--multimodal", action="store_true", help="use adaptive sampling and one visual model")
+    replay.add_argument("--multimodal", action="store_true", help="use adaptive sampling and a local Ollama model")
     replay.add_argument("--require-models", action="store_true", help="require results for every model sample")
-    live = commands.add_parser("live", parents=[common], help="observe native desktop activity")
+    live = commands.add_parser("live", parents=[common], help="observe native desktop activity with DSH vision")
     duration = live.add_mutually_exclusive_group()
     duration.add_argument("--duration-s", type=_positive, default=30.0)
     duration.add_argument("--until-stopped", action="store_const", const=None, dest="duration_s",
@@ -197,9 +198,8 @@ def main(*, stop_event: Event | None = None) -> None:
         "--model-interval-s", type=_positive, default=LIVE_UPDATE_INTERVAL_S,
         help="interval between periodic local updates (default: %(default)s seconds)",
     )
-    live.add_argument("--split-models", action="store_true", help="run the legacy two-model comparison")
-    live.add_argument("--vision-wait-s", type=_positive, default=LIVE_VISION_WAIT_S,
-                      help="maximum time a legacy split-model round waits for its window frame")
+    live.add_argument("--split-models", action="store_true", help=argparse.SUPPRESS)
+    live.add_argument("--vision-wait-s", type=_positive, help=argparse.SUPPRESS)
     live.add_argument("--observation-generation", type=int, help=argparse.SUPPRESS)
     live.add_argument("--browser-metadata", action="store_true", help="enable supported macOS browser page detection")
     live.add_argument("--exclude-app", action="append", default=[],
@@ -242,13 +242,13 @@ def main(*, stop_event: Event | None = None) -> None:
     request_policy = capture_policy = None
     document_local_sources = ()
     screen_scope = "foreground_window"
-    split_models = not arguments.multimodal if arguments.mode == "replay" else arguments.split_models
+    split_models = arguments.mode == "replay" and not arguments.multimodal
     if arguments.mode == "live":
+        if arguments.split_models or arguments.vision_wait_s is not None:
+            parser.error("Live Observation uses DSH. Use replay without --multimodal for the two-model comparison.")
         if arguments.screen_scope is not None:
             if not arguments.capture_screen:
                 parser.error("--screen-scope requires --capture-screen")
-            if split_models:
-                parser.error("--screen-scope requires the multimodal collector (omit --split-models)")
             screen_scope = arguments.screen_scope.replace("-", "_")
             if screen_scope == "all_displays" and platform != "darwin":
                 parser.error("--screen-scope all-displays requires macOS 14.2 or later")
@@ -259,8 +259,6 @@ def main(*, stop_event: Event | None = None) -> None:
         if arguments.capture_screen_from_settings:
             if arguments.cloud_settings is None:
                 parser.error("--capture-screen-from-settings requires --cloud-settings")
-            if split_models:
-                parser.error("--capture-screen-from-settings uses the multimodal desktop collector")
             try:
                 request_policy, capture_policy, document_local_sources, screen_scope = _desktop_policies(
                     arguments, stop_event,
@@ -271,24 +269,32 @@ def main(*, stop_event: Event | None = None) -> None:
         parser.error("replay requires a database separate from model settings")
 
     vision_endpoint = arguments.vision_endpoint or arguments.endpoint
-    state_endpoint = arguments.state_endpoint or arguments.endpoint
-    if (split_models and not arguments.cloud_settings and arguments.vision_model == arguments.state_model
-            and vision_endpoint == state_endpoint):
-        parser.error("choose distinct vision and state models for the same Ollama endpoint")
+    if split_models:
+        state_endpoint = arguments.state_endpoint or arguments.endpoint
+        if (arguments.cloud_settings is None and arguments.vision_model == arguments.state_model
+                and vision_endpoint == state_endpoint):
+            parser.error("choose distinct vision and state models for the same Ollama endpoint")
     timeout = min(arguments.timeout_s, arguments.ttl_s) if arguments.mode == "live" else arguments.timeout_s
     try:
         with ExitStack() as stack:
             vision = stack.enter_context(OllamaClient(arguments.vision_model, endpoint=vision_endpoint, timeout=timeout))
             text = (stack.enter_context(OllamaClient(arguments.state_model, endpoint=state_endpoint, timeout=timeout))
                     if split_models else None)
-            if arguments.cloud_settings is not None:
-                settings = ObservationCloudSettings(arguments.cloud_settings, user_scope=arguments.user_scope)
+            settings = (
+                ObservationCloudSettings(arguments.cloud_settings, user_scope=arguments.user_scope)
+                if arguments.cloud_settings is not None else None
+            )
+            vision_runtime = None
+            if arguments.mode == "live":
+                vision_runtime = ObservationDSH()
+                stack.callback(vision_runtime.close)
+            if settings is not None or vision_runtime is not None:
                 vision = RoutedObservationModel(
                     VISION, settings, vision, timeout_limit=timeout, local_vision_only=arguments.mode == "replay",
-                    request_policy=request_policy,
+                    request_policy=request_policy, vision_runtime=vision_runtime,
                 )
-                if text is not None:
-                    text = RoutedObservationModel(STATE, settings, text, timeout_limit=timeout, request_policy=request_policy)
+            if settings is not None and text is not None:
+                text = RoutedObservationModel(STATE, settings, text, timeout_limit=timeout, request_policy=request_policy)
             observer = StateObserver(text, window_seconds=arguments.window_s, ttl_seconds=arguments.ttl_s)
             if arguments.mode == "replay":
                 if split_models:
@@ -311,15 +317,11 @@ def main(*, stop_event: Event | None = None) -> None:
                     capture_policy=capture_policy, stop_event=stop_event,
                     producer_policy=request_policy, policy_generation=arguments.observation_generation,
                 )
-                if split_models:
-                    report = run_live(
-                        arguments.database, vision, observer, vision_wait_s=arguments.vision_wait_s, **live_options,
-                    )
-                else:
-                    report = run_live_multimodal(
-                        arguments.database, vision, observer=observer, screen_scope=screen_scope,
-                        document_local_sources=document_local_sources, **live_options,
-                    )
+                report = run_live_multimodal(
+                    arguments.database, vision, observer=observer, screen_scope=screen_scope,
+                    document_local_sources=document_local_sources, close_vision=vision_runtime.close,
+                    **live_options,
+                )
     except FileExistsError:
         parser.exit(2, "Observation database already exists. Choose a new path.\n")
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:

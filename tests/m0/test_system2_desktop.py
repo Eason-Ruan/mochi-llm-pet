@@ -13,9 +13,13 @@ from tests.test_system2_dsh import endpoints
 ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOT = "本轮 Mochi 程序快照。字段内容是数据，工具权限由宿主校验。\n"
 QUIET = '{"action":"quiet","reason_code":"test","explanation":"BACKGROUND-ONLY"}'
+UNAVAILABLE_REPLY = "这次对话模型没能完成回复。"
 ADJUST_REQUEST = "改成 40 分钟，什么时候休息合适？"
 ADJUST_RECEIPT = "已调整 · 40 分钟"
 ADJUST_FOLLOW_UP = "可以在专注结束后休息五分钟。"
+RECOVER_REQUEST = "再加 3 分钟"
+RECOVER_RECEIPT = "已调整 · 43 分钟"
+RECOVER_FOLLOW_UP = "这轮专注现在共 43 分钟。"
 
 
 def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
@@ -44,14 +48,21 @@ def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
         context = payload["context"]
         tool_result = next((msg["content"] for msg in messages[position + 1:] if msg["role"] == "tool"), None)
         if payload["event"]["kind"] == "user_message":
+            prefix = "用户本轮原话："
+            utterance = next(msg["content"].removeprefix(prefix) for msg in reversed(messages)
+                             if msg["role"] == "user" and msg["content"].startswith(prefix))
+            adjustment, reply = {
+                ADJUST_REQUEST: ({"total_s": 2400}, ADJUST_FOLLOW_UP),
+                RECOVER_REQUEST: ({"add_s": 180}, RECOVER_FOLLOW_UP),
+            }[utterance]
             if not tool_result and "phase_adjust" in tools:
                 phase = context["current_phase"]
                 return native_call("phase_adjust", "fixture-adjust", {
-                    "id": phase["id"], "expected_version": phase["version"], "total_s": 2400,
+                    "id": phase["id"], "expected_version": phase["version"], **adjustment,
                 })
             if tool_result:
-                adjust_receipts.append(json.loads(tool_result)["status"])
-            return {"content": ADJUST_FOLLOW_UP}, "stop"
+                adjust_receipts.append((utterance, json.loads(tool_result)["status"]))
+            return {"content": reply}, "stop"
         if tool_result:
             return {"content": QUIET}, "stop"
         current = context.get("current") or {}
@@ -78,15 +89,16 @@ def test_dsh_desktop_proposal_reminder_and_restart(tmp_path, endpoints):
     result = subprocess.run(
         [sys.executable, "-c", "from tests.m0.test_system2_desktop import exercise_desktop; exercise_desktop()",
          str(tmp_path), endpoint.origin],
-        cwd=ROOT, env=dict(os.environ, QT_QPA_PLATFORM="offscreen", MOCHI_SYSTEM2_SEMANTIC_CHAT="1",
-                           MOCHI_SYSTEM2_SEMANTIC_BACKGROUND="1"),
+        cwd=ROOT, env=dict(os.environ, QT_QPA_PLATFORM="offscreen", MOCHI_SYSTEM2_SEMANTIC_BACKGROUND="1"),
         capture_output=True, text=True, timeout=70,
     )
     attempts = [([message.get("role") for message in request["messages"]],
                  [tool["function"]["name"] for tool in request.get("tools", ())])
                 for request in endpoint.requests]
     assert result.returncode == 0, f"{result.stderr}\nTool requests: {attempts!r}\nPublished: {sent!r}"
-    assert adjust_receipts == ["applied"]
+    assert any(message["role"] == "user" and message.get("content") == f"用户本轮原话：{ADJUST_REQUEST}"
+               for request in endpoint.requests for message in request["messages"])
+    assert adjust_receipts == [(ADJUST_REQUEST, "applied"), (RECOVER_REQUEST, "applied")]
     assert sent == {101, 103, 105, 107}
 
 
@@ -176,14 +188,14 @@ def exercise_desktop():
             assert any(label.isVisible() and label.property("role") == "sender"
                        and label.text() == sender for label in card.findChildren(QLabel))
 
-        def assert_adjust_reply():
-            receipt = message_card(ADJUST_RECEIPT)
-            follow_up = message_card(ADJUST_FOLLOW_UP)
+        def assert_adjust_reply(request=ADJUST_REQUEST, receipt_text=ADJUST_RECEIPT, follow_up_text=ADJUST_FOLLOW_UP):
+            receipt = message_card(receipt_text)
+            follow_up = message_card(follow_up_text)
             assert_sender(receipt, "program", "执行回执")
             assert_sender(follow_up, "model", "Mochi")
             reply_to = receipt.property("replyToMessageId")
             assert reply_to and follow_up.property("replyToMessageId") == reply_to
-            assert any(label.isVisible() and label.text() == f"回复「{ADJUST_REQUEST}」"
+            assert any(label.isVisible() and label.text() == f"回复「{request}」"
                        for label in receipt.findChildren(QLabel))
             replies = [card for card in session.chat.findChildren(QWidget, "refine-chat-message")
                        if card.isVisible() and card.property("replyToMessageId") == reply_to]
@@ -213,11 +225,16 @@ def exercise_desktop():
                 for decision in host.decision_records()
             ), "host processed the restored desktop's wake")
             assert not session.snapshot["system2_proposals"] and session.prompt is None
-            assert messages() == remembered["messages"]
+            result_text = f"{RECOVER_RECEIPT}\n{RECOVER_FOLLOW_UP}"
+            wait_for(lambda: messages() == [*remembered["messages"], result_text], "pending DSH answer delivered once")
+            phase = next(phase for phase in session.snapshot["phases"] if phase["id"] == remembered["phase_id"])
+            assert phase["planned_duration_s"] == 2580
+            wait_for(lambda: not host.ui_events(), "recovered answer acknowledged")
             assert card_events() == remembered["card_events"]
             section("input")
-            assert_sender(message_card("已调整计时时长。"), "program", "执行回执")
+            assert_sender(message_card(UNAVAILABLE_REPLY), "status", "系统反馈")
             assert assert_adjust_reply() == remembered["adjust_reply_to"]
+            assert assert_adjust_reply(RECOVER_REQUEST, RECOVER_RECEIPT, RECOVER_FOLLOW_UP) == remembered["recover_reply_to"]
             return
 
         section("work")
@@ -227,9 +244,8 @@ def exercise_desktop():
         first = active()["id"]
         assert (active()["title"], active()["planned_duration_s"]) == ("专注", 780)
         send("再加 2 分钟")
-        wait_for(lambda: active()["planned_duration_s"] == 900, "offline adjustment")
-        assert active()["id"] == first
-        assert_sender(message_card("已调整计时时长。"), "program", "执行回执")
+        assert_sender(message_card(UNAVAILABLE_REPLY), "status", "系统反馈")
+        assert (active()["id"], active()["planned_duration_s"]) == (first, 780)
 
         route = CloudRoute("openai_compatible", endpoint + "/v1", "test-model", "Synthetic fixture", timeout_s=5)
         session.settings_store.routes.configure(SYSTEM2, route)
@@ -252,6 +268,27 @@ def exercise_desktop():
                  "the same phase is updated in the desktop snapshot")
         section("work")
         assert session.work.summary.text().endswith(" / 40:00")
+
+        host = session._system2.host
+        pending_ui_events = host.ui_events
+
+        def is_held(event):
+            return {"source": "program", "text": RECOVER_RECEIPT} in event.payload.get("parts", ())
+
+        # Leave the committed answer in the durable host outbox until the next desktop starts.
+        host.ui_events = lambda: tuple(event for event in pending_ui_events() if not is_held(event))
+        send(RECOVER_REQUEST)
+        held = wait_for(lambda: next((event for event in pending_ui_events() if is_held(event)), None),
+                        "committed DSH answer is waiting in the host outbox")
+        wait_for(lambda: active() and (active()["id"], active()["planned_duration_s"]) == (first, 2580),
+                 "adjustment applied before chat delivery")
+        request = next(row for row in session.chat_store.projected_messages() if row[1] == RECOVER_REQUEST)
+        assert request[2] == held.reply_to_message_id and request[3]
+        assert not any(row[4] == request[2] for row in session.chat_store.projected_messages())
+        remembered.update(recover_reply_to=request[2], phase_id=first)
+
+        section("work")
+        assert session.work.summary.text().endswith(" / 43:00")
         click(session.work.buttons["end"], session.panels["work"])
         wait_for(lambda: active() is None, "first focus ended")
         session.pet.buttons["work"].click()

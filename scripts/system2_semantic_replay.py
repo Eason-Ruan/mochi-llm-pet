@@ -1,4 +1,4 @@
-"""Compare legacy and semantic System 2 policies with no live effects or API calls."""
+"""Replay current System 2 chat and supported background policies offline."""
 
 import argparse
 import json
@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from evaluation.system2_replay import blind_review, load_recordings, read_cases, run_comparison
+from evaluation.system2_replay import blind_review, load_recordings, read_cases, run_replay
 
 
 def write_json(path, value):
@@ -19,8 +19,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="New output directory")
     parser.add_argument("--scenario", action="append", help="Run selected scenario IDs (repeatable)")
     parser.add_argument("--recorded-model", type=Path, help="Optional offline model outputs captured on synthetic inputs")
-    parser.add_argument("--blind-seed", type=int, help="Write a randomized blind review packet and a separate answer key")
-    parser.add_argument("--check-semantic", action="store_true", help="Exit nonzero if a semantic replay check fails")
+    parser.add_argument("--blind-seed", type=int, help="Blind the comparison between two background policies")
+    parser.add_argument("--check-semantic", action="store_true", help="Exit nonzero if a check fails with semantic background")
     args = parser.parse_args()
     try:
         cases = read_cases()
@@ -30,8 +30,10 @@ def main():
                 raise ValueError(f"Unknown scenario IDs: {', '.join(sorted(missing))}")
             cases = [case for case in cases if case["id"] in args.scenario]
         recordings = load_recordings(args.recorded_model) if args.recorded_model else None
+        if args.blind_seed is not None and recordings is not None and len(recordings) != 2:
+            raise ValueError("Blind review of recorded turns requires schema 2 captures for both background policies")
         args.output.mkdir(parents=True, exist_ok=False)
-        report = run_comparison(cases, recordings=recordings)
+        report = run_replay(cases, recordings=recordings)
         write_json(args.output / "report.json", report)
         if args.blind_seed is not None:
             review, key = blind_review(cases, report, args.blind_seed)
@@ -41,7 +43,7 @@ def main():
         parser.exit(1, f"Replay failed: {type(error).__name__}: {error}\n")
     print(json.dumps({variant: data["metrics"] for variant, data in report["variants"].items()},
                      ensure_ascii=False, indent=2))
-    semantic = report["variants"]["semantic"]["metrics"]
+    semantic = report["variants"]["semantic_background"]["metrics"]
     interruption = semantic["interruption"]
     failed_steps = any(semantic[key] for key in (
         "false_actions", "missed_actions", "failed_checks", "duplicate_reminder_displays",

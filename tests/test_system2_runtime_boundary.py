@@ -187,12 +187,14 @@ def test_native_read_scope_reply_and_budget_survive_a_host_restart(desktop):
             assert host.pump()
             reply, = host.ui_events()
             assert reply.reply_to_message_id == "timer-query"
-            assert reply.payload["status"] == "failed"
+            assert reply.payload["parts"] == [
+                {"source": "model", "text": "好，刚刚帮你创建了新事项。要查看详情吗？"}
+            ]
             assert len(wire) == 6
             assert last_tool(wire[1])["view"]["planned_duration_s"] == 1500
             assert last_tool(wire[2])["error_code"] == "NOT_AUTHORIZED"
             assert last_tool(wire[3])["view"]["id"] == visible["id"]
-            assert [item["id"] for item in last_tool(wire[4])["view"]] == [visible["id"]]
+            assert {item["id"] for item in last_tool(wire[4])["view"]} == {visible["id"], hidden["id"]}
             assert last_tool(wire[5])["error_code"] == "TOOL_BUDGET_EXHAUSTED"
             with sqlite3.connect(desktop.database) as db:
                 steps = db.execute("SELECT step_id FROM s2_calls WHERE admission_id=? ORDER BY rowid", (admission,)).fetchall()
@@ -210,13 +212,14 @@ def test_native_read_scope_reply_and_budget_survive_a_host_restart(desktop):
             assert len(wire) == 7
         finally:
             restored.close()
-    for body in wire:
+    for index, body in enumerate(wire):
         packet = json.dumps(body)
         assert all(marker not in packet for marker in (
-            "LOCAL-TIMER-NOTES", "LOCAL-ITEM-NOTES", "UNRELATED-ITEM-TITLE",
-            "OLD-ACTIVITY-NOTES", "CURRENT-ACTIVITY-NOTES",
+            "LOCAL-TIMER-NOTES", "LOCAL-ITEM-NOTES", "OLD-ACTIVITY-NOTES", "CURRENT-ACTIVITY-NOTES",
         ))
-        assert "phase_start" not in {tool["function"]["name"] for tool in body["tools"]}
+        if index < 4:
+            assert "UNRELATED-ITEM-TITLE" not in packet
+        assert "phase_start" in {tool["function"]["name"] for tool in body["tools"]}
     assert len(desktop.phases.list_phases()) == 1
     assert len(desktop.tasks.list_tasks()) == 2
 
@@ -304,7 +307,10 @@ def test_native_chat_amendment_and_restarted_old_button_share_one_phase(desktop)
             current = desktop.phases.current_phase()
             assert current.planned_duration_s == 2400
             answer, = host.ui_events()
-            assert answer.payload["text"] == "已开始 · 40 分钟"
+            assert answer.payload["parts"] == [
+                {"source": "program", "text": "已开始 · 40 分钟"},
+                {"source": "model", "text": "已开始 · 40 分钟"},
+            ]
             assert len(wire) == 4
             assert last_tool(wire[3])["view"]["planned_duration_s"] == 2400
             assert "phase_start" not in {tool["function"]["name"] for tool in wire[0]["tools"]}
@@ -361,10 +367,12 @@ def test_policy_change_after_model_callback_check_blocks_the_business_write(desk
             host.close()
 
 
-def test_question_shaped_write_claim_is_replaced_with_host_owned_text(desktop):
+def test_write_claim_and_punctuation_are_preserved_as_model_text_without_receipt(desktop):
+    model_text = "  如果你想让我帮你记录或安排接下来的事，直接告诉我就好～  \n给你整理好了。可以看一下这个结果吗？"
+
     class FakeModel:
         def run(self, *_):
-            return "给你整理好了。可以看一下这个结果吗？"
+            return model_text
 
         def close(self):
             pass
@@ -375,9 +383,9 @@ def test_question_shaped_write_claim_is_replaced_with_host_owned_text(desktop):
         assert host.pump()
         event, = host.ui_events()
         assert event.payload == {
-            "status": "failed",
-            "text": "这次没有执行成功。",
-            "parts": [{"source": "program", "text": "这次没有执行成功。"}],
+            "status": "answered",
+            "text": model_text,
+            "parts": [{"source": "model", "text": model_text}],
         }
         assert not desktop.tasks.list_tasks()
     finally:

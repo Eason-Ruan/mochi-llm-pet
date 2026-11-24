@@ -167,14 +167,14 @@ def test_concurrent_proposals_amendments_and_lost_result_replay(business, monkey
 
 
 def test_focus_offer_while_working_without_habit_task_or_available_slot(business):
-    from deskpet.system2.intent import describe_grants
+    from deskpet.system2.semantic_policy import background_grants
 
     business.auto_adjust()
     snapshot = business.publish(71, "working")
     assert snapshot["opportunity_id"] is None
     context = {"current_status": "fresh", "current": {"state": "working"},
                "enabled_settings": {"auto_adjust": True}, "eligible_items": []}
-    grants = describe_grants(None, context, requested_at=business.clock.wall_now())
+    grants = background_grants(context)
     assert {"proposal.offer", "pet.present"} <= grants.keys()
     assert "reminder.present" not in grants
     business.clock.advance(16)

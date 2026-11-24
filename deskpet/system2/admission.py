@@ -13,8 +13,9 @@ from uuid import uuid4
 
 from deskpet.observation_v2.routes import CloudRouteError
 
-from .intent import READ_TOOLS, allows, cancels_start, literal_start_cancellation, ref_id
+from .intent import allows, ref_id
 from .protocol import ToolAuthority, UiEvent
+from .tool_schema import READ_TOOLS
 
 
 def json_text(value) -> str:
@@ -38,7 +39,7 @@ _SCHEMA = (
         event TEXT NOT NULL, user_intent TEXT, fingerprint TEXT NOT NULL,
         created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
         state TEXT NOT NULL, intent_generation INTEGER NOT NULL DEFAULT 1,
-        superseded_by TEXT, supersedes TEXT, start_intent INTEGER NOT NULL DEFAULT 0,
+        superseded_by TEXT, supersedes TEXT,
         grants TEXT, authority_context TEXT, initial_step_id TEXT, owner TEXT,
         replans INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS s2_queue ON s2_admissions(user_scope, state, sequence)",
@@ -145,115 +146,61 @@ class AdmissionStore:
                 WHERE user_scope = ? AND source = 'background' AND state = 'running' AND owner = ?
             """, (self.scope, self.owner))
 
-    def _insert(self, db, admission_id, source, event, user, at, expires, fingerprint, *,
-                supersedes=None, start_intent=False):
+    def _insert(self, db, admission_id, source, event, user, at, expires, fingerprint, *, supersedes=None):
         db.execute("""
             INSERT INTO s2_admissions(
                 admission_id, user_scope, source, event, user_intent, fingerprint, created_at,
-                expires_at, state, supersedes, start_intent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                expires_at, state, supersedes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
         """, (admission_id, self.scope, source, json_text(event), json_text(user) if user else None,
-              fingerprint, timestamp(at), timestamp(expires), supersedes, int(start_intent)))
+              fingerprint, timestamp(at), timestamp(expires), supersedes))
 
     def submit(self, event: dict, user: dict, at: datetime, ttl: timedelta, *,
-               explicit_supersedes: str | None = None, start_intent: bool = False) -> str:
-        return self.submit_many(((event, user, start_intent),), at, ttl,
-                                explicit_supersedes=explicit_supersedes)[0]
-
-    def submit_many(self, messages, at, ttl, *, explicit_supersedes=None):
+               explicit_supersedes: str | None = None) -> str:
         with self.write() as db:
             if not self._owned(db):
                 raise RuntimeError("System 2 host was replaced")
-            return tuple(self._submit(db, event, user, at, ttl, start_intent,
-                                      explicit_supersedes if index == 0 else None)
-                         for index, (event, user, start_intent) in enumerate(messages))
-
-    def _submit(self, db, event, user, at, ttl, start_intent, explicit_supersedes):
-        event_id = event["trigger_ids"][0]
-        admission_id = "s2a-" + stable_id(self.scope, "user", event_id)
-        fingerprint = stable_id(json_text(user), explicit_supersedes or "")
-        prior = db.execute("SELECT fingerprint FROM s2_admissions WHERE admission_id = ?", (admission_id,)).fetchone()
-        if prior is not None:
-            if prior["fingerprint"] != fingerprint:
-                raise ValueError("A user event ID already refers to a different input")
+            event_id = event["trigger_ids"][0]
+            admission_id = "s2a-" + stable_id(self.scope, "user", event_id)
+            fingerprint = stable_id(json_text(user), explicit_supersedes or "")
+            prior = db.execute("SELECT fingerprint FROM s2_admissions WHERE admission_id = ?",
+                               (admission_id,)).fetchone()
+            if prior is not None:
+                if prior["fingerprint"] != fingerprint:
+                    raise ValueError("A user event ID already refers to a different input")
+                return admission_id
+            target = None
+            if explicit_supersedes:
+                previous = db.execute("""
+                    SELECT admission_id FROM s2_admissions
+                    WHERE user_scope = ? AND source = 'user' AND admission_id = ?
+                """, (self.scope, explicit_supersedes)).fetchone()
+                if previous:
+                    target = previous["admission_id"]
+                    db.execute("""
+                        UPDATE s2_admissions SET state = CASE
+                            WHEN state IN ('queued', 'running') THEN 'superseded' ELSE state END,
+                            intent_generation = intent_generation + 1, superseded_by = ?
+                        WHERE admission_id = ?
+                    """, (admission_id, target))
+            self._insert(db, admission_id, "user", event, user, at, at + ttl, fingerprint, supersedes=target)
             return admission_id
-        semantic = event.get("semantic_chat") is True
-        target = self._target(db, user, explicit_supersedes, semantic=semantic)
-        if target is not None and semantic and not explicit_supersedes:
-            db.execute("INSERT OR IGNORE INTO s2_revoked_actions VALUES (?, 'phase.start', ?)",
-                       (target, admission_id))
-        elif target is not None:
-            db.execute("""
-                UPDATE s2_admissions SET state = CASE
-                    WHEN state IN ('queued', 'running') THEN 'superseded' ELSE state END,
-                    intent_generation = intent_generation + 1, superseded_by = ?
-                WHERE admission_id = ?
-            """, (admission_id, target))
-        self._insert(db, admission_id, "user", event, user, at, at + ttl, fingerprint,
-                     supersedes=target, start_intent=start_intent)
-        return admission_id
-
-    def _target(self, db, user, explicit, *, semantic=False):
-        if explicit:
-            row = db.execute("""
-                SELECT admission_id FROM s2_admissions
-                WHERE user_scope = ? AND source = 'user' AND admission_id = ?
-            """, (self.scope, explicit)).fetchone()
-            return row["admission_id"] if row else None
-        cancels = literal_start_cancellation if semantic else cancels_start
-        if user.get("reply_to_proposal_id") or not user.get("utterance") or not cancels(user["utterance"]):
-            return None
-        rows = db.execute("""
-            SELECT a.admission_id, a.user_intent FROM s2_admissions AS a WHERE a.user_scope = ?
-                AND a.source = 'user' AND a.superseded_by IS NULL AND a.state IN ('queued', 'running')
-                AND (a.start_intent = 1 OR (? AND EXISTS (
-                    SELECT 1 FROM s2_calls AS c WHERE c.admission_id = a.admission_id AND c.function = 'phase.start'
-                )))
-                AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
-                    WHERE r.admission_id = a.admission_id AND r.function = 'phase.start')
-                ORDER BY a.sequence DESC LIMIT 2
-        """, (self.scope, semantic)).fetchall()
-        selected = ref_id(user.get("selected_ref"))
-        if selected:
-            rows = [row for row in rows if ref_id(json.loads(row["user_intent"]).get("selected_ref")) == selected]
-        if not rows and semantic:
-            # A pending conversational turn can choose phase.start even before
-            # its first tool call. Revoke only that function on a unique turn.
-            rows = db.execute("""
-                SELECT a.admission_id, a.user_intent, a.state FROM s2_admissions AS a
-                WHERE a.user_scope = ? AND a.source = 'user' AND a.superseded_by IS NULL
-                    AND a.state IN ('running', 'queued') AND json_extract(a.event, '$.semantic_chat') = 1
-                    AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
-                        WHERE r.admission_id = a.admission_id AND r.function = 'phase.start')
-                ORDER BY a.state = 'running' DESC, a.sequence DESC LIMIT 2
-            """, (self.scope,)).fetchall()
-            if selected:
-                rows = [row for row in rows if ref_id(json.loads(row["user_intent"]).get("selected_ref")) == selected]
-            if rows and rows[0]["state"] == "running":
-                rows = rows[:1]
-        return rows[0]["admission_id"] if len(rows) == 1 else None
 
     def supersede_direct(self, function, subject_ref, event_id, *, db=None):
+        if function != "phase.start" and subject_ref is None:
+            return
+        fence = _action_fence(function, subject_ref)
         with self.write() if db is None else nullcontext(db) as db:
             if not self._owned(db):
                 return
-            rows = db.execute("""
-                SELECT admission_id, user_intent, grants, start_intent
-                FROM s2_admissions WHERE user_scope = ? AND source = 'user'
-                AND state IN ('queued', 'running')
-            """, (self.scope,)).fetchall()
-            for row in rows:
-                grant = json.loads(row["grants"] or "{}").get(function)
-                if function == "phase.start":
-                    matching = row["start_intent"]
-                else:
-                    target = ref_id((grant or {}).get("target"))
-                    matching = target and target == subject_ref
-                if matching:
-                    db.execute("""
-                        UPDATE s2_admissions SET state = 'superseded', superseded_by = ?,
-                            intent_generation = intent_generation + 1 WHERE admission_id = ?
-                    """, (event_id, row["admission_id"]))
+            # A newer, committed button action wins for the same operation.
+            # Leave the model free to answer and take unrelated actions.
+            db.execute("""
+                INSERT OR IGNORE INTO s2_revoked_actions
+                SELECT admission_id, ?, ? FROM s2_admissions
+                WHERE user_scope = ? AND source = 'user' AND state IN ('queued', 'running')
+                    AND json_type(user_intent, '$.utterance') = 'text'
+            """, (fence, event_id, self.scope))
 
     def _queue_head(self, db):
         return db.execute("""
@@ -334,8 +281,9 @@ class AdmissionStore:
                 return None, _failure(command_id, "SUPERSEDED")
             if now < admission.created_at or admission.expires_at <= now:
                 return None, _failure(command_id, "EXPIRED_REQUEST")
-            revoked = db.execute("SELECT 1 FROM s2_revoked_actions WHERE admission_id = ? AND function = ?",
-                                 (admission.admission_id, function)).fetchone()
+            revoked = db.execute("""
+                SELECT 1 FROM s2_revoked_actions WHERE admission_id = ? AND function IN (?, ?)
+            """, (admission.admission_id, function, _call_fence(function, args))).fetchone()
             if revoked:
                 return None, _failure(command_id, "SUPERSEDED")
             grants = json.loads(row["grants"] or "{}")
@@ -471,6 +419,15 @@ class AdmissionStore:
                        (self.scope, sequence))
 
 
+def _action_fence(function, subject_ref):
+    return f"{function}:{subject_ref}" if subject_ref is not None else function
+
+
+def _call_fence(function, args):
+    target = next((ref_id(args[key]) for key in ("id", "item_id", "occurrence_id") if key in args), None)
+    return _action_fence(function, target)
+
+
 def _failure(call_id, code, *, status="rejected"):
     return {"call_id": call_id, "status": status, "error_code": code}
 
@@ -489,8 +446,9 @@ def authorize_tool(db: sqlite3.Connection, function: str, args: dict, authority:
         WHERE a.admission_id = ? AND a.user_scope = ? AND s.step_id = ?
             AND c.command_id = ? AND c.function = ? AND c.result IS NULL
             AND NOT EXISTS (SELECT 1 FROM s2_revoked_actions AS r
-                WHERE r.admission_id = a.admission_id AND r.function = c.function)
-    """, (authority.admission_id, authority.user_scope, authority.step_id, authority.call_id, function)).fetchone()
+                WHERE r.admission_id = a.admission_id AND r.function IN (c.function, ?))
+    """, (authority.admission_id, authority.user_scope, authority.step_id, authority.call_id, function,
+          _call_fence(function, args))).fetchone()
     if row is None:
         return "SUPERSEDED"
     state, generation, created_at, expires_at, grants, source, event, user, context, fingerprint = row
