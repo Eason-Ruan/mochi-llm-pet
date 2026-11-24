@@ -307,6 +307,65 @@ def test_desktop_panel_clicks_use_the_same_versioned_phase_service(tmp_path, mon
     panel.close()
 
 
+def test_desktop_review_headings_and_controls_fit_in_scroll_viewport(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtCore import QPoint, QRect
+    from PyQt6.QtWidgets import QApplication, QLabel
+
+    from deskpet.c_ui.refine_style import DetailPanel, PANEL_WIDTH
+    from deskpet.c_ui.work_panel import PhasePanel
+
+    app = QApplication.instance() or QApplication([])
+    clock = FakeClock()
+    service = PersistentWorkSessionService(path=tmp_path / "business.sqlite3", clock=clock)
+    try:
+        focus = write(service, "start").view
+        clock.advance(120)
+        assert write(service, "end", version=focus.version).status == "applied"
+        snapshot = service.snapshot_fields()
+    finally:
+        service.close()
+    panel = PhasePanel(submit=lambda *args, **kwargs: None)
+    details = DetailPanel("专注与回顾", panel, lambda: None)
+    scroll = details._scroll.verticalScrollBar()
+    viewport = details._scroll.viewport()
+
+    def visible_rect(widget):
+        return QRect(widget.mapTo(viewport, QPoint()), widget.size())
+
+    try:
+        details.show()
+        panel.render_snapshot(snapshot)
+        for width, height in ((PANEL_WIDTH, 440), (PANEL_WIDTH - 20, 285), (360, 590)):
+            details.setFixedWidth(width)
+            details.set_height_limit(height)
+            details.resize(width, height)
+            app.processEvents()
+            assert scroll.maximum() > 0
+            assert details._scroll.horizontalScrollBar().maximum() == 0
+
+            for editor, title, field in (
+                (panel.review_editor, "本轮回顾", panel.outcomes),
+                (panel.interval_editor, "修改工时归属", panel.review_intervals),
+            ):
+                heading = editor.layout().itemAt(0).widget()
+                assert isinstance(heading, QLabel) and heading.text() == title
+                assert editor.accessibleName() == title
+                scroll.setValue(heading.mapTo(panel, QPoint()).y() - 4)
+                heading_rect = visible_rect(heading)
+                field_rect = visible_rect(field)
+                assert heading_rect.bottom() < field_rect.top()
+                assert viewport.rect().contains(heading_rect) and viewport.rect().contains(field_rect)
+                assert viewport.childAt(heading_rect.center()) is heading
+
+            scroll.setValue(scroll.maximum())
+            submit = panel.buttons["reassign_interval"]
+            assert submit.isEnabled() and viewport.rect().contains(visible_rect(submit))
+    finally:
+        details.close()
+
+
 def test_disabling_issue_linkage_commits_interval_boundary_with_settings(tmp_path):
     path = tmp_path / "business.sqlite3"
     clock = FakeClock()

@@ -302,6 +302,15 @@ class MinutesSpinBox(QDoubleSpinBox):
         return self.locale().toString(value, "f", 0 if value.is_integer() else self.decimals())
 
 
+def _phase_editor_section(title):
+    section = QGroupBox()
+    section.setAccessibleName(title)
+    layout = QVBoxLayout(section)
+    # Reserve space for the heading in the same layout as the fields.
+    layout.addWidget(_text(title, size=12))
+    return section, layout
+
+
 class PhasePanel(QGroupBox):
     """The desktop timer, driven by acknowledged actions and the shared phase view."""
 
@@ -404,8 +413,7 @@ class PhasePanel(QGroupBox):
         self._button(adjust, "adjust", "调整")
         layout.addLayout(adjust)
 
-        self.review_editor = QGroupBox("本轮回顾")
-        review_layout = QVBoxLayout(self.review_editor)
+        self.review_editor, review_layout = _phase_editor_section("本轮回顾")
         self.outcomes = QTextEdit()
         self.outcomes.setAcceptRichText(False)
         self.outcomes.setPlaceholderText("实际完成的内容，每行一项")
@@ -417,8 +425,7 @@ class PhasePanel(QGroupBox):
         review_layout.addWidget(self.outcomes)
         review_layout.addWidget(self.next_steps)
         self._button(review_layout, "review", "保存回顾")
-        self.interval_editor = QGroupBox("修改工时归属")
-        interval_layout = QVBoxLayout(self.interval_editor)
+        self.interval_editor, interval_layout = _phase_editor_section("修改工时归属")
         self.review_intervals = MenuField()
         self.review_intervals.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.review_intervals.setAccessibleName("工时区间")
@@ -432,8 +439,7 @@ class PhasePanel(QGroupBox):
         review_layout.addWidget(self.interval_editor)
         layout.addWidget(self.review_editor)
 
-        self.recovery_editor = QGroupBox("补记中断时间")
-        recovery_layout = QVBoxLayout(self.recovery_editor)
+        self.recovery_editor, recovery_layout = _phase_editor_section("补记中断时间")
         recovery_layout.addWidget(label("请选择你实际专注的起止时刻。"))
         self.credit_start = QDateTimeEdit(QDateTime.currentDateTime())
         self.credit_end = QDateTimeEdit(QDateTime.currentDateTime())
