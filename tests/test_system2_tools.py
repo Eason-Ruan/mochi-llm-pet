@@ -176,11 +176,16 @@ def test_focus_offer_while_working_without_habit_task_or_available_slot(business
                "enabled_settings": {"auto_adjust": True}, "eligible_items": []}
     grants = describe_grants(None, context, requested_at=business.clock.wall_now())
     assert "proposal.offer" in grants and "pet.present" not in grants and "reminder.present" not in grants
+    business.clock.advance(16)
+    business.publish(72, "working")
     offer = business.command("proposal.offer", _offer(), "work-focus", origin="agent", snapshot=snapshot)
     assert business.tools.permit_presentation(offer.delivery_id)
     assert business.tools.validate_presentation(offer.delivery_id)
     assert business.phases.current_phase() is None
-    business.publish(72, "away")
+    business.publish(73, "working")
+    assert business.tools.validate_presentation(offer.delivery_id)
+    business.publish(74, "away")
+    business.publish(75, "working")
     assert not business.tools.validate_presentation(offer.delivery_id)
 
 

@@ -247,21 +247,26 @@ def exercise_desktop():
             for revision, answer in ((101, "accept"), (103, "amend"), (105, "reject")):
                 if revision > 101:
                     publish(revision - 1, "working", wake=False)
+                if answer == "reject":
+                    section("input")
                 publish(revision, "available")
                 wait_for(lambda: session.prompt and session.prompt.kind == "proposal"
                          and session.prompt.painted, f"visible native proposal {revision}")
                 assert active() is None
-                click(find("refine-bubble-yes"))
-                section("input")
-                button = find(f"refine-proposal-{answer}")
+                assert find("refine-bubble-yes").text() == "接受"
                 if answer == "amend":
+                    section("input")
+                    button = find("refine-proposal-amend")
                     def edit():
                         dialog = session.app.activeModalWidget()
                         dialog.findChild(QSpinBox, "proposal-edit-planned_duration_s").setValue(2100)
                         ok = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok)
                         click(ok)
                     QTimer.singleShot(50, edit)
-                click(button, session.panels["input"])
+                    click(button, session.panels["input"])
+                else:
+                    click(find("refine-bubble-yes" if answer == "accept" else "refine-bubble-no"))
+                    assert session.section == ("input" if answer == "reject" else None)
                 wait_for(lambda: not session.snapshot["system2_proposals"], f"resolved {answer}")
                 if answer == "reject":
                     assert active() is None and len(session.snapshot["phases"]) == 3

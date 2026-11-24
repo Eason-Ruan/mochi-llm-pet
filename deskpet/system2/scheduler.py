@@ -647,10 +647,19 @@ class Scheduler:
                            context_valid_until=None, observation_cursor=None, observation_generation=None) -> bool:
         with self._transaction(db) as tx:
             head = self._sync(tx, now)
-            return bool(self._matches_context(head, now, context_revision, context_valid_until,
-                                              observation_cursor, observation_generation)
-                        and head.current.state in {"working", "available"} and self._settings(tx).auto_adjust
-                        and not self.has_time_sensitive_candidate(now=now, db=tx))
+            if (head.current_status != "fresh" or not head.current or head.current.state not in {"working", "available"}
+                    or (context_valid_until is not None and now >= context_valid_until)
+                    or not self._settings(tx).auto_adjust or self.has_time_sensitive_candidate(now=now, db=tx)):
+                return False
+            if self._matches_context(head, now, context_revision, context_valid_until,
+                                     observation_cursor, observation_generation):
+                return True
+            if not observation_generation or observation_generation != head.producer_generation:
+                return False
+            return self.observation.same_published_state(
+                observation_cursor, head.publication_cursor, revision=context_revision,
+                state=head.current.state, generation=observation_generation,
+            )
 
     def authorize_pet(self, *, context_revision: int | None, now: datetime, db=None,
                       context_valid_until=None, observation_cursor=None, observation_generation=None) -> str | None:

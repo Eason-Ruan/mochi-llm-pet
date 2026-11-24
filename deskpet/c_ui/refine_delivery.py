@@ -20,6 +20,7 @@ class Prompt:
     on_answer: Callable[[bool], None] | None = None
     command: DisplayCommand | None = None
     painted: bool = False
+    direct_focus: bool = False
     siblings: tuple[DisplayCommand, ...] = ()
     preview: tuple[DisplayCommand, ...] | None = None
     delivery_id: str | None = None
@@ -84,11 +85,11 @@ class RefineDeliveryMixin:
         return bool(self.prompt and self.prompt.command and not self._closing and bubble
                     and self.pet._bubble_exposed(bubble))
 
-    def _can_show_reminder(self):
+    def _can_show_reminder(self, *, collapsed_ok=False):
         if not self.production:
             return self.pet.isVisible()
         handle = self.pet.windowHandle()
-        return (self.pet.isVisible() and self.pet._expanded and not self.pet.isMinimized()
+        return (self.pet.isVisible() and (self.pet._expanded or collapsed_ok) and not self.pet.isMinimized()
                 and bool(handle and handle.isExposed())
                 and self.presentation.lock_probe() is False)
 
@@ -244,7 +245,7 @@ class RefineDeliveryMixin:
 
         labels = None
         if item.kind == "proposal":
-            labels = ("查看", "稍后")
+            labels = ("接受", "拒绝") if item.direct_focus else ("查看", "稍后")
         elif self.production and item.command and not item.siblings:
             labels = ("好的", "关闭")
         self.pet.show_bubble(

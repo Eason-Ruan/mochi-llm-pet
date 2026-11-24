@@ -213,6 +213,10 @@ class RefineSession(RefineDeliveryMixin):
         self.pet.quit_requested.connect(self.quit)
         self._render_toolbar()
         self.pet.show()
+        if self.production and self.app.platformName() == "cocoa":
+            from .macos_desktops import MacDesktopFollower
+            from .refine_window import WIDTH, CAT_HEIGHT
+            self._desktop_follower = MacDesktopFollower(self.pet, WIDTH, CAT_HEIGHT)
 
     def _service_ready(self):
         self._system2 = self.window.worker.system2
@@ -395,7 +399,7 @@ class RefineSession(RefineDeliveryMixin):
         self.pet.set_proposal_count(len(proposals))
         if self.proposal_card.refresh(proposals):
             self.chat.refresh_proposals()
-        if self._system2 is None or self.section == "input" or not can_show:
+        if self._system2 is None or not self._can_show_reminder(collapsed_ok=True):
             return
         indexed = {proposal["id"]: proposal for proposal in proposals}
         queued = {item.delivery_id for item in self.waiting_prompts if item.delivery_id}
@@ -407,10 +411,13 @@ class RefineSession(RefineDeliveryMixin):
             if (delivery_id in self._presented_proposals or delivery_id in queued or not proposal
                     or delivery["proposal_version"] != proposal["version"]):
                 continue
-            self.waiting_prompts.append(self._proposal_prompt(delivery, proposal))
+            prompt = self._proposal_prompt(delivery, proposal)
+            if prompt.direct_focus or (can_show and self.section != "input"):
+                self.waiting_prompts.append(prompt)
         if self.prompt is None:
             self._show_next_prompt()
-        self._render_pet_intents(snapshot)
+        if can_show and self.section != "input":
+            self._render_pet_intents(snapshot)
 
     def _proposal_prompt(self, delivery, proposal):
         delivery_id = delivery["delivery_id"]
@@ -420,8 +427,14 @@ class RefineSession(RefineDeliveryMixin):
         permitted = False
         generation = delivery["presentation_generation"]
 
+        direct_focus = (proposal["function"] in {"phase.adjust", "phase.pause", "phase.resume"}
+                        or (proposal["function"] == "phase.start" and proposal["args"].get("kind", "focus") == "focus"))
+
         def current():
-            return (self._can_show_reminder() and self.section != "input" and self.presentation.now() < deadline
+            visible_until = (datetime.fromisoformat(proposal["valid_until"])
+                             if delivery_id in self._presented_proposals else deadline)
+            return (self._can_show_reminder(collapsed_ok=direct_focus) and (direct_focus or self.section != "input")
+                    and self.presentation.now() < visible_until
                     and any((item["id"], item["version"]) == (proposal["id"], proposal["version"])
                             for item in self.snapshot.get("system2_proposals", ())))
 
@@ -450,12 +463,16 @@ class RefineSession(RefineDeliveryMixin):
             return result
 
         def open_proposal(yes):
-            if yes and current():
+            if not current():
+                return
+            if direct_focus:
+                self._resolve_proposal(proposal, "accept" if yes else "reject", None)
+            elif yes:
                 self.proposal_card.select(proposal["id"])
                 self._show_section("input")
 
         return Prompt("proposal", proposal["display_text"], open_proposal,
-                      delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted)
+                      delivery_id=delivery_id, valid=current, before_paint=permit, on_painted=painted, direct_focus=direct_focus)
 
     def _render_pet_intents(self, snapshot):
         if self.prompt is not None or self.pet._press is not None:

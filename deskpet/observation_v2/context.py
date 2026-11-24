@@ -806,6 +806,20 @@ class ObservationContextReader:
                 self._latest_read = token, at, monotonic_s
         return RealtimeHead(observation, "fresh", cursor, generation)
 
+    def same_published_state(self, first, last, *, revision, state, generation):
+        """Check the entire publication interval, including away-and-back transitions."""
+        with self._snapshot(realtime=True) as db:
+            if db is None or first is None or last is None or first >= last:
+                return False
+            head = db.execute("SELECT generation, publication_cursor FROM realtime_observation_head").fetchone()
+            if not head or tuple(head) != (generation, last):
+                return False
+            count, different, original = db.execute("""
+                SELECT count(*), sum(state != ?), max(CASE WHEN observation_id=? THEN context_revision END)
+                FROM effective_observations WHERE observation_id BETWEEN ? AND ?
+                """, (state, first, first, last)).fetchone()
+            return count == last - first + 1 and not different and original == revision
+
     def read_realtime_head(
         self, as_of: datetime | None = None, *, monotonic_s: float | None = None,
         policy_generation: int | None = None,

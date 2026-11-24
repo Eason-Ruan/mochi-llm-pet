@@ -713,7 +713,7 @@ class System2ToolExecutor:
                 return _rejected(call_id, "STALE_TASK")
         payload.pop("expected_version", None)
         opportunity = self.scheduler.get_opportunity(db=db)
-        if authority.opportunity_id and authority.opportunity_id != opportunity:
+        if not function.startswith("phase.") and authority.opportunity_id and authority.opportunity_id != opportunity:
             return _rejected(call_id, "STALE_CONTEXT")
         active = self.phases.current_phase_in_transaction(db)
         if function == "phase.start" and active and active.state in ("running", "paused"):
@@ -760,8 +760,9 @@ class System2ToolExecutor:
     def _queue_proposal(self, db, scope, proposal, authority, now, opportunity):
         if authority.origin == "user" or authority.context_revision is None:
             return None
-        valid_until = min(proposal.valid_until, authority.expires_at,
-                          authority.observation_valid_until or authority.expires_at)
+        valid_until = min(proposal.valid_until, authority.expires_at)
+        if not proposal.function.startswith("phase.") and authority.observation_valid_until:
+            valid_until = min(valid_until, authority.observation_valid_until)
         if valid_until <= now:
             return None
         bounds = {"context_revision": authority.context_revision, "context_valid_until": valid_until,
