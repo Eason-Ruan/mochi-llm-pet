@@ -13,6 +13,7 @@ ACTIVITY_POLL_S = 1.5
 FOREGROUND_SETTLE_S = 3.0
 UPLOAD_INTERVAL_S = 30.0
 VISUAL_REVIEW_S = 120.0
+FOCUS_VIDEO_REVIEW_S = 45.0
 _THUMBNAIL_SIZE = (96, 54)
 _VIDEO_APPS = frozenset({
     "iina", "movies & tv", "mpv", "quicktime player", "vlc", "vlc media player", "windows media player", "wmplayer",
@@ -52,6 +53,7 @@ class CaptureSchedule:
         self.stable_since_s = 0.0
         self.next_probe_s = float("inf")
         self.review_s = float("inf")
+        self.focus_video_review_s = float("-inf")
         self.soon_s = float("inf")
         self.soon_used = False
         self.latest: bytes | None = None
@@ -71,6 +73,7 @@ class CaptureSchedule:
         self.moving = 0
         self.soon_s = float("inf")
         self.next_probe_s = self.review_s = monotonic_s + FOREGROUND_SETTLE_S
+        self.focus_video_review_s = self.next_probe_s
 
     def due(self, monotonic_s: float, *, interactive: bool) -> bool:
         if self.identity is None:
@@ -79,7 +82,12 @@ class CaptureSchedule:
             return False
         return (interactive and not self.video) or monotonic_s >= min(self.soon_s, self.review_s)
 
-    def inspect(self, thumbnail: bytes, monotonic_s: float) -> bool:
+    def focus_video_review_due(self, monotonic_s: float, *, observed_video: bool) -> bool:
+        return (self.video or observed_video) and monotonic_s >= max(
+            self.focus_video_review_s, self.last_upload_s + FOCUS_VIDEO_REVIEW_S,
+        )
+
+    def inspect(self, thumbnail: bytes, monotonic_s: float, *, focus_video_review: bool = False) -> bool:
         """Admit the first settled foreground, then look for materially new frames."""
         previous, self.latest = self.latest, thumbnail
         self.next_probe_s = monotonic_s + ACTIVITY_POLL_S
@@ -92,6 +100,10 @@ class CaptureSchedule:
             self.review_s = self.next_probe_s
             return False
         prior_upload = self.uploaded.get(self.window)
+        if focus_video_review:
+            # A materially changed playback frame can supply fresh evidence even while it is moving.
+            self.focus_video_review_s = monotonic_s + FOCUS_VIDEO_REVIEW_S
+            return prior_upload is None or materially_different(prior_upload, thumbnail)
         if self.video and (previous is None or moving):
             # A known video can leave the same window. Look for a settled view
             # in a bounded local check before making another request.
@@ -110,6 +122,7 @@ class CaptureSchedule:
     def defer_probe(self, monotonic_s: float) -> None:
         self.latest = None
         self.next_probe_s = self.review_s = monotonic_s + UPLOAD_INTERVAL_S
+        self.focus_video_review_s = self.next_probe_s
 
     def sent(self, monotonic_s: float) -> None:
         self.last_upload_s = monotonic_s

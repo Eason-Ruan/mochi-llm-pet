@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from getpass import getpass
@@ -124,13 +124,15 @@ def _manage_cloud(arguments: argparse.Namespace) -> None:
 
 def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
     from deskpet.settings import OBSERVATION_POLICY_READ_TIMEOUT_S, SettingsStore
+    from deskpet.system2.semantic_policy import semantic_background_enabled
 
-    def preferences():
+    def preferences(*, db=None):
         if stop_event is not None and stop_event.is_set():
             return None
         try:
             settings = SettingsStore.read_at(
                 arguments.cloud_settings, user_scope=arguments.user_scope, timeout=OBSERVATION_POLICY_READ_TIMEOUT_S,
+                db=db,
             )
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             return None
@@ -156,6 +158,21 @@ def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
             return None
         return settings.observation_generation
 
+    def focus_video_review() -> bool:
+        target = arguments.cloud_settings.expanduser().resolve()
+        try:
+            with closing(sqlite3.connect(
+                target.as_uri() + "?mode=ro", uri=True, timeout=OBSERVATION_POLICY_READ_TIMEOUT_S,
+            )) as db:
+                db.execute("BEGIN")
+                settings = preferences(db=db)
+                return bool(settings and settings.auto_adjust and settings.observation_screenshots and db.execute("""
+                    SELECT 1 FROM phase_views WHERE active=1
+                    AND json_extract(view, '$.kind')='focus' AND json_extract(view, '$.state')='running'
+                """).fetchone())
+        except (OSError, ValueError, sqlite3.Error):
+            return False
+
     preferences_at_start = preferences()
     if preferences_at_start is None:
         raise ValueError("Could not confirm the desktop Observation policy")
@@ -163,7 +180,7 @@ def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
         arguments.observation_generation = preferences_at_start.observation_generation
     return (
         request_policy, capture_policy, preferences_at_start.document_local_sources,
-        preferences_at_start.observation_screen_scope,
+        preferences_at_start.observation_screen_scope, focus_video_review if semantic_background_enabled() else None,
     )
 
 
@@ -244,7 +261,7 @@ def main(*, stop_event: Event | None = None) -> None:
         except (OSError, ValueError, sqlite3.Error) as exc:
             parser.exit(2, f"Could not read Observation context ({exc}).\n")
         return
-    request_policy = capture_policy = None
+    request_policy = capture_policy = focus_video_review = None
     document_local_sources = ()
     screen_scope = "foreground_window"
     split_models = arguments.mode == "replay" and not arguments.multimodal
@@ -265,7 +282,7 @@ def main(*, stop_event: Event | None = None) -> None:
             if arguments.cloud_settings is None:
                 parser.error("--capture-screen-from-settings requires --cloud-settings")
             try:
-                request_policy, capture_policy, document_local_sources, screen_scope = _desktop_policies(
+                request_policy, capture_policy, document_local_sources, screen_scope, focus_video_review = _desktop_policies(
                     arguments, stop_event,
                 )
             except ValueError as exc:
@@ -330,7 +347,7 @@ def main(*, stop_event: Event | None = None) -> None:
                 report = run_live_multimodal(
                     arguments.database, vision, observer=observer, screen_scope=screen_scope,
                     document_local_sources=document_local_sources, close_vision=vision_runtime.close,
-                    **live_options,
+                    focus_video_review=focus_video_review, **live_options,
                 )
     except FileExistsError:
         parser.exit(2, "Observation database already exists. Choose a new path.\n")

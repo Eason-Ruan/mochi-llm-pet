@@ -835,6 +835,39 @@ def test_known_video_source_has_first_sample_and_rechecks_based_on_scene(
     assert captures[1] == EPOCH + timedelta(seconds=124.5 if confirmed_video else 42)
 
 
+@pytest.mark.parametrize("moving,focus_ends_at,expected", [
+    (True, 110, [3, 48, 93]),
+    (True, 70, [3, 48]),
+    (True, 43, [3]),
+    (False, 110, [3]),
+])
+def test_video_playback_supplies_bounded_fresh_captures_during_focus(
+    tmp_path, monkeypatch, moving, focus_ends_at, expected,
+):
+    class VideoVision(Vision):
+        def complete(self, **kwargs):
+            result = super().complete(**kwargs)
+            return result | {"screen_kind": "video", "activity_kind": "leisure", "scene_elements": ["video player"]}
+
+    frames = [_frame(area=(x, 100, x + 300, 420)) for x in (0, 160, 320, 480)]
+    runtime = FakeRuntime(
+        monkeypatch, metadata=lambda _: {"app_name": "Windows Media Player", "idle_s": 20},
+        jpeg=lambda at: frames[int(at / 1.5) % len(frames)] if moving else frames[0],
+    )
+    vision = VideoVision()
+    database = tmp_path / "desktop.sqlite"
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=106, capture_screen=True, focus_video_review=lambda: runtime.elapsed < focus_ends_at,
+    )
+
+    assert report["visual_attempts"] == len(vision.calls) == len(expected)
+    with sqlite3.connect(database) as db:
+        captures = db.execute("SELECT captured_at, status, realtime_eligible FROM screen_observations ORDER BY captured_at")
+        assert [(datetime.fromisoformat(at), status, eligible) for at, status, eligible in captures] == [
+            (EPOCH + timedelta(seconds=seconds), "ready", 1) for seconds in expected
+        ]
+
+
 def test_multimodal_replay_runs_adaptive_picker_and_leaves_native_signals_unknown(tmp_path, monkeypatch):
     frames = tuple(media.Frame(second, _frame()) for second in range(0, 61, 3))
     monkeypatch.setattr(pipeline, "recording_frames", lambda *_args, **_kwargs: frames)

@@ -26,6 +26,7 @@ _GAP = timedelta(seconds=45)
 _RECENT_LIMIT = 3
 _SEGMENT_LIMIT = 8
 _KEEP_LATEST = 4
+VISUAL_OBSERVATION_LIMIT = 4
 CurrentStatus = Literal["fresh", "expired", "context_changed", "no_data"]
 _STATES = ("working", "available", "away", "unknown")
 CAPTURE_HEALTH_STATUSES = {"ready", "skipped", "source_restricted", "capture_failed", "model_failed", "filtered"}
@@ -71,6 +72,7 @@ class ActivityDetail:
     visual: bool = False
     hidden: bool = False
     capture_id: str | None = None
+    screen_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -248,13 +250,16 @@ def _activity_history(details: tuple[ActivityDetail, ...], *, retained: tuple[Ac
         visual_changed = detail.visual and previous_visual is not None and (
             set(previous_visual.scene_elements) != set(detail.scene_elements)
             or previous_visual.activity_kind != detail.activity_kind
+            or previous_visual.screen_kind != detail.screen_kind
+            or ((previous_visual.late or detail.late) and previous_visual.summary != detail.summary)
         )
         if (previous is None or gap or previous.activity_id != detail.activity_id
                 or visual_changed or previous.document_name != detail.document_name):
             segment = _detail_projection(detail, share_summary=share_summary, document_sources=document_sources,
                                          include_document_source=include_document_source)
             segment.pop("observed_at")
-            segments.append(dict(segment, first_observed_at=timestamp, last_observed_at=timestamp, sample_count=1))
+            segment.update(first_observed_at=timestamp, last_observed_at=timestamp, sample_count=1)
+            segments.append(segment)
             previous_visual = None
         else:
             segment = segments[-1]
@@ -272,7 +277,18 @@ def _activity_history(details: tuple[ActivityDetail, ...], *, retained: tuple[Ac
         if share_summary and detail.visible_changes:
             segments[-1]["change_observed_at"] = timestamp
         if share_summary and detail.visual:
-            segments[-1]["scene_observed_at"] = timestamp
+            segment["scene_observed_at"] = timestamp
+            if detail.capture_id is not None and not detail.late:
+                # Keep each ready capture's evidence paired with its own time.
+                observations = segment.setdefault("visual_observations", [])
+                if not observations or observations[-1]["observed_at"] != timestamp:
+                    observations.append({
+                        "observed_at": timestamp,
+                        "activity_kind": detail.activity_kind if detail.activity_kind in _KINDS else "unknown",
+                        "summary": detail.summary,
+                        "scene_elements": list(detail.scene_elements),
+                    })
+                    del observations[:-VISUAL_OBSERVATION_LIMIT]
         if detail.document_change_at is not None and "document_name" in segments[-1]:
             segments[-1]["document_change"] = {"type": "unsaved_changes_appeared",
                                                "observed_at": detail.document_change_at.isoformat()}
@@ -571,7 +587,7 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
                 scene_elements=elements, visible_changes=changes,
                 late=_row_value(frame, "realtime_eligible") == 0,
                 document_change_at=change if change is not None and change <= captured_at else None,
-                visual=True, capture_id=frame["capture_id"],
+                visual=True, capture_id=frame["capture_id"], screen_kind=frame["screen_kind"],
             )
             details.append(detail)
         if sampled is not None and max(started, since, latest_capture or started, change or started) < sampled <= until:

@@ -19,6 +19,7 @@ from deskpet.observation_v2.desktop import DesktopObserver
 from deskpet.observation_v2.pipeline import ObservationStore
 from deskpet.observation_v2.state import Observation
 from deskpet.settings import SettingsStore
+from deskpet.work_sessions.models import PhaseCommand
 
 
 @pytest.mark.parametrize("locked_database", ["business", "observation"])
@@ -203,7 +204,7 @@ def test_observation_policy_waits_for_a_short_business_write(tmp_path, monkeypat
         observation_generation=current.observation_generation,
         browser_metadata=False, exclude_app=(), exclude_domain=(),
     )
-    request_policy, capture_policy, _, _ = _desktop_policies(args, stop)
+    request_policy, capture_policy, _, _, _ = _desktop_policies(args, stop)
 
     def start_reader(pool, read):
         started = Event()
@@ -241,6 +242,35 @@ def test_observation_policy_waits_for_a_short_business_write(tmp_path, monkeypat
         stop.set()
         writer.rollback()
         assert request.result(timeout=1) is None
+
+
+def test_managed_video_review_requires_opt_in_and_running_focus(tmp_path, monkeypatch):
+    from deskpet.observation_v2.__main__ import _desktop_policies
+
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1")
+    path = tmp_path / "business.sqlite3"
+    env = build_environment(profile="realtime", phase_database=path)
+    store = SettingsStore(path)
+    settings = store.update(expected_version=store.read().version, observation_screenshots=True)
+    stop = Event()
+    args = SimpleNamespace(
+        cloud_settings=path, user_scope=store.user_scope, observation_generation=settings.observation_generation,
+        browser_metadata=False, exclude_app=(), exclude_domain=(),
+    )
+    *_, review = _desktop_policies(args, stop)
+    assert not review()
+    started = env.sessions.apply_phase(PhaseCommand(command_id="start", phase_id="focus", kind="start")).view
+    assert started is not None and not review()
+    store.update(expected_version=settings.version, auto_adjust=True)
+    assert review()
+    paused = env.sessions.apply_phase(PhaseCommand(command_id="pause", phase_id="focus", kind="pause",
+                                                    expected_version=started.version)).view
+    assert paused is not None and paused.state == "paused" and not review()
+    resumed = env.sessions.apply_phase(PhaseCommand(command_id="resume", phase_id="focus", kind="resume",
+                                                     expected_version=paused.version)).view
+    assert resumed is not None and review()
+    stop.set()
+    assert not review()
 
 
 @pytest.mark.parametrize("scope", ["all_displays", "all_displays_unfiltered"])

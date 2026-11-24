@@ -862,7 +862,7 @@ def run_live_multimodal(
     document_local_sources: tuple[str, ...] = (), stop_event: Event | None = None,
     capture_policy: Callable[[], int | None] | None = None,
     producer_policy: Callable[[], int | None] | None = None, policy_generation: int | None = None,
-    close_vision: Callable[[], None] | None = None,
+    close_vision: Callable[[], None] | None = None, focus_video_review: Callable[[], bool] | None = None,
 ) -> dict:
     """Publish a local desk state and sample stable, materially changed views."""
     from .activity import _app_excluded, _domain_excluded, _excluded_app_rules, _excluded_domain_rules, _page_domain
@@ -1102,7 +1102,16 @@ def run_live_multimodal(
             window = ((sample.session_id, "foreground_unattributed") if context_only else
                       (sample.session_id, sample.app_id or sample.app_name, sample.window_id))
             schedule.observe(window if context_only else foreground_activity_id, sample.monotonic_s, window=window)
-            if job is not None or not schedule.due(sample.monotonic_s, interactive=sample.idle_s is not None and sample.idle_s < 5):
+            if job is not None:
+                return
+            review_video = (focus_video_review is not None and not context_only
+                            and schedule.focus_video_review_due(
+                                sample.monotonic_s,
+                                observed_video=visual is not None and visual.screen.screen_kind == "video",
+                            ) and focus_video_review())
+            if not review_video and not schedule.due(
+                sample.monotonic_s, interactive=sample.idle_s is not None and sample.idle_s < 5,
+            ):
                 return
 
             def permitted() -> bool:
@@ -1177,7 +1186,7 @@ def run_live_multimodal(
                 return
             assert activity is not None and thumbnail is not None
             now = time.monotonic()
-            if not schedule.inspect(thumbnail, now):
+            if not schedule.inspect(thumbnail, now, focus_video_review=review_video):
                 store.save_capture_health("skipped", acquired_at, reason="waiting_for_visual_change",
                                           preserve_status=visual is not None)
                 return

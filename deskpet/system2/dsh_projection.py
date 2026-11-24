@@ -6,7 +6,9 @@ from datetime import datetime
 import math
 
 from deskpet.contracts.models import REMINDER_TIMING_CONTEXT_LIMIT
-from deskpet.observation_v2.context import CAPTURE_HEALTH_REASONS, CAPTURE_HEALTH_STATUSES, CAPTURE_HEALTH_TIMES
+from deskpet.observation_v2.context import (
+    CAPTURE_HEALTH_REASONS, CAPTURE_HEALTH_STATUSES, CAPTURE_HEALTH_TIMES, VISUAL_OBSERVATION_LIMIT,
+)
 from deskpet.observation_v2.documents import document_source_allowed, sanitize_document_name
 from deskpet.observation_v2.state import _KINDS, _REASONS
 from deskpet.observation_v2.vision import validated_scene_elements, validated_visible_changes
@@ -32,7 +34,8 @@ _PRIVATE_FIELDS = {
     "previous_foreground", "credential_ref", "api_key", "authorization", "notes", "note",
     "description", "timing_context", "review", "confirmed_outcomes", "next_steps", "password", "access_token",
     "document_name", "document_source", "document_local_sources", "document_cloud_sources", "document_change",
-    "scene_elements", "visible_changes", "current_context", "last_observed_activity", "history_1h", "capture_health",
+    "scene_elements", "visible_changes", "visual_observations", "current_context", "last_observed_activity",
+    "history_1h", "capture_health",
 }
 
 
@@ -127,6 +130,23 @@ def _document_detail(value: dict, *, share: bool, document_sources: tuple[str, .
             if (isinstance(change, dict) and change.get("type") == "unsaved_changes_appeared"
                     and (observed_at := _stamp(change.get("observed_at")))):
                 result["document_change"] = {"type": "unsaved_changes_appeared", "observed_at": observed_at}
+    return result
+
+
+def _activity_segment(value: dict, *, share: bool, document_sources: tuple[str, ...]) -> dict:
+    result = {**_segment(value, share=False), **_document_detail(value, share=share, document_sources=document_sources)}
+    if share:
+        captures = {}
+        for item in _items(value.get("visual_observations"), VISUAL_OBSERVATION_LIMIT):
+            if (stamp := _stamp(item.get("observed_at"))) and stamp not in captures:
+                captures[stamp] = {
+                    "observed_at": stamp,
+                    "activity_kind": _enum(item.get("activity_kind"), _KINDS, "unknown"),
+                    "summary": _summary(item.get("summary")),
+                    "scene_elements": list(validated_scene_elements(item.get("scene_elements"))),
+                }
+        if captures:
+            result["visual_observations"] = list(captures.values())
     return result
 
 
@@ -268,8 +288,7 @@ def project_context(value: dict, *, share: bool, document_sources: tuple[str, ..
                 result["history"].pop(key, None)
         result["history_1h"] = {
             "from_at": _stamp(hour.get("from_at")), "to_at": _stamp(hour.get("to_at")),
-            "segments": [{**_segment(item, share=False),
-                          **_document_detail(item, share=share, document_sources=document_sources)}
+            "segments": [_activity_segment(item, share=share, document_sources=document_sources)
                          for item in hour_segments],
             "gaps": _gap_projection(hour),
         }

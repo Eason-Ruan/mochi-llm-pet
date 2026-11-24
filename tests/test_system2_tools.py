@@ -190,6 +190,35 @@ def test_focus_offer_while_working_without_habit_task_or_available_slot(business
     assert not business.tools.validate_presentation(offer.delivery_id)
 
 
+@pytest.mark.parametrize("answer,expected_state", [("reject", "running"), ("accept", "paused")])
+def test_background_pause_card_changes_focus_only_on_acceptance(business, answer, expected_state):
+    business.auto_adjust()
+    focus = business.command("phase.start", {"kind": "focus", "planned_duration_s": 900}, "focus")
+    target = {"id": focus.view["id"], "expected_version": focus.actual_version}
+    snapshot = business.publish(71, "working")
+
+    assert business.command(
+        "phase.pause", target, "direct-background-pause", origin="agent", snapshot=snapshot,
+    ).error_code == "NEEDS_CONFIRMATION"
+    offer = business.command("proposal.offer", {
+        "function": "phase.pause", "args": target, "display_text": "要暂停这轮专注吗？",
+        "presentation": {"level": "actionable", "channel": "pet_card", "sound": False},
+    }, "pause-offer", origin="agent", snapshot=snapshot, versions={f"phase:{target['id']}": target["expected_version"]})
+    assert offer.status == "pending" and offer.delivery_id, offer
+    delivery, = business.tools.pending_presentations()
+    assert delivery["channel"] == "pet_card" and not delivery["request_sound"]
+    assert business.tools.permit_presentation(offer.delivery_id)
+    assert business.tools.ack_presentation(offer.delivery_id, displayed=True)
+    assert business.phases.current_phase().state == "running"
+
+    response = business.command("proposal.resolve", {
+        "id": offer.view["id"], "answer": answer, "expected_version": offer.actual_version,
+    }, "pause-answer")
+    assert response.status == "applied"
+    current = business.phases.current_phase()
+    assert current.id == target["id"] and current.state == expected_state
+
+
 def test_focus_refusal_survives_restart_until_proposal_expires(business):
     business.auto_adjust()
     snapshot = business.publish(71)

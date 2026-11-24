@@ -219,6 +219,89 @@ def test_scene_visual_outlives_history_range_while_sampler_is_current(tmp_path):
         assert reader.read_current(wall)[0].visual_capture_id == "retained"
 
 
+def test_activity_history_keeps_distinct_visual_times_under_existing_sharing_controls(tmp_path):
+    path = tmp_path / "live.sqlite"
+    reader = ObservationContextReader(path, boot_id="test-boot")
+
+    def at(seconds):
+        return NOW + timedelta(seconds=seconds)
+
+    with ObservationStore(path, live=True, boot_id="test-boot") as store:
+        store.begin_live_run(NOW, monotonic_s=0, policy_generation=9)
+        recorder = ActivityRecorder(store, document_local_sources=("app:vscode",), on_sample_write=
+                                    lambda sample, activity, _boundary, _changed: store._record_live_sample(
+                                        sample.observed_at, sample.monotonic_s, sample=sample, activity=activity))
+
+        def observe(seconds, *, locked=False):
+            recorder.observe(ActivitySample(at(seconds), seconds, app_name="Visual Studio Code", window_id=1,
+                                            window_title="notes.py — Visual Studio Code", screen_locked=locked))
+
+        def save_capture(seconds, *, suffix="", kind="ide", late=False, summary=None):
+            store.save_screen(MultimodalScreenObservation(
+                f"capture-{seconds}{suffix}", recorder.current_activity.activity_id, at(seconds), "ready", "fixture",
+                kind, activity_kind="work", scene_elements=("code editor",), screen_summary=summary,
+                unfiltered_desktop=summary is not None,
+            ), processed_at=at(seconds), realtime_eligible=not late)
+
+        summaries = {30: "The editor shows a work document.", 60: "The user is browsing a gaming article."}
+        for seconds in range(122):
+            observe(seconds)
+            if seconds % 30 == 0:
+                save_capture(seconds, summary=summaries.get(seconds))
+            if seconds == 90:
+                save_capture(seconds, suffix="-same-time")
+            if seconds == 105:
+                save_capture(seconds, late=True)
+        for seconds in (10, 40, 70, 100):
+            publish(store, seconds)
+        store.save_observation(Observation(
+            "work", "working", None, ("screen_context",), at(121), None, 2, visual_capture_id="capture-120",
+        ), published_at=at(121), monotonic_s=121)
+
+        context = reader.read_realtime_context(at(121), monotonic_s=121, policy_generation=9)
+        view = project_observation_context(context, share_summary=True)
+        segment, = view["history_1h"]["segments"]
+        visual_times = [at(seconds).isoformat() for seconds in (30, 60, 90, 120)]
+        captures = segment["visual_observations"]
+        assert [capture["observed_at"] for capture in captures] == visual_times
+        assert [capture["summary"] for capture in captures] == [
+            summaries[30], summaries[60], "The visible interface includes code editor.",
+            "The visible interface includes code editor.",
+        ]
+        assert all(capture["activity_kind"] == "work" and capture["scene_elements"] == ["code editor"]
+                   for capture in captures)
+        assert segment["last_observed_at"] == at(121).isoformat()
+        assert segment["sample_count"] == 8
+        assert view["last_observed_activity"]["relation"] == "current"
+        assert view["last_observed_activity"]["scene_observed_at"] == visual_times[-1]
+        assert project_context(view, share=True)["history_1h"]["segments"][0]["visual_observations"] == captures
+        assert "visual_observations" not in str(project_context(view, share=False))
+        assert "visual_observations" not in str(project_observation_context(context))
+        assert "visual_observations" not in str(project_observation_context(
+            context, share_summary=True, excluded_apps=("visual studio code",),
+        ))
+
+        observe(122)
+        save_capture(122, kind="browser")
+        observe(123, locked=True)
+        locked = project_observation_context(reader.read_observation_context(at(123)), share_summary=True)
+        assert "visual_observations" not in str(locked)
+        observe(124)
+        save_capture(124, kind="browser")
+        observe(125)
+        late_summary = "A training video is visible."
+        save_capture(125, kind="browser", late=True, summary=late_summary)
+        observe(126)
+        save_capture(126, kind="browser")
+        after_gap = reader.read_observation_context(at(126)).to_dict()["history_1h"]
+        assert after_gap["gaps"] == [{"last_observed_at": at(122).isoformat(), "next_observed_at": at(124).isoformat()}]
+        assert after_gap["segments"][3]["summary"] == late_summary
+        assert [[capture["observed_at"] for capture in part.get("visual_observations", ())]
+                for part in after_gap["segments"]] == [
+            visual_times, [at(122).isoformat()], [at(124).isoformat()], [], [at(126).isoformat()],
+        ]
+
+
 def test_document_history_stays_timed_and_separate_from_interruptibility(tmp_path):
     path = tmp_path / "live.sqlite"
     reader = ObservationContextReader(path, boot_id="test-boot")
