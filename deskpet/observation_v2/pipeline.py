@@ -809,20 +809,25 @@ class _MultimodalJob:
 def run_live_multimodal(
     database: Path, vision: ScreenModel, *, duration_s: float | None,
     observer: StateObserver | None = None, capture_screen: bool | Callable[[], bool] = False,
+    screen_scope: str = "foreground_window",
     browser_metadata: bool = False, model_interval_s: float = LIVE_UPDATE_INTERVAL_S,
     excluded_apps: tuple[str, ...] = (), excluded_domains: tuple[str, ...] = (),
     document_local_sources: tuple[str, ...] = (), stop_event: Event | None = None,
     capture_policy: Callable[[], int | None] | None = None,
     producer_policy: Callable[[], int | None] | None = None, policy_generation: int | None = None,
 ) -> dict:
-    """Publish a local desk state and sample only stable, materially changed windows."""
-    from .media import capture_window, cloud_window_eligible
+    """Publish a local desk state and sample stable, materially changed views."""
+    from .media import DesktopCaptureRestricted, capture_filtered_desktop, capture_window, cloud_window_eligible
     from .openai_cloud import LOCAL_CAPTURE, prepare_vision_capture
     from .vision import VisionSignals, analyze_multimodal
 
     if (not math.isfinite(model_interval_s) or model_interval_s <= 0
             or duration_s is not None and (not math.isfinite(duration_s) or duration_s <= 0)):
         raise ValueError("Live duration and update interval must be positive and finite")
+    if screen_scope not in ("foreground_window", "all_displays"):
+        raise ValueError("Invalid live screen scope")
+    all_displays = screen_scope == "all_displays"
+    protected_foreground_reasons = {"privacy_excluded", "private_window", "browser_url_unavailable", "mochi_foreground"}
 
     def capture_stamp() -> int | None:
         try:
@@ -851,6 +856,7 @@ def run_live_multimodal(
     activity_floor = None
     activity_id = None
     last_sample = None
+    last_desktop_identity = None
     latest = None
     visual = None
     previous_visual = None
@@ -905,6 +911,13 @@ def run_live_multimodal(
             on_sample_write=record_sample, reset_wall_on_rollback=True,
         )
 
+        def observe_sample(sample: ActivitySample) -> None:
+            nonlocal last_desktop_identity
+            if all_displays:
+                # Only an in-memory comparison is needed to revoke a stale frame.
+                last_desktop_identity = sha256(repr(_desktop_identity(sample)).encode(errors="replace")).digest()
+            recorder.observe(sample)
+
         def activities_at(at: datetime) -> list:
             since = at - timedelta(seconds=observer.window_seconds)
             while metrics and metrics[0]["started_at"] < since:
@@ -948,21 +961,38 @@ def run_live_multimodal(
                 outcomes[outcome] += 1
 
         def acquire(sample: ActivitySample) -> None:
-            nonlocal immediate_update, job, uploads
+            nonlocal immediate_update, job, uploads, visual, previous_visual
             activity = recorder.current_activity
             stamp = capture_stamp()
-            if stamp is None or not recorder.capture_eligible or not cloud_window_eligible(
+            restriction = recorder.capture_ineligibility
+            foreground_excluded = False
+            context_only = False
+            if all_displays:
+                if sampler.platform != "darwin":
+                    restriction = "filtered_desktop_unavailable"
+                elif sample.screen_locked is False:
+                    foreground_excluded = restriction in protected_foreground_reasons
+                    context_only = foreground_excluded or restriction == "foreground_unavailable"
+                    if context_only:
+                        restriction = None
+            elif not cloud_window_eligible(
                 sample, browser_url_required=bool(excluded_domains), platform=sampler.platform,
-            ) or activity is None:
+            ):
+                restriction = restriction or "window_unavailable"
+            if stamp is None or restriction is not None or (activity is None and not context_only):
                 schedule.observe(None, sample.monotonic_s)
                 store.save_capture_health(
                     "skipped" if stamp is None else "source_restricted", sample.observed_at,
-                    reason="capture_disabled" if stamp is None else recorder.capture_ineligibility or "window_unavailable",
+                    reason="capture_disabled" if stamp is None else restriction or "foreground_unavailable",
                 )
                 return
-            video_hint = known_video_source(sample.app_name, sample.window_title, activity.domain)
-            window = (sample.session_id, sample.app_id or sample.app_name, sample.window_id)
-            schedule.observe(activity.activity_id, sample.monotonic_s, window=window)
+            video_hint = not context_only and activity is not None and known_video_source(
+                sample.app_name, sample.window_title, activity.domain,
+            )
+            foreground_activity_id = activity.activity_id if activity is not None else None
+            window = ((sample.session_id, "foreground_unattributed") if context_only else
+                      (sample.session_id, sample.app_id or sample.app_name, sample.window_id))
+            schedule.observe(window if context_only else foreground_activity_id, sample.monotonic_s, window=window)
             if job is not None or not schedule.due(sample.monotonic_s, interactive=sample.idle_s is not None and sample.idle_s < 5):
                 return
 
@@ -973,20 +1003,28 @@ def run_live_multimodal(
             if grant is None or not permitted():
                 store.save_capture_health("source_restricted", sample.observed_at, reason="recipient_unavailable")
                 return
+            failure = None
             try:
-                acquired_at, image = capture_window(sample, platform=sampler.platform)
-                thumbnail = frame_thumbnail(image)
+                if all_displays:
+                    desktop = capture_filtered_desktop(
+                        sample, platform=sampler.platform, excluded_apps=excluded_apps, excluded_domains=excluded_domains,
+                        foreground_excluded=foreground_excluded,
+                    )
+                    acquired_at, image = desktop.captured_at, desktop.jpeg
+                    context_only = context_only or desktop.foreground_excluded
+                else:
+                    acquired_at, image = capture_window(sample, platform=sampler.platform)
+                thumbnail = None if context_only else frame_thumbnail(image)
+            except DesktopCaptureRestricted as exc:
+                failure = ("source_restricted", exc.reason)
             except (OSError, RuntimeError, ValueError):
-                schedule.probe_failed(sample.monotonic_s)
-                store.set_capture_status(activity.activity_id, "failed")
-                store.save_capture_health("capture_failed", sample.observed_at)
-                return
+                failure = ("capture_failed", None)
 
             after = sampler.sample()
             if (_desktop_identity(sample) != _desktop_identity(after)
                     or not clocks_agree(after.observed_at, after.monotonic_s, sample.observed_at, sample.monotonic_s)
                     or after.monotonic_s - sample.monotonic_s > 3 * ACTIVITY_POLL_S):
-                recorder.observe(after)
+                observe_sample(after)
                 schedule.observe(None, after.monotonic_s)
                 store.save_capture_health("source_restricted", after.observed_at,
                                           reason="foreground_changed_during_capture")
@@ -994,8 +1032,23 @@ def run_live_multimodal(
                     refresh(publish=True)
                     immediate_update = False
                 return
+            if failure is not None:
+                status, reason = failure
+                schedule.defer_probe(after.monotonic_s)
+                if status == "capture_failed" and activity is not None and not context_only:
+                    store.set_capture_status(activity.activity_id, "failed")
+                store.save_capture_health(status, after.observed_at, reason=reason)
+                return
             if not permitted() or not sample.observed_at <= acquired_at <= after.observed_at:
                 return
+            if context_only:
+                schedule.defer_probe(after.monotonic_s)
+                store.save_capture_health("skipped", acquired_at, reason="foreground_context_only")
+                if visual is not None or previous_visual is not None:
+                    visual = previous_visual = None
+                    refresh(publish=True)
+                return
+            assert activity is not None and thumbnail is not None
             now = time.monotonic()
             if not schedule.inspect(thumbnail, now):
                 store.save_capture_health("skipped", acquired_at, reason="waiting_for_visual_change",
@@ -1003,7 +1056,10 @@ def run_live_multimodal(
                 return
             store.set_capture_status(activity.activity_id, "captured")
             signals = observer.features(activities_at(acquired_at), [], as_of=acquired_at, live=True)
-            document_source = activity.document_source if activity.document_status == "title_unavailable" else None
+            # A desktop image can show titles from several apps under one native foreground source.
+            document_source = (
+                activity.document_source if not all_displays and activity.document_status == "title_unavailable" else None
+            )
             evidence = VisionSignals(
                 sampled_at=sample.system_sampled_at or sample.observed_at,
                 foreground_run_s=signals["current_foreground_run_s"],
@@ -1013,11 +1069,14 @@ def run_live_multimodal(
             )
             capture_id = uuid4().hex
             deadline_s = after.monotonic_s + observer.ttl_seconds - (after.observed_at - acquired_at).total_seconds()
+            scene_identity = last_desktop_identity
 
             def still_owns_scene() -> bool:
                 at, mono = datetime.now(UTC), time.monotonic()
                 return (activity_id == activity.activity_id and mono < deadline_s and coverage_current(at, mono)
-                        and last_sample is not None and last_sample.screen_locked is False)
+                        and last_sample is not None and last_sample.screen_locked is False
+                        and recorder.capture_eligible
+                        and (not all_displays or last_desktop_identity == scene_identity))
 
             if grant is not LOCAL_CAPTURE:
                 grant = replace(grant, send_permitted=still_owns_scene)
@@ -1028,7 +1087,7 @@ def run_live_multimodal(
                 return analyze_multimodal(
                     vision, image=image, activity_id=activity.activity_id, capture_id=capture_id,
                     captured_at=acquired_at, image_grant=None if grant is LOCAL_CAPTURE else grant,
-                    signals=evidence, document_source=document_source,
+                    signals=evidence, document_source=document_source, all_displays=all_displays,
                 )
 
             store.record_upload(datetime.now(UTC), now)
@@ -1064,7 +1123,10 @@ def run_live_multimodal(
                 previous_visual = result
                 if realtime:
                     visual = result
-                    video = result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
+                    # Only a native foreground hint can enable the slower video cadence for a desktop composite.
+                    video = finished.video_hint if all_displays else (
+                        result.screen_kind == "video" or (finished.video_hint and result.screen_kind == "unknown")
+                    )
                     schedule.recommend(result.next_check, mono, video=video)
                     refresh(publish=True, outcome="model")
             if not realtime:
@@ -1080,7 +1142,7 @@ def run_live_multimodal(
                         sample.observed_at, sample.monotonic_s, last_sample.observed_at, last_sample.monotonic_s,
                     ):
                         recorder.close()
-                    recorder.observe(sample)
+                    observe_sample(sample)
                     periodic = mono >= next_update
                     refresh(publish=periodic or immediate_update)
                     immediate_update = False

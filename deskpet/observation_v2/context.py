@@ -31,6 +31,8 @@ CAPTURE_HEALTH_REASONS = {
     "capture_disabled", "privacy_excluded", "screen_locked", "mochi_foreground", "private_window",
     "foreground_unavailable", "browser_url_unavailable", "lock_state_unavailable", "window_unavailable",
     "video_source", "recipient_unavailable", "foreground_changed_during_capture", "waiting_for_visual_change",
+    "screen_recording_permission_denied", "filtered_desktop_unavailable", "desktop_privacy_restricted",
+    "foreground_context_only",
 }
 CAPTURE_HEALTH_TIMES = ("last_ready_at", "last_failure_at", "last_skipped_at")
 

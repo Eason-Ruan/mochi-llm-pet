@@ -18,6 +18,11 @@ from PIL import Image
 from .activity import (
     _DEFAULT_EXCLUDED_APPS, _SENSITIVE_TITLE_WORDS, ActivitySample, _is_browser, _page_domain, _private_title,
 )
+from .desktop_capture import (
+    DesktopCaptureRestricted as DesktopCaptureRestricted,
+    FilteredDesktopCapture as FilteredDesktopCapture,
+    capture_filtered_desktop as capture_filtered_desktop,
+)
 from .documents import is_mochi_app
 
 _WIDTH, _HEIGHT = 960, 540

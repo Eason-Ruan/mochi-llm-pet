@@ -18,7 +18,7 @@ from deskpet.observation_v2.documents import normalize_document_sources
 
 
 _OBSERVATION_PRIVACY_FIELDS = {
-    "observation_screenshots", "observation_browser_metadata", "observation_paused",
+    "observation_screenshots", "observation_screen_scope", "observation_browser_metadata", "observation_paused",
     "observation_excluded_apps", "observation_excluded_domains",
     "document_local_sources", "document_cloud_sources",
 }
@@ -44,6 +44,7 @@ class Settings(BaseModel):
     allow_system_notifications: bool = False
     lock_screen_detail: bool = False
     observation_screenshots: bool = False
+    observation_screen_scope: Literal["foreground_window", "all_displays"] = "foreground_window"
     observation_browser_metadata: bool = False
     observation_excluded_apps: tuple[str, ...] = Field(default=(), max_length=100)
     observation_excluded_domains: tuple[str, ...] = Field(default=(), max_length=100)
@@ -58,7 +59,7 @@ class Settings(BaseModel):
     def _clean_apps(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         names = tuple(dict.fromkeys(name.strip().casefold() for name in value if name.strip()))
         if any(len(name) > 120 or any(ord(char) < 32 for char in name) for name in names):
-            raise ValueError("Use an application name or part of its name")
+            raise ValueError("Use an application name or bundle ID")
         return names
 
     @field_validator("observation_excluded_domains")

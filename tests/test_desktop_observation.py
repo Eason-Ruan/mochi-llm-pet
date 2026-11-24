@@ -1,5 +1,6 @@
 import io
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import closing
@@ -124,21 +125,85 @@ def test_supervisor_releases_child_on_pause_and_starts_with_updated_policy(tmp_p
     observer.refresh()
     assert len(children) == 1 and "--capture-screen-from-settings" in children[0].args
     assert children[0].args[children[0].args.index("--observation-generation") + 1] == "0"
-    observer.settings.update(expected_version=prefs.version, observation_paused=True)
+    observer.settings.update(expected_version=prefs.version, observation_screen_scope="all_displays")
     observer.refresh()
     assert children[0].stdin.closed
     children[0].exit_code = 0
     observer.refresh()
-    assert len(children) == 1
+    assert len(children) == 2
+    assert children[-1].args[children[-1].args.index("--observation-generation") + 1] == "1"
+    prefs = observer.settings.read()
+    observer.settings.update(expected_version=prefs.version, observation_paused=True)
+    observer.refresh()
+    assert children[-1].stdin.closed
+    children[-1].exit_code = 0
+    observer.refresh()
+    assert len(children) == 2
     prefs = observer.settings.read()
     observer.settings.update(expected_version=prefs.version, observation_paused=False,
                              observation_excluded_domains=("example.net",))
     observer.refresh()
-    assert len(children) == 2 and "example.net" in children[-1].args
-    assert children[-1].args[children[-1].args.index("--observation-generation") + 1] == "2"
+    assert len(children) == 3 and "example.net" in children[-1].args
+    assert children[-1].args[children[-1].args.index("--observation-generation") + 1] == "3"
     observer.stop()
     observer.refresh()
-    assert children[-1].stdin.closed and len(children) == 2
+    assert children[-1].stdin.closed and len(children) == 3
+
+
+def test_managed_cli_pins_scope_and_revokes_previous_worker(tmp_path, monkeypatch):
+    from deskpet.observation_v2 import __main__ as cli
+
+    observer = DesktopObserver(tmp_path)
+    current = observer.settings.update(
+        expected_version=0, observation_screenshots=True, observation_screen_scope="all_displays",
+    )
+    args = observer._arguments(current)
+    monkeypatch.setattr(sys, "argv", ["deskpet.observation_v2", *args[3:]])
+
+    def verify_live_policy(database, vision, **options):
+        assert database == observer.database
+        assert options["screen_scope"] == "all_displays"
+        assert options["capture_policy"]() == options["producer_policy"]() == current.observation_generation
+        observer.settings.update(expected_version=current.version, observation_screen_scope="foreground_window")
+        assert options["capture_policy"]() is None and options["producer_policy"]() is None
+        return {}
+
+    monkeypatch.setattr(cli, "run_live_multimodal", verify_live_policy)
+    cli.main()
+
+
+@pytest.mark.parametrize("platform,scope,flags,error", [
+    ("darwin", "all-displays", [], "requires --capture-screen"),
+    ("darwin", "all-displays", ["--capture-screen", "--split-models"], "requires the multimodal collector"),
+    ("darwin", "foreground-window", ["--capture-screen", "--split-models"], "requires the multimodal collector"),
+    ("win32", "all-displays", ["--capture-screen"], "requires macOS 14.2 or later"),
+    ("darwin", "all-displays", ["--capture-screen"], None),
+])
+def test_explicit_cli_requires_capture_opt_in_and_macos_multimodal(
+    tmp_path, monkeypatch, capsys, platform, scope, flags, error,
+):
+    from deskpet.observation_v2 import __main__ as cli
+
+    monkeypatch.setattr(cli, "platform", platform)
+    monkeypatch.setattr(sys, "argv", [
+        "deskpet.observation_v2", "live", "--database", str(tmp_path / "test.db"),
+        "--screen-scope", scope, *flags,
+    ])
+
+    def verify_scope(database, vision, **options):
+        assert error is None
+        assert options["screen_scope"] == "all_displays" and options["capture_screen"]
+        return {"scope": options["screen_scope"]}
+
+    monkeypatch.setattr(cli, "run_live_multimodal", verify_scope)
+    if error:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        assert error in capsys.readouterr().err
+    else:
+        cli.main()
+        assert '"scope": "all_displays"' in capsys.readouterr().out
 
 
 def test_production_tool_and_qt_readers_reject_still_fresh_head_after_pause_resume(tmp_path, monkeypatch):

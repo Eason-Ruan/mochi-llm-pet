@@ -483,7 +483,7 @@ class RoutedObservationModel:
 
     def complete_multimodal_image(
         self, image_grant: VisionImageGrant | None, *, image: bytes, signals: VisionSignals | None,
-        captured_at: datetime, activity_id: int, allow_document_title: bool,
+        captured_at: datetime, activity_id: int, allow_document_title: bool, all_displays: bool = False,
     ) -> dict:
         from .vision import _multimodal_request, _project_signals
 
@@ -498,6 +498,7 @@ class RoutedObservationModel:
         request = _multimodal_request(
             projected, captured_at=captured_at, allow_document_title=allow_document_title,
             include_signals=image_grant is None or image_grant.snapshot.vision_signals_permission,
+            all_displays=all_displays,
         )
         if image_grant is None:
             return self._complete(image=image, allow_partial_fields=True, **request)

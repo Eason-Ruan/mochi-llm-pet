@@ -193,7 +193,14 @@ def test_native_sampler_isolated_failures_and_locked_foreground(monkeypatch):
     assert sampler.errors == {"idle": "OSError"}
 
 
-@pytest.mark.parametrize("title, private", [("Page name - Incognito", None), ("unmarked", True)])
+@pytest.mark.parametrize("title, private", [
+    ("Page name - Incognito", None),
+    ("网页 - 无痕模式", None),
+    ("无痕式窗口", None),
+    ("隱私視窗", None),
+    ("隐私窗口", None),
+    ("unmarked", True),
+])
 def test_private_window_omits_title_and_domain_and_never_requests_capture(title, private):
     with ActivityStore(":memory:") as store:
         recorder = ActivityRecorder(store, capture_enabled=True)
@@ -206,7 +213,7 @@ def test_private_window_omits_title_and_domain_and_never_requests_capture(title,
 
 def test_mac_browser_automation_is_opt_in_and_checks_privacy_before_url(monkeypatch):
     monkeypatch.setattr(module, "_mac_session", lambda: (False, "session"))
-    monkeypatch.setattr(module, "_mac_foreground", lambda: ("Google Chrome", 12, "page"))
+    monkeypatch.setattr(module, "_mac_foreground", lambda: ("Google Chrome", 12, "page", "com.google.Chrome"))
     monkeypatch.setattr(module, "_mac_idle", lambda: 2)
     monkeypatch.setattr(module, "_mac_active_bundle_path", lambda bundle_id: "/Applications/Google Chrome.app")
     calls = []
@@ -224,6 +231,11 @@ def test_mac_browser_automation_is_opt_in_and_checks_privacy_before_url(monkeypa
     assert sampler.errors["browser_url"] == "native_url_disabled"
     assert not calls
 
+    excluded = NativeActivitySampler(browser_metadata=True, excluded_apps=("com.google.chrome",))
+    excluded.platform = "darwin"
+    assert excluded.sample().url is None
+    assert not calls
+
     sampler = NativeActivitySampler(browser_metadata=True)
     sampler.platform = "darwin"
     hidden = sampler.sample()
@@ -235,13 +247,14 @@ def test_mac_browser_automation_is_opt_in_and_checks_privacy_before_url(monkeypa
 
 def test_default_and_configured_privacy_exclude_content_before_writes_or_capture():
     with ActivityStore(":memory:") as store:
-        recorder = ActivityRecorder(store, capture_enabled=True, excluded_apps=("private app",),
+        recorder = ActivityRecorder(store, capture_enabled=True, excluded_apps=("private app", "com.example.chat"),
                                     excluded_domains=("example.test",))
         assert recorder.observe(sample(0, "Editor")) is not None
         for observation in (
             sample(1, "1Password"),
             sample(2, "The Private App"),
             sample(3, "Chrome", url="https://sub.example.test/private"),
+            sample(3.5, "Some Messenger", app_id="com.example.Chat"),
         ):
             assert recorder.observe(observation) is None
             assert recorder.last_capture_reason == "privacy_excluded"

@@ -372,8 +372,18 @@ DESKPET_CONFIG (path to config.toml)     DESKPET_LOG_LEVEL (DEBUG|INFO|...)
 ## Desktop privacy
 
 The production pet starts with screen capture off. Its settings distinguish
-three recipients. The vision model can receive an eligible window image. The
-Observation state model can receive structured signals and, with separate
+three recipients. The vision model can receive an eligible window image.
+On macOS 14.2 or later, the screenshot scope can also be set to **所有显示器（排除黑名单应用）**.
+This mode combines the filtered displays into one image per visual request.
+It omits blacklisted apps, windows matching the built-in sensitive-title rules,
+and recognizable private windows. With no domain
+exclusions, browser windows of unknown private status are eligible even when
+browser metadata is disabled. A configured domain exclusion requires enough
+information to rule it out before a browser window can be included. The
+selected cloud vision provider receives the image under its existing consent.
+macOS Screen Recording permission is also required.
+
+The Observation state model can receive structured signals and, with separate
 permission, filtered screen text. System 2 receives current and compressed
 historical state. Sharing published activity summaries with a cloud System 2
 model is a separate choice. User messages and relevant user-entered items are

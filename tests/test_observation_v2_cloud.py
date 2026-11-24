@@ -296,8 +296,9 @@ def test_vision_consent_scope_recipient_switch_and_recording_isolation(tmp_path,
 
 
 @pytest.mark.parametrize("permission_revoked", [False, True])
+@pytest.mark.parametrize("all_displays", [False, True])
 def test_cloud_multimodal_grant_admits_one_combined_call_and_checks_late_permission(
-    tmp_path, monkeypatch, permission_revoked,
+    tmp_path, monkeypatch, permission_revoked, all_displays,
 ):
     clock = SimpleNamespace(now=100.0)
     monkeypatch.setattr("deskpet.observation_v2.openai_cloud.time", SimpleNamespace(monotonic=lambda: clock.now))
@@ -325,6 +326,7 @@ def test_cloud_multimodal_grant_admits_one_combined_call_and_checks_late_permiss
                 captured_at=captured_at, signals=VisionSignals(
                     sampled_at=captured_at - timedelta(seconds=1), foreground_run_s=3.0, screen_locked=False,
                 ),
+                all_displays=all_displays,
             )
             assert responded.wait(timeout=5)
             clock.now = grant.expires_at + 1
@@ -338,6 +340,7 @@ def test_cloud_multimodal_grant_admits_one_combined_call_and_checks_late_permiss
         assert probe_usage == [ObservationUsage("qwen3.7-flash", None, None, None)]
         assert len(seen) == 2  # Capability check plus the single combined request.
         _, _, wire = seen[-1]
+        assert ("one filtered desktop capture" in wire["messages"][0]["content"]) is all_displays
         content = wire["messages"][-1]["content"]
         assert base64.b64decode(content[1]["image_url"]["url"].split(",")[-1]) == jpeg
         assert json.loads(content[0]["text"])["system_signals"]["foreground_run_s"] == 3.0

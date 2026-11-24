@@ -43,6 +43,25 @@ def test_default_privacy_and_settings_compare_and_swap(tmp_path):
     assert SettingsStore(path).read().version == 2
 
 
+def test_legacy_screenshot_scope_defaults_to_foreground_and_scope_changes_advance_generation(tmp_path):
+    path = tmp_path / "business.sqlite3"
+    store = SettingsStore(path)
+    legacy = Settings(version=3, observation_screenshots=True, observation_generation=2).to_dict()
+    del legacy["observation_screen_scope"]
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE pet_settings SET settings = ?", (json.dumps(legacy),))
+
+    migrated = store.read()
+    assert migrated.observation_screenshots and migrated.observation_screen_scope == "foreground_window"
+    widened = store.update(expected_version=3, observation_screen_scope="all_displays")
+    assert widened.observation_generation == 3
+    assert SettingsStore.read_at(path) == widened
+    repeated = store.update(expected_version=widened.version, observation_screen_scope="all_displays")
+    assert repeated.observation_generation == widened.observation_generation
+    narrowed = store.update(expected_version=repeated.version, observation_screen_scope="foreground_window")
+    assert narrowed.observation_generation == widened.observation_generation + 1
+
+
 def test_document_permissions_migrate_and_apply_only_to_the_exact_allowed_source(tmp_path):
     path = tmp_path / "business.sqlite3"
     store = SettingsStore(path)
@@ -258,6 +277,40 @@ def test_settings_widget_edits_document_permissions_together(tmp_path, monkeypat
         store.update(expected_version=version, **changes)
         panel.finish_preference_save(True)
         assert "本机记录 0 个来源 · 云端共享 0 个来源" == panel._document_permissions_label.text()
+    finally:
+        panel.close()
+
+
+def test_settings_widget_applies_capture_scope_and_app_blacklist(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PyQt6")
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QApplication, QComboBox, QDialogButtonBox, QLabel, QLineEdit, QPushButton
+
+    from deskpet.c_ui import settings as settings_ui
+
+    monkeypatch.setattr(settings_ui, "platform", "darwin")
+    app = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    panel = settings_ui.SettingsPanel(store)
+    scope = panel.findChild(QComboBox, "settings-observation_screen_scope")
+
+    def edit_exclusions():
+        dialog = app.activeModalWidget()
+        field = dialog.findChild(QLineEdit, "settings-observation_excluded_apps")
+        field.setText("Mail， com.example.blocked")
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Save).click()
+
+    try:
+        assert scope.currentData() == "foreground_window"
+        assert any("仍可采集" in label.text() and "云端" in label.text() for label in panel.findChildren(QLabel))
+        scope.setCurrentIndex(scope.findData("all_displays"))
+        scope.activated.emit(scope.currentIndex())
+        assert store.read().observation_screen_scope == "all_displays"
+        assert not store.read().observation_screenshots
+        QTimer.singleShot(0, edit_exclusions)
+        panel.findChild(QPushButton, "settings-observation-exclusions").click()
+        assert store.read().observation_excluded_apps == ("mail", "com.example.blocked")
     finally:
         panel.close()
 

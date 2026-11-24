@@ -50,6 +50,7 @@ class FakeRuntime:
     def __init__(self, monkeypatch, *, metadata=None, jpeg=None, model_delay=0):
         self.elapsed = 0.0
         self.captures = []
+        self.desktop_captures = []
         runtime = self
         self.metadata = metadata or (lambda _: {})
         self.jpeg = jpeg or (lambda _: _frame())
@@ -95,6 +96,7 @@ class FakeRuntime:
         monkeypatch.setattr(pipeline, "NativeActivitySampler", Sampler)
         monkeypatch.setattr(pipeline, "ThreadPoolExecutor", Executor)
         monkeypatch.setattr(media, "capture_window", self.capture)
+        monkeypatch.setattr(media, "capture_filtered_desktop", self.capture_filtered_desktop)
 
     def now(self):
         return EPOCH + timedelta(seconds=self.elapsed)
@@ -105,6 +107,11 @@ class FakeRuntime:
     def capture(self, sample, *, platform):
         self.captures.append(self.elapsed)
         return self.now(), self.jpeg(self.elapsed)
+
+    def capture_filtered_desktop(self, sample, *, platform, excluded_apps, excluded_domains, foreground_excluded=False):
+        self.desktop_captures.append((sample, platform, excluded_apps, excluded_domains, foreground_excluded))
+        acquired_at, jpeg = self.capture(sample, platform=platform)
+        return media.FilteredDesktopCapture(acquired_at, jpeg, foreground_excluded)
 
 
 def _time(second):
@@ -166,11 +173,59 @@ def test_stable_material_change_has_one_call_each_and_keeps_capture_time(tmp_pat
         )
 
 
+def test_all_displays_observes_ordinary_chrome_without_window_or_browser_metadata(tmp_path, monkeypatch):
+    frames = [_frame(area=(100 + x, 100, 240 + x, 320)) for x in (0, 180, 360)]
+    runtime = FakeRuntime(
+        monkeypatch,
+        metadata=lambda at: {
+            "app_name": "Google Chrome", "window_id": None, "window_title": None, "private_window": None,
+        },
+        jpeg=lambda at: frames[int(at / 1.5) % len(frames)],
+    )
+
+    def single_window(*args, **kwargs):
+        pytest.fail("All-displays capture must use the filtered desktop source")
+
+    class DesktopVision(Vision):
+        def complete(self, *, system, **kwargs):
+            assert "only the application window that visibly has focus" in system
+            assert "background music or video" in system
+            assert "Google Chrome" not in system
+            result = super().complete(system=system, **kwargs)
+            if len(self.calls) == 1:
+                result["screen_kind"] = "video"
+            return result
+
+    monkeypatch.setattr(media, "capture_window", single_window)
+    database = tmp_path / "desktop.sqlite"
+    vision = DesktopVision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=45, capture_screen=True, screen_scope="all_displays",
+        excluded_apps=("blacklisted",),
+    )
+
+    assert report["visual_attempts"] == len(vision.calls) == 2
+    assert all(platform == "darwin" and apps == ("blacklisted",) and domains == () and not foreground_excluded
+               for _, platform, apps, domains, foreground_excluded in runtime.desktop_captures)
+    assert all(sample.window_title is None and sample.window_id is None and sample.private_window is None
+               for sample, *_ in runtime.desktop_captures)
+    assert all("document_title" not in fields and "Google Chrome" not in json.dumps(prompt)
+               for prompt, fields in vision.calls)
+    with sqlite3.connect(database) as conn:
+        frames_at = [datetime.fromisoformat(row[0]) for row in conn.execute(
+            "SELECT captured_at FROM screen_observations ORDER BY captured_at",
+        )]
+    assert frames_at[0] == EPOCH + timedelta(seconds=3)
+    assert 30 <= (frames_at[1] - frames_at[0]).total_seconds() <= 35
+
+
 @pytest.mark.parametrize("foreground,exclusions", [
     ({"app_name": "Mochi"}, {}),
     ({"screen_locked": True}, {}),
     ({"app_name": "Restricted Editor"}, {"excluded_apps": ("restricted",)}),
     ({"app_name": "Chrome", "url": "https://internal.example.net/doc"}, {"excluded_domains": ("example.net",)}),
+    ({"app_name": "Chrome", "url": None, "private_window": None}, {"excluded_domains": ("example.net",)}),
+    ({"app_name": "Chrome", "private_window": None, "window_title": "Incognito"}, {}),
     ({"private_window": True}, {}),
 ])
 def test_restricted_app_or_window_never_acquires_an_image(tmp_path, monkeypatch, foreground, exclusions):
@@ -185,6 +240,64 @@ def test_restricted_app_or_window_never_acquires_an_image(tmp_path, monkeypatch,
     assert report["observations"] == 1
     if foreground.get("screen_locked"):
         assert report["last_observation"]["state"] == "away"
+
+
+@pytest.mark.parametrize("locked", [True, None])
+def test_all_displays_never_captures_when_locked_or_lock_unknown(tmp_path, monkeypatch, locked):
+    runtime = FakeRuntime(monkeypatch, metadata=lambda _: {"screen_locked": locked})
+    report = pipeline.run_live_multimodal(
+        tmp_path / "desktop.sqlite", Vision(), duration_s=6, capture_screen=True, screen_scope="all_displays",
+    )
+
+    assert runtime.captures == []
+    assert report["visual_attempts"] == 0
+
+
+@pytest.mark.parametrize("foreground,exclusions", [
+    ({"app_name": "Mochi"}, {}),
+    ({"app_name": "Restricted Editor"}, {"excluded_apps": ("restricted",)}),
+    ({"app_name": "Chrome", "url": "https://internal.example.net/doc"}, {"excluded_domains": ("example.net",)}),
+    ({"app_name": "Chrome", "url": None, "private_window": None}, {"excluded_domains": ("example.net",)}),
+    ({"app_name": "Chrome", "private_window": None, "window_title": "Incognito"}, {}),
+    ({"private_window": True}, {}),
+])
+def test_all_displays_keeps_allowed_background_when_foreground_is_excluded(
+    tmp_path, monkeypatch, foreground, exclusions,
+):
+    runtime = FakeRuntime(monkeypatch, metadata=lambda _: foreground)
+    database = tmp_path / "desktop.sqlite"
+    vision = Vision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=6, capture_screen=True, screen_scope="all_displays", **exclusions,
+    )
+
+    assert report["visual_attempts"] == len(vision.calls) == 0
+    assert len(runtime.desktop_captures) == 1 and runtime.desktop_captures[0][-1] is True
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT count(*) FROM screen_observations").fetchone() == (0,)
+        assert conn.execute("SELECT count(*) FROM observation_upload_budget").fetchone() == (0,)
+        assert conn.execute("SELECT status, reason FROM observation_capture_health").fetchone() == (
+            "skipped", "foreground_context_only",
+        )
+
+
+def test_all_displays_respects_foreground_exclusion_reported_by_provider(tmp_path, monkeypatch):
+    runtime = FakeRuntime(monkeypatch)
+
+    def capture(sample, **options):
+        assert not options.pop("foreground_excluded")
+        return runtime.capture_filtered_desktop(sample, foreground_excluded=True, **options)
+
+    monkeypatch.setattr(media, "capture_filtered_desktop", capture)
+    database = tmp_path / "desktop.sqlite"
+    vision = Vision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=6, capture_screen=True, screen_scope="all_displays",
+    )
+
+    assert report["visual_attempts"] == len(vision.calls) == 0
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT reason FROM observation_capture_health").fetchone() == ("foreground_context_only",)
 
 
 @pytest.mark.parametrize("revoked", [False, True])
@@ -306,6 +419,55 @@ def test_lock_detected_during_capture_discards_frame_and_records_departure(tmp_p
     assert report["last_observation"]["state"] == "away"
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT screen_locked, lock_epoch FROM realtime_observation_head").fetchone() == (1, 1)
+
+
+@pytest.mark.parametrize("changed", ["privacy", "pause"])
+def test_all_displays_rechecks_permission_and_foreground_after_capture(tmp_path, monkeypatch, changed):
+    acquired = False
+    runtime = FakeRuntime(
+        monkeypatch,
+        metadata=lambda _: {"private_window": True} if acquired and changed == "privacy" else {},
+    )
+
+    def capture(sample, **options):
+        nonlocal acquired
+        result = runtime.capture_filtered_desktop(sample, **options)
+        acquired = True
+        return result
+
+    monkeypatch.setattr(media, "capture_filtered_desktop", capture)
+    database = tmp_path / "desktop.sqlite"
+    vision = Vision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=4.5, capture_screen=True, screen_scope="all_displays",
+        capture_policy=lambda: None if acquired and changed == "pause" else 0,
+    )
+
+    assert runtime.captures == [3]
+    assert report["visual_attempts"] == len(vision.calls) == 0
+    assert report["screens"] == {}
+
+
+def test_all_displays_reports_screen_recording_restriction(tmp_path, monkeypatch):
+    FakeRuntime(monkeypatch)
+
+    def capture(sample, **options):
+        raise media.DesktopCaptureRestricted(
+            "Screen Recording permission unavailable", reason="screen_recording_permission_denied",
+        )
+
+    monkeypatch.setattr(media, "capture_filtered_desktop", capture)
+    database = tmp_path / "desktop.sqlite"
+    vision = Vision()
+    report = pipeline.run_live_multimodal(
+        database, vision, duration_s=6, capture_screen=True, screen_scope="all_displays",
+    )
+
+    assert report["visual_attempts"] == len(vision.calls) == 0
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT status, reason FROM observation_capture_health").fetchone() == (
+            "source_restricted", "screen_recording_permission_denied",
+        )
 
 
 @pytest.mark.parametrize("new_foreground", [{"screen_locked": True}, {"app_name": "Mochi"}])

@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from sys import platform
 from threading import Event
 from uuid import uuid4
 
@@ -158,7 +159,10 @@ def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
         raise ValueError("Could not confirm the desktop Observation policy")
     if arguments.observation_generation is None:
         arguments.observation_generation = preferences_at_start.observation_generation
-    return request_policy, capture_policy, preferences_at_start.document_local_sources
+    return (
+        request_policy, capture_policy, preferences_at_start.document_local_sources,
+        preferences_at_start.observation_screen_scope,
+    )
 
 
 def main(*, stop_event: Event | None = None) -> None:
@@ -197,12 +201,15 @@ def main(*, stop_event: Event | None = None) -> None:
                       help="maximum time a legacy split-model round waits for its window frame")
     live.add_argument("--observation-generation", type=int, help=argparse.SUPPRESS)
     live.add_argument("--browser-metadata", action="store_true", help="enable supported macOS browser page detection")
-    live.add_argument("--exclude-app", action="append", default=[], help="exclude an application name substring")
+    live.add_argument("--exclude-app", action="append", default=[],
+                      help="exclude an application name or available bundle ID substring")
     live.add_argument("--exclude-domain", action="append", default=[], help="exclude a detected domain and its subdomains")
     capture = live.add_mutually_exclusive_group()
-    capture.add_argument("--capture-screen", action="store_true", help="opt into verified foreground window capture")
+    capture.add_argument("--capture-screen", action="store_true", help="opt into screen image capture")
     capture.add_argument("--capture-screen-from-settings", action="store_true",
-                         help="use the live desktop's stored screenshot preference")
+                         help="use the live desktop's stored screenshot permission and scope")
+    live.add_argument("--screen-scope", choices=("foreground-window", "all-displays"),
+                      help="multimodal scope for --capture-screen (foreground-window by default, all-displays needs macOS 14.2+)")
     context = commands.add_parser("context", help="read the System 2 Observation snapshot")
     context.add_argument("--database", type=Path, required=True)
     context.add_argument("--as-of", type=datetime.fromisoformat, help="ISO timestamp with UTC offset")
@@ -233,8 +240,17 @@ def main(*, stop_event: Event | None = None) -> None:
         return
     request_policy = capture_policy = None
     document_local_sources = ()
+    screen_scope = "foreground_window"
     split_models = not arguments.multimodal if arguments.mode == "replay" else arguments.split_models
     if arguments.mode == "live":
+        if arguments.screen_scope is not None:
+            if not arguments.capture_screen:
+                parser.error("--screen-scope requires --capture-screen")
+            if split_models:
+                parser.error("--screen-scope requires the multimodal collector (omit --split-models)")
+            screen_scope = arguments.screen_scope.replace("-", "_")
+            if screen_scope == "all_displays" and platform != "darwin":
+                parser.error("--screen-scope all-displays requires macOS 14.2 or later")
         if arguments.observation_generation is not None and (
             arguments.observation_generation < 0 or not arguments.capture_screen_from_settings
         ):
@@ -245,7 +261,9 @@ def main(*, stop_event: Event | None = None) -> None:
             if split_models:
                 parser.error("--capture-screen-from-settings uses the multimodal desktop collector")
             try:
-                request_policy, capture_policy, document_local_sources = _desktop_policies(arguments, stop_event)
+                request_policy, capture_policy, document_local_sources, screen_scope = _desktop_policies(
+                    arguments, stop_event,
+                )
             except ValueError as exc:
                 parser.exit(2, f"Observation could not start ({exc}).\n")
     if arguments.mode == "replay" and arguments.cloud_settings and arguments.database.resolve() == arguments.cloud_settings.resolve():
@@ -298,8 +316,8 @@ def main(*, stop_event: Event | None = None) -> None:
                     )
                 else:
                     report = run_live_multimodal(
-                        arguments.database, vision, observer=observer, document_local_sources=document_local_sources,
-                        **live_options,
+                        arguments.database, vision, observer=observer, screen_scope=screen_scope,
+                        document_local_sources=document_local_sources, **live_options,
                     )
     except FileExistsError:
         parser.exit(2, "Observation database already exists. Choose a new path.\n")

@@ -107,7 +107,7 @@ class CaptureSchedule:
         self.review_s = monotonic_s + VISUAL_REVIEW_S
         return prior_upload is None or materially_different(prior_upload, thumbnail)
 
-    def probe_failed(self, monotonic_s: float) -> None:
+    def defer_probe(self, monotonic_s: float) -> None:
         self.latest = None
         self.next_probe_s = self.review_s = monotonic_s + UPLOAD_INTERVAL_S
 

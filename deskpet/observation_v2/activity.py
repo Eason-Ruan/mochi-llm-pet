@@ -37,8 +37,8 @@ _BROWSERS = frozenset({
     "vivaldi", "zen browser",
 })
 _PRIVATE_TITLE = re.compile(
-    r"\b(?:incognito|inprivate|private (?:browsing|window))\b|无痕(?:浏览|窗口)|隐私浏览|"
-    r"無痕(?:瀏覽|視窗)|私密(?:浏览|瀏覽)|プライベートブラウズ", re.IGNORECASE,
+    r"\b(?:incognito|inprivate|private (?:browsing|window))\b|无痕(?:浏览|模式|式?窗口)|隐私(?:浏览|窗口)|"
+    r"無痕(?:瀏覽|模式|式?視窗)|隱私(?:瀏覽|視窗)|私密(?:浏览|瀏覽)|プライベートブラウズ", re.IGNORECASE,
 )
 _MAC_CHROMIUM_APPS = {
     "brave browser": "com.brave.Browser",
@@ -248,6 +248,11 @@ def _excluded_app_rules(exclusions: tuple[str, ...]) -> tuple[str, ...]:
     return (*_DEFAULT_EXCLUDED_APPS, *(app.strip().casefold() for app in exclusions if app.strip()))
 
 
+def _app_excluded(app_name: str | None, app_id: str | None, exclusions: tuple[str, ...]) -> bool:
+    name, bundle = (app_name or "").casefold(), (app_id or "").casefold()
+    return any(rule in name or rule in bundle for rule in exclusions)
+
+
 def _excluded_domain_rules(exclusions: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(domain.strip().casefold().strip(".") for domain in exclusions if domain.strip().strip("."))
 
@@ -380,7 +385,7 @@ class ActivityRecorder:
         domain = candidate_domain if not private else None
         normalized_app = app.casefold() if app else None
         excluded = bool(
-            normalized_app and any(rule in normalized_app for rule in self._excluded_apps)
+            app and _app_excluded(app, sample.app_id, self._excluded_apps)
             or candidate_domain and _domain_excluded(candidate_domain, self._excluded_domains)
         )
         self.browser_url_status = None
@@ -589,7 +594,7 @@ class NativeActivitySampler:
         if _is_browser(app):
             if _private_title(title) or any(word in (title or "").casefold() for word in _SENSITIVE_TITLE_WORDS):
                 private = True
-            elif not any(rule in app.casefold() for rule in self._excluded_apps):
+            elif not _app_excluded(app, app_id, self._excluded_apps):
                 private, url, tab_title = self._browser_window(app, app_id, locked is False)
                 if browser_document_source(url) and _page_domain(url) in self._document_domains:
                     current = self._probe("foreground", foreground, (None, None, None))

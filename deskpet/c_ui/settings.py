@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from sys import platform
 from threading import Thread
 from uuid import uuid4
 import sqlite3
@@ -25,7 +26,7 @@ from .refine_style import (
 
 _ROLES = {
     "system2": ("对话与动作", "分享已发布的活动摘要"),
-    VISION: ("屏幕图像理解", "发送获准窗口的截图"),
+    VISION: ("屏幕图像理解", "发送所选范围内获准的截图"),
     "observation_state": ("活动状态判断（旧版／对照）", "发送脱敏屏幕文字"),
 }
 
@@ -44,7 +45,7 @@ _CHECKBOXES = (
     ("phase_end_sound", "阶段结束音"),
     ("allow_system_notifications", "允许系统通知"),
     ("lock_screen_detail", "在锁屏显示通知详情"),
-    ("observation_screenshots", "允许截取当前窗口"),
+    ("observation_screenshots", "允许截取屏幕图像"),
     ("observation_browser_metadata", "读取浏览器域名"),
     ("observation_paused", "暂停活动采集"),
 )
@@ -219,9 +220,30 @@ class SettingsPanel(_Panel):
 
     def _build_models(self):
         section = self._section("模型与隐私")
-        for key in ("observation_paused", "observation_screenshots", "observation_browser_metadata"):
+        for key in ("observation_paused", "observation_screenshots"):
             section.addWidget(self._checkboxes[key])
+        self._screen_scope = MenuField()
+        self._screen_scope.setObjectName("settings-observation_screen_scope")
+        self._screen_scope.setAccessibleName("截图范围")
+        self._screen_scope.addItem("当前窗口", "foreground_window")
+        if platform == "darwin":
+            self._screen_scope.addItem("所有显示器（排除黑名单应用）", "all_displays")
+        else:
+            self._screen_scope.addItem("所有显示器（此系统不可用）", "all_displays")
+            self._screen_scope.model().item(1).setEnabled(False)
+        section.addWidget(_text("截图范围", size=12))
+        section.addWidget(self._screen_scope)
+        self._screen_scope.activated.connect(
+            lambda _: self._save(observation_screen_scope=self._screen_scope.currentData()),
+        )
+        note = "若已授权云端识图，所选范围内获准的截图可发送给该接收方。"
+        if platform == "darwin":
+            note = ("所有显示器范围需要 macOS 14.2 或更高版本及屏幕录制权限。"
+                    "已识别的无痕窗口会排除。未设域名排除时，无法判断是否无痕的窗口仍可采集。" + note)
+        section.addWidget(_text(note, size=11, color=MUTED, wrap=True))
+        section.addWidget(self._checkboxes["observation_browser_metadata"])
         exclusions = QPushButton("编辑排除应用与域名")
+        exclusions.setObjectName("settings-observation-exclusions")
         exclusions.clicked.connect(self._edit_exclusions)
         section.addWidget(exclusions)
         documents = QPushButton("编辑文档名权限")
@@ -265,6 +287,7 @@ class SettingsPanel(_Panel):
         for key, widget in self._durations.items():
             with QSignalBlocker(widget):
                 widget.setValue(getattr(self._settings, key) / 60)
+        self._screen_scope.setCurrentIndex(self._screen_scope.findData(self._settings.observation_screen_scope))
         self._load_habits()
         self._render_routes()
         self._render_document_permissions()
@@ -354,14 +377,18 @@ class SettingsPanel(_Panel):
         body = QVBoxLayout(dialog)
         form = QFormLayout()
         apps = QLineEdit(", ".join(self._settings.observation_excluded_apps))
-        apps.setPlaceholderText("应用名称，逗号分开")
+        apps.setObjectName("settings-observation_excluded_apps")
+        apps.setPlaceholderText("应用名称片段或 Bundle ID，逗号分开")
         domains = QLineEdit(", ".join(self._settings.observation_excluded_domains))
         domains.setPlaceholderText("例如 example.com")
         form.addRow("应用", apps)
         form.addRow("域名", domains)
         body.addLayout(form)
-        body.addWidget(_text("域名排除含子域名。启用域名排除后，无法确认网页域名时会跳过截图。",
-                             size=11, color=MUTED, wrap=True))
+        body.addWidget(_text(
+            "应用名称与 Bundle ID 均按片段匹配。所有显示器范围内，前台和后台窗口均适用。"
+            "域名排除含子域名。启用域名排除后，无法确认域名的浏览器窗口会被排除。",
+            size=11, color=MUTED, wrap=True,
+        ))
         buttons = _dialog_buttons(dialog)
         buttons.accepted.connect(dialog.accept)
         body.addWidget(buttons)
@@ -500,8 +527,9 @@ class SettingsPanel(_Panel):
                 if role == "system2" and not local:
                     status += "\n活动摘要分享已开启" if snapshot.permission else "\n活动摘要分享已关闭"
                 elif role == VISION and snapshot.permission:
-                    status += ("\n已授权截图与近期系统信号" if snapshot.vision_signals_permission
-                               else "\n已授权截图")
+                    status += "\n已授权所选范围内的截图"
+                    if snapshot.vision_signals_permission:
+                        status += "与近期系统信号"
                 elif snapshot.permission:
                     status += "\n已授权该接收方"
                 if snapshot.last_success:
