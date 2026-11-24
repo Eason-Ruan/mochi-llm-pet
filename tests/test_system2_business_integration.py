@@ -325,19 +325,24 @@ def test_chat_binds_the_users_literal_reminder_times(business, message, fields):
         host.close()
 
 
-def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(business):
+@pytest.mark.parametrize(("request_text", "title", "minutes"), [
+    ("一分钟后提醒我喝水", "喝水", 1),
+    ("过十分钟提醒我去上厕所", "去上厕所", 10),
+    ("请过１０分钟后准时提醒我起身。", "起身", 10),
+])
+def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(business, request_text, title, minutes):
     def unexpected_model(*_):
         pytest.fail("literal reminder and capability question should run locally")
 
     host = host_for(business, unexpected_model)
     try:
         start = business.clock.wall_now()
-        host.submit_user("一分钟后提醒我喝水", event_id="water")
+        host.submit_user(request_text, event_id="relative-reminder")
         business.clock.advance(3)
         assert host.pump()
         task, = business.tasks.list_tasks()
-        due = start + timedelta(minutes=1)
-        assert task.draft.content == "喝水"
+        due = start + timedelta(minutes=minutes)
+        assert task.draft.content == title
         assert task.draft.mode == "hard"
         assert task.draft.opens_at == task.draft.hard_deadline == due
 
@@ -345,7 +350,7 @@ def test_chat_creates_relative_reminder_at_the_user_event_time_without_a_model(b
         assert host.pump()
         assert len(business.tasks.list_tasks()) == 1
         created, capability = host.ui_events()
-        assert created.payload["text"] == "已设置提醒「喝水」。"
+        assert created.payload["text"] == f"已设置提醒「{title}」。"
         assert "可以直接叫我设提醒" in capability.payload["text"]
 
         host.submit_user("1秒后提醒我休息", event_id="elapsed-reminder")
