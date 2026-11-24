@@ -124,7 +124,7 @@ _MULTIMODAL_SYSTEM = (
 _WINDOW_SCENE_TARGET = "Use the dominant visible interface even within a browser."
 _DESKTOP_SCENE_TARGET = (
     "The image is one filtered desktop capture, with connected displays shown in separate panels. "
-    "The first panel is labeled Active display because it contains the foreground window. "
+    "The first panel contains the foreground window. With multiple panels it is labeled Active display. "
     "In this panel, describe only the application window that visibly has focus. Other windows may show background "
     "music or video, including on a secondary display. Ignore their contents when reporting activity, "
     "visible elements, changes, and document titles. When window focus is ambiguous, use unknown for both "

@@ -22,6 +22,8 @@ _OBSERVATION_PRIVACY_FIELDS = {
     "observation_excluded_apps", "observation_excluded_domains",
     "document_local_sources", "document_cloud_sources",
 }
+# Allow a concurrent business commit to finish before treating policy as unavailable.
+OBSERVATION_POLICY_READ_TIMEOUT_S = 0.15
 
 
 class SettingsConflict(ValueError):

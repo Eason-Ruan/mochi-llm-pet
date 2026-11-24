@@ -150,6 +150,61 @@ def test_supervisor_releases_child_on_pause_and_starts_with_updated_policy(tmp_p
     assert children[-1].stdin.closed and len(children) == 3
 
 
+def test_observation_policy_waits_for_a_short_business_write(tmp_path, monkeypatch):
+    from deskpet.observation_v2.__main__ import _desktop_policies
+
+    child = SimpleNamespace(stdin=io.BytesIO(), poll=lambda: None)
+    monkeypatch.setattr("deskpet.observation_v2.desktop.subprocess.Popen", lambda *args, **kwargs: child)
+    observer = DesktopObserver(tmp_path)
+    current = observer.settings.update(expected_version=0, observation_screenshots=True)
+    observer.start()
+
+    stop = Event()
+    args = SimpleNamespace(
+        cloud_settings=observer.settings_path, user_scope=observer.settings.user_scope,
+        observation_generation=current.observation_generation,
+        browser_metadata=False, exclude_app=(), exclude_domain=(),
+    )
+    request_policy, capture_policy, _, _ = _desktop_policies(args, stop)
+
+    def start_reader(pool, read):
+        started = Event()
+
+        def run():
+            started.set()
+            return read()
+
+        future = pool.submit(run)
+        assert started.wait(1)
+        return future
+
+    with closing(sqlite3.connect(observer.settings_path)) as writer, ThreadPoolExecutor(max_workers=2) as pool:
+        writer.execute("PRAGMA journal_mode = DELETE")
+        writer.execute("BEGIN EXCLUSIVE")
+        capture = start_reader(pool, capture_policy)
+        refresh = start_reader(pool, observer.refresh)
+        for reader in (capture, refresh):
+            with pytest.raises(FutureTimeout):
+                reader.result(timeout=0.02)
+        writer.rollback()
+        assert capture.result(timeout=1) == current.observation_generation
+        refresh.result(timeout=1)
+        assert not child.stdin.closed
+
+        writer.execute("BEGIN EXCLUSIVE")
+        assert capture_policy() is None
+        writer.rollback()
+        assert capture_policy() == current.observation_generation
+
+        writer.execute("BEGIN EXCLUSIVE")
+        request = start_reader(pool, request_policy)
+        with pytest.raises(FutureTimeout):
+            request.result(timeout=0.02)
+        stop.set()
+        writer.rollback()
+        assert request.result(timeout=1) is None
+
+
 def test_managed_cli_pins_scope_and_revokes_previous_worker(tmp_path, monkeypatch):
     from deskpet.observation_v2 import __main__ as cli
 

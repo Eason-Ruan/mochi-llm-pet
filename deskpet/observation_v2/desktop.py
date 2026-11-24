@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 
-from deskpet.settings import SettingsStore
+from deskpet.settings import OBSERVATION_POLICY_READ_TIMEOUT_S, SettingsStore
 
 
 log = logging.getLogger(__name__)
@@ -70,7 +70,9 @@ class DesktopObserver:
                 self._process = None
                 self._stop_requested_at = None
         try:
-            with closing(sqlite3.connect(self.settings_path.as_uri() + "?mode=ro", uri=True, timeout=0)) as db:
+            with closing(sqlite3.connect(
+                self.settings_path.as_uri() + "?mode=ro", uri=True, timeout=OBSERVATION_POLICY_READ_TIMEOUT_S,
+            )) as db:
                 prefs = self.settings.read(db=db)
             policy = None if prefs.observation_paused else self._arguments(prefs)
         except (ValueError, OSError, sqlite3.Error):

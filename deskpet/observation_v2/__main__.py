@@ -122,19 +122,20 @@ def _manage_cloud(arguments: argparse.Namespace) -> None:
 
 
 def _desktop_policies(arguments: argparse.Namespace, stop_event: Event | None):
-    from deskpet.settings import SettingsStore
+    from deskpet.settings import OBSERVATION_POLICY_READ_TIMEOUT_S, SettingsStore
 
     def preferences():
         if stop_event is not None and stop_event.is_set():
             return None
         try:
             settings = SettingsStore.read_at(
-                arguments.cloud_settings, user_scope=arguments.user_scope, timeout=0,
+                arguments.cloud_settings, user_scope=arguments.user_scope, timeout=OBSERVATION_POLICY_READ_TIMEOUT_S,
             )
         except (OSError, RuntimeError, ValueError, sqlite3.Error):
             return None
         if (
-            settings.observation_paused
+            (stop_event is not None and stop_event.is_set())
+            or settings.observation_paused
             or (arguments.observation_generation is not None
                 and settings.observation_generation != arguments.observation_generation)
             or settings.observation_browser_metadata != arguments.browser_metadata
