@@ -15,7 +15,7 @@ from deskpet.observation_v2.routes import CloudRouteError
 
 from .intent import allows, ref_id
 from .protocol import ToolAuthority, UiEvent
-from .tool_schema import READ_TOOLS
+from .tool_schema import READ_TOOLS, canonical_tool_name
 
 
 def json_text(value) -> str:
@@ -53,7 +53,7 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS s2_calls(
         command_id TEXT PRIMARY KEY, admission_id TEXT NOT NULL, step_id TEXT NOT NULL,
         native_call_id TEXT NOT NULL, function TEXT NOT NULL,
-        fingerprint TEXT NOT NULL, result TEXT, declared_reason TEXT,
+        fingerprint TEXT NOT NULL, result TEXT, declared_reason TEXT, review_key TEXT,
         UNIQUE(admission_id, native_call_id))""",
     """CREATE TABLE IF NOT EXISTS s2_decisions(
         decision_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, as_of TEXT NOT NULL,
@@ -105,6 +105,8 @@ class AdmissionStore:
             call_columns = {row["name"] for row in db.execute("PRAGMA table_info(s2_calls)")}
             if "declared_reason" not in call_columns:
                 db.execute("ALTER TABLE s2_calls ADD COLUMN declared_reason TEXT")
+            if "review_key" not in call_columns:
+                db.execute("ALTER TABLE s2_calls ADD COLUMN review_key TEXT")
             db.execute("""
                 INSERT INTO s2_owners VALUES (?, ?) ON CONFLICT(user_scope)
                 DO UPDATE SET token = excluded.token
@@ -300,6 +302,13 @@ class AdmissionStore:
                 rejection["_attempt_target"] = attempt_target
             if prior:
                 return None, _failure(command_id, "RESULT_PENDING", status="pending")
+            review_key = None
+            if admission.source == "background" and function not in READ_TOOLS:
+                review_key = _background_review_key(function, args)
+                if origin := _scope_review_origin(admission.event):
+                    prior_effect = self._scope_review_prior_effect(db, origin, command_id, fingerprint, review_key)
+                    if prior_effect is not None:
+                        return None, prior_effect
             calls = db.execute("""
                 SELECT function, fingerprint, result FROM s2_calls WHERE admission_id = ? ORDER BY rowid
             """, (admission.admission_id,)).fetchall()
@@ -326,11 +335,12 @@ class AdmissionStore:
                        (admission.admission_id, step_id, admission.generation, timestamp(now)))
             db.execute("""
                 INSERT INTO s2_calls(
-                    command_id, admission_id, step_id, native_call_id, function, fingerprint, declared_reason, result
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    command_id, admission_id, step_id, native_call_id, function, fingerprint, declared_reason,
+                    result, review_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (command_id, admission.admission_id, step_id, native_call_id, function, fingerprint,
                   args.get("reason_code") if function == "reminder.present" else None,
-                  json_text(rejection) if rejection else None))
+                  json_text(rejection) if rejection else None, review_key))
         return (None, rejection) if rejection else (command_id, None)
 
     def save_call_result(self, command_id, result):
@@ -345,28 +355,48 @@ class AdmissionStore:
                          for row in db.execute("SELECT * FROM s2_calls WHERE admission_id = ? ORDER BY rowid",
                                                (admission_id,)))
 
-    def _background_effect_committed(self, db, admission_id):
+    def _background_write_results(self, db, admission_id):
         # Business receipts are written in the same transaction as the effect.
         # An interruption may land after that commit but before s2_calls is saved.
         durable_receipts = db.execute("""SELECT 1 FROM sqlite_master WHERE type='table'
             AND name='system2_command_receipts'""").fetchone()
-        for command_id, function, _, recorded in self.calls(admission_id, db=db):
-            if function in READ_TOOLS:
+        rows = db.execute("""
+            SELECT c.command_id, c.function, c.fingerprint, c.review_key, c.result
+            FROM s2_calls c JOIN s2_admissions a ON a.admission_id=c.admission_id
+            WHERE c.admission_id=? AND a.user_scope=? AND a.source='background'
+            ORDER BY c.rowid
+        """, (admission_id, self.scope))
+        for call in rows:
+            if call["function"] in READ_TOOLS:
                 continue
+            recorded = json.loads(call["result"]) if call["result"] else None
+            result = recorded
             if durable_receipts:
                 stored = db.execute("""SELECT result FROM system2_command_receipts
-                    WHERE user_scope=? AND command_id=?""", (self.scope, command_id)).fetchone()
-                result = json.loads(stored["result"]) if stored else recorded
-            else:
-                result = recorded
-                if result is None or result["status"] == "timeout":
-                    return True
-            if (result and result.get("outcome") != "quiet"
-                    and (result.get("original_status") or result["status"]) in {"applied", "accepted", "pending"}):
+                    WHERE user_scope=? AND command_id=?""", (self.scope, call["command_id"])).fetchone()
+                if stored:
+                    result = json.loads(stored["result"])
+            yield call, result, bool(durable_receipts)
+
+    def _background_effect_committed(self, db, admission_id):
+        for _, result, durable_receipts in self._background_write_results(db, admission_id):
+            if _committed_status(result) or not durable_receipts and _result_unknown(result):
                 return True
         return False
 
-    def finish(self, admission, decision, reply, session_id, prompt_version, *, expected_state, recover_wakes=None):
+    def _scope_review_prior_effect(self, db, origin, command_id, fingerprint, review_key):
+        uncertain = False
+        for call, result, _ in self._background_write_results(db, origin):
+            if call["fingerprint"] != fingerprint and (review_key is None or call["review_key"] != review_key):
+                continue
+            if status := _committed_status(result):
+                return {"call_id": command_id, "status": "duplicate", "original_status": status,
+                        "outcome": "duplicate"}
+            uncertain = uncertain or _result_unknown(result)
+        return _failure(command_id, "RESULT_UNKNOWN") if uncertain else None
+
+    def finish(self, admission, decision, reply, session_id, prompt_version, *, expected_state,
+               recover_wakes=None, review_scope=None):
         with self.write() as db:
             if not self._owned(db):
                 return
@@ -378,8 +408,11 @@ class AdmissionStore:
                                   (admission.admission_id, self.scope, decision["as_of"], json_text(decision)))
             if inserted.rowcount != 1:
                 return
-            if recover_wakes is not None and not self._background_effect_committed(db, admission.admission_id):
-                recover_wakes(db)
+            if admission.source == "background" and not _scope_review_origin(admission.event):
+                if review_scope is not None:
+                    review_scope(db)
+                elif recover_wakes is not None and not self._background_effect_committed(db, admission.admission_id):
+                    recover_wakes(db)
             if reply is not None:
                 event_id = admission.user_intent["message_id"]
                 db.execute("""
@@ -426,6 +459,40 @@ def _action_fence(function, subject_ref):
 def _call_fence(function, args):
     target = next((ref_id(args[key]) for key in ("id", "item_id", "occurrence_id") if key in args), None)
     return _action_fence(function, target)
+
+
+def _scope_review_origin(event):
+    return next((wake["scope_review_of"] for wake in event.get("wakes", ()) if wake.get("scope_review_of")), None)
+
+
+def _background_review_key(function, args):
+    if function == "proposal.offer":
+        offered = canonical_tool_name(args["function"])
+        payload = args["args"]
+        target = ref_id(payload.get("id") or payload.get("previous_phase_id"))
+        kind = payload.get("kind", "focus") if offered == "phase.start" else None
+        identity = (offered, target, kind)
+    elif function == "reminder.present":
+        identity = tuple(ref_id(target) for target in args["occurrence_ids"])
+    elif function in {"reminder.recheck", "observation.wait_fresh", "decision.recheck"}:
+        identity = (args.get("purpose"), ref_id(args.get("occurrence_id")))
+    elif function == "pet.present":
+        identity = ()
+    else:
+        return None
+    return stable_id(function, json_text(identity))
+
+
+def _committed_status(result):
+    if result and result.get("outcome") != "quiet":
+        status = result.get("original_status") or result.get("status")
+        if status in {"applied", "accepted", "pending"}:
+            return status
+    return None
+
+
+def _result_unknown(result):
+    return result is None or result.get("status") == "timeout"
 
 
 def _failure(call_id, code, *, status="rejected"):

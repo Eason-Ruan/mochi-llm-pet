@@ -148,13 +148,18 @@ def _register(name, summary, **fields):
     _DEFINITIONS.append(ToolDefinition(wire_name, name, summary, model.model_json_schema()))
 
 
-_register("context.read", "Read decision evidence. Optional history_start and history_end select a time range "
-          "within the last hour of as_of. Request capture health for observation diagnostics. "
-          "Set include_document_source only when the user asks which document was observed. "
-          "Historical evidence never authorizes an early reminder.",
+_CONTEXT_READ_V13 = (
+    "Read decision evidence. Optional history_start and history_end select a time range "
+    "within the last hour of as_of. Request capture health for observation diagnostics. "
+    "Set include_document_source only when the user asks which document was observed. "
+    "Historical evidence never authorizes an early reminder."
+)
+_CONTEXT_READ_V14 = _CONTEXT_READ_V13 + " Use activity_window for time shares and representative activities."
+_register("context.read", _CONTEXT_READ_V14,
           as_of=(AwareDatetime | None, None), history_start=(AwareDatetime | None, None),
           history_end=(AwareDatetime | None, None), include_capture_health=(bool | None, None),
-          include_document_source=(StrictBool | None, None))
+          include_document_source=(StrictBool | None, None),
+          activity_window=(Literal["last_15m", "last_60m", "both"] | None, None))
 _register("item.get", "Read one reminder or issue by ID.", **Identified)
 _register("item.list", "List reminders or issues.", filter=(ItemFilter | None, None))
 _register("item.create", "Create a reminder or an issue that tracks a work goal or to-do. "
@@ -274,6 +279,17 @@ _DEFINITIONS.append(ToolDefinition(
 ))
 
 tool_definitions = tuple(_DEFINITIONS)
+
+
+def legacy_context_tool_schema(tools: list[dict]) -> list[dict]:
+    result = []
+    for tool in tools:
+        if tool["name"] == "context_read" and tool["description"] == _CONTEXT_READ_V14:
+            schema = tool["parameters"]
+            properties = {key: value for key, value in schema["properties"].items() if key != "activity_window"}
+            tool = {**tool, "description": _CONTEXT_READ_V13, "parameters": {**schema, "properties": properties}}
+        result.append(tool)
+    return result
 _WIRE_NAMES = {definition.name: definition.canonical_name for definition in tool_definitions}
 READ_TOOLS = frozenset({"context.read", "item.get", "item.list", "phase.get", "habit.get",
                         "habit.list", "settings.get", "command.get_result"})
@@ -284,6 +300,11 @@ def canonical_tool_name(name):
 
 
 def validate_tool_args(name, args, *, relative_time=False):
+    if name == "reminder.present" and isinstance(args, dict):
+        options = args.get("presentation")
+        if isinstance(options, str) and options.lstrip().startswith("{"):
+            presentation = ReminderPresentation.model_validate_json(options)
+            args = {**args, "presentation": presentation.model_dump(mode="json", exclude_unset=True)}
     if name == "proposal.offer":
         model = _proposal_adapter.validate_python(args)
     else:

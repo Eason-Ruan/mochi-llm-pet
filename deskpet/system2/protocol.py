@@ -6,7 +6,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from sqlite3 import Connection
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .prompt import PromptSelection
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +26,8 @@ class TurnRequest:
     observation_generation: int | None = None
     observation_privacy_marker: tuple[str | None, int, bool | None] | None = None
     observation_document_query: bool = False
+    prompt_selection: PromptSelection | None = None
+    is_scope_current: Callable[[], bool] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

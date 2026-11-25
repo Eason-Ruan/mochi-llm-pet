@@ -6,9 +6,10 @@ import pytest
 
 from deskpet.contracts import DecisionEnvelope, ErrorCode, TaskCommand
 from deskpet.m0.composition import build_environment
+from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import FakeClock
 from deskpet.mocks.policy import ScriptedSlowPlanner
-from deskpet.observation_v2.activity import ActivityRecorder, ActivitySample
+from deskpet.observation_v2.activity import Activity, ActivityRecorder, ActivitySample
 from deskpet.observation_v2.context import ObservationContextReader, project_observation_context
 from deskpet.observation_v2.pipeline import ObservationStore, _live_writer
 from deskpet.observation_v2.state import Observation
@@ -16,6 +17,22 @@ from deskpet.observation_v2.vision import MultimodalScreenObservation, ScreenObs
 from deskpet.system2.dsh_projection import project_context
 
 NOW = datetime(2026, 11, 23, 2, tzinfo=UTC)
+
+
+def at(offset):
+    return NOW + timedelta(seconds=offset)
+
+
+def record_activity(store, start, end, app_name=None, **fields):
+    with store.connection:
+        return store._insert(Activity(0, at(start), at(end), end - start, app_name, **fields)).activity_id
+
+
+def record_frame(store, activity_id, offset, kind, *, scene="video", summary=None, late=False, available=None):
+    store.save_screen(MultimodalScreenObservation(
+        f"frame-{activity_id}-{offset}", activity_id, at(offset), "ready", "fixture",
+        scene, activity_kind=kind, screen_summary=summary, unfiltered_desktop=summary is not None,
+    ), processed_at=at(offset if available is None else available), realtime_eligible=not late)
 
 
 def publish(store, seconds, *, state="working", kind="work", summary=None, revision=1, latency=0):
@@ -270,6 +287,14 @@ def test_activity_history_keeps_distinct_visual_times_under_existing_sharing_con
         ]
         assert all(capture["activity_kind"] == "work" and capture["scene_elements"] == ["code editor"]
                    for capture in captures)
+        focus = view["focus_evidence_2m"]
+        assert focus["complete"] and not focus["gaps"]
+        assert [entry["observed_at"] for entry in focus["visual_observations"]] == [
+            at(seconds).isoformat() for seconds in (30, 60, 90, 90, 105, 120)
+        ]
+        assert [entry["late"] for entry in focus["visual_observations"]] == [
+            False, False, False, False, True, False,
+        ]
         assert segment["last_observed_at"] == at(121).isoformat()
         assert segment["sample_count"] == 8
         assert view["last_observed_activity"]["relation"] == "current"
@@ -300,6 +325,191 @@ def test_activity_history_keeps_distinct_visual_times_under_existing_sharing_con
                 for part in after_gap["segments"]] == [
             visual_times, [at(122).isoformat()], [at(124).isoformat()], [], [at(126).isoformat()],
         ]
+
+
+def test_activity_windows_count_authorized_time_before_visual_and_history_compression(tmp_path):
+    path = tmp_path / "observation.sqlite"
+    with ObservationStore(path, live=True) as store:
+        work = record_activity(store, -4000, -600, "Editor")
+        record_frame(store, work, -3900, "work", scene="ide", summary="An older editor view.")
+        record_frame(store, work, -700, "work", scene="ide")
+        study = record_activity(store, -600, -400, "Browser")
+        record_frame(store, study, -600, "study")
+        record_frame(store, study, -500, "leisure")
+        record_activity(store, -400, -300, "Unclassified")
+        other = record_activity(store, -300, -175, "Other")
+        record_frame(store, other, -300, "other")
+        record_activity(store, -260, -200, screen_locked=True)
+        private = record_activity(store, -200, -100, "Browser", domain="sub.private.example")
+        record_frame(store, private, -200, "leisure", summary="This account is excluded.")
+        pending = record_activity(store, -50, 0, "Player")
+        record_frame(store, pending, -50, "leisure", available=1)
+
+    reader = ObservationContextReader(path)
+    context = reader.read_observation_context(NOW)
+    view = project_observation_context(context, share_summary=True, excluded_domains=("private.example",))
+    windows = view["activity_windows"]
+    assert windows["last_15m"]["seconds"] == {
+        "work": 300, "study": 100, "leisure": 100, "other": 40, "unknown": 150, "unobserved": 210,
+    }
+    assert windows["last_60m"]["seconds"] == {**windows["last_15m"]["seconds"], "work": 3000}
+    assert windows["last_15m"]["to_at"] == windows["last_60m"]["to_at"] == NOW.isoformat()
+    assert windows["last_15m"]["percent"]["unobserved"] == 23.33
+    assert windows["last_60m"]["percent"]["work"] == 83.33
+    for window in windows.values():
+        assert sum(window["seconds"].values()) == window["duration_s"]
+        assert [item["observed_at"] for item in window["representative_summaries"]] == [
+            at(-700).isoformat(), at(-500).isoformat(),
+        ]
+    assert "older editor view" not in str(windows) and "account is excluded" not in str(windows)
+    assert "focus_evidence_2m" not in project_observation_context(context, share_summary=True, historical=True)
+    assert project_observation_context(context)["activity_windows"]["last_60m"]["seconds"]["unobserved"] == 3600
+
+    bounded = reader.read_observation_context(NOW, history_start=at(-700), history_end=at(-600)).to_dict()
+    assert "activity_windows" not in bounded and "focus_evidence_2m" not in bounded
+
+
+def test_focus_evidence_keeps_evicted_and_late_contradictions_and_reports_gaps(tmp_path):
+    path = tmp_path / "observation.sqlite"
+    doc_name = "research-cases.py"
+    with ObservationStore(path, live=True) as store:
+        editor = record_activity(store, -170, -119, "Visual Studio Code", document_name=doc_name,
+                                 document_source="app:vscode", document_status="identified")
+        record_frame(store, editor, -140, "work", scene="ide")
+        first = record_activity(store, -119, -56, "Player")
+        record_frame(store, first, -115, "study", summary="An online course is playing.")
+        for offset in (-110, -100, -90, -80, -70):
+            record_frame(store, first, offset, "leisure", scene="video" if offset % 20 else "game")
+        record_activity(store, -59, -55, screen_locked=True)
+        record_frame(store, first, -59, "leisure", summary="The hidden interval.")
+        second = record_activity(store, -53, 0, "Player")
+        for offset in (-50, -40, -30, -20, -10):
+            record_frame(store, second, offset, "leisure", scene="video" if offset % 20 else "game",
+                         summary=f"A clip mentioned {doc_name}." if offset == -10 else None)
+        record_frame(store, second, -35, "study", summary="A lecture is visible.", late=True)
+
+    reader = ObservationContextReader(path)
+    view = reader.read_observation_context(NOW).to_dict()
+    history = view["history_1h"]
+    assert history["stats"]["omitted_segment_count"] > 0
+    assert at(-115).isoformat() not in str(history["segments"])
+    assert doc_name not in str(history["segments"][:-1])
+    focus = view["focus_evidence_2m"]
+    assert focus["complete"]
+    assert focus["from_at"] == at(-120).isoformat() and focus["to_at"] == NOW.isoformat()
+    assert {"from_at": at(-59).isoformat(), "to_at": at(-53).isoformat()} in focus["gaps"]
+    frames = {entry["observed_at"]: entry for entry in focus["visual_observations"]}
+    assert frames[at(-115).isoformat()]["activity_kind"] == "study"
+    assert frames[at(-35).isoformat()]["activity_kind"] == "study"
+    assert frames[at(-35).isoformat()]["late"] is True
+    assert frames[at(-10).isoformat()]["summary"] is None
+    assert at(-59).isoformat() not in frames
+    assert doc_name not in str(view["activity_windows"])
+    assert doc_name not in str(view)
+    bounded = project_observation_context(
+        reader.read_observation_context(NOW, history_start=at(-20), history_end=at(-5)),
+        share_summary=True, historical=True,
+    )
+    assert bounded["history_1h"]["segments"][-1]["summary"] is None
+    assert doc_name not in str(bounded)
+    with_titles = project_observation_context(reader.read_observation_context(NOW), share_summary=True,
+                                              document_sources=("app:vscode",))
+    approved = project_observation_context(
+        reader.read_observation_context(NOW, history_start=at(-160), history_end=at(-125)),
+        share_summary=True, document_sources=("app:vscode",), historical=True,
+    )
+    assert doc_name not in str(with_titles)
+    assert approved["history_1h"]["segments"][-1]["document_name"] == doc_name
+
+
+def test_focus_evidence_does_not_treat_partially_recorded_spans_as_continuous(tmp_path):
+    path = tmp_path / "observation.sqlite"
+    with ObservationStore(path, live=True) as store:
+        player = record_activity(store, -120, 0, "Player")
+        record_frame(store, player, -80, "leisure")
+        record_frame(store, player, -40, "leisure")
+        with store.connection:
+            store.connection.execute("UPDATE activities SET duration_s=1 WHERE activity_id=?", (player,))
+
+    view = ObservationContextReader(path).read_observation_context(NOW).to_dict()
+    assert view["activity_windows"]["last_15m"]["seconds"]["unobserved"] == 899
+    focus = view["focus_evidence_2m"]
+    assert focus["complete"] and len(focus["visual_observations"]) == 2
+    assert focus["gaps"] == [{"from_at": at(-120).isoformat(), "to_at": NOW.isoformat()}]
+
+
+def test_activity_timeline_policy_generation_uses_recorded_order_across_clock_rollback(tmp_path):
+    path = tmp_path / "observation.sqlite"
+    reader = ObservationContextReader(path, boot_id="boot")
+    with ObservationStore(path, live=True, boot_id="boot") as store:
+        store.begin_live_run(at(-80), policy_generation=4)
+        old = record_activity(store, -70, -40, "Player")
+        record_frame(store, old, -60, "leisure", summary="An older scope.")
+        store.begin_live_run(at(-110), policy_generation=5)
+        current = record_activity(store, -100, -30, "Editor")
+        record_frame(store, current, -100, "work", scene="ide")
+        store.begin_live_run(at(-25), policy_generation=5)
+        record_activity(store, -20, 0, "Browser")
+
+    matched = reader.read_realtime_context(NOW, include_current=False, policy_generation=5).to_dict()
+    assert matched["activity_windows"]["last_15m"]["seconds"]["work"] == 70
+    assert [entry["observed_at"] for entry in matched["focus_evidence_2m"]["visual_observations"]] == [
+        at(-100).isoformat(),
+    ]
+    mismatch = reader.read_realtime_context(NOW, include_current=False, policy_generation=6).to_dict()
+    assert mismatch["activity_windows"]["last_15m"]["seconds"]["unobserved"] == 900
+    assert not mismatch["focus_evidence_2m"]["complete"]
+    assert mismatch["focus_evidence_2m"]["visual_observations"] == []
+
+
+def test_older_overlapping_owner_cannot_override_a_newer_locked_interval(tmp_path):
+    path = tmp_path / "observation.sqlite"
+    with ObservationStore(path, live=True) as store:
+        editor = record_activity(store, -60, -20, "Editor")
+        record_frame(store, editor, -50, "work", scene="ide")
+        record_activity(store, -80, -30, screen_locked=True)
+        record_activity(store, -25, 0, "Player")
+
+    view = ObservationContextReader(path).read_observation_context(NOW).to_dict()
+    assert view["activity_windows"]["last_15m"]["seconds"]["work"] == 0
+    assert view["focus_evidence_2m"]["visual_observations"] == []
+
+
+def test_desktop_discards_activity_timeline_if_policy_changed_without_a_live_estimate(tmp_path, monkeypatch):
+    path = tmp_path / "observation.sqlite"
+    with ObservationStore(path, live=True) as store:
+        store.begin_live_run(at(-100), policy_generation=3)
+        app = record_activity(store, -90, 0, "Editor")
+        record_frame(store, app, -70, "work")
+
+    reader = DesktopObservationInput(path)
+    policies = iter(((True, 3), (True, 4)))
+    monkeypatch.setattr(reader, "_policy", lambda **_: next(policies))
+    view = reader.read_observation_context(NOW).to_dict()
+    assert view["current_status"] == "context_changed"
+    assert view["activity_windows"]["last_15m"]["seconds"]["unobserved"] == 900
+    assert not view["focus_evidence_2m"]["complete"]
+
+
+@pytest.mark.parametrize("missing_columns", [True, False])
+def test_legacy_activity_timeline_keeps_coverage_and_marks_evidence_incomplete(tmp_path, missing_columns):
+    path = tmp_path / "legacy.sqlite"
+    with ObservationStore(path) as store:
+        editor = record_activity(store, -100, 0, "Editor")
+        record_frame(store, editor, -90, "work", scene="ide")
+        with store.connection:
+            if missing_columns:
+                store.connection.execute("ALTER TABLE screen_observations DROP COLUMN processed_at")
+                store.connection.execute("ALTER TABLE screen_observations DROP COLUMN realtime_eligible")
+            else:
+                store.connection.execute("UPDATE screen_observations SET processed_at = NULL")
+
+    view = ObservationContextReader(path).read_observation_context(NOW).to_dict()
+    seconds = view["activity_windows"]["last_15m"]["seconds"]
+    assert (seconds["work"], seconds["unknown"], seconds["unobserved"]) == (90, 10, 800)
+    focus = view["focus_evidence_2m"]
+    assert not focus["complete"]
+    assert [entry["late"] for entry in focus["visual_observations"]] == [True]
 
 
 def test_document_history_stays_timed_and_separate_from_interruptibility(tmp_path):

@@ -52,6 +52,28 @@ def runtime(tmp_path):
     business.close()
 
 
+def test_selected_command_does_not_disclose_a_previous_admissions_receipt(runtime):
+    _, create = runtime
+    results = {}
+
+    def model(request, payload, call):
+        if "command_id" not in results:
+            created = call("item_create", "create", {"type": "issue", "title": "整理资料"})
+            results["command_id"] = created["call_id"]
+        results[request.admission_id] = call("command_get_result", "lookup", {"command_id": results["command_id"]})
+        return "好"
+
+    host = create(model)
+    try:
+        first = host.submit_user("创建事项整理资料。", event_id="first")
+        assert host.pump() and results[first]["status"] == "applied"
+        second = host.submit_user("查询上次回执。", event_id="second",
+                                  selected_ref={"kind": "command", "id": results["command_id"]})
+        assert host.pump() and results[second]["error_code"] == "NOT_AUTHORIZED"
+    finally:
+        host.close()
+
+
 def test_proposal_button_queued_during_pump_uses_time_of_execution(runtime, monkeypatch):
     business, create = runtime
     business.auto_adjust()

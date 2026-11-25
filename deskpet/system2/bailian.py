@@ -19,8 +19,11 @@ def _sse_events(lines: Iterable[str]) -> Iterator[list[str]]:
 class BailianTurn:
     def __init__(self) -> None:
         self._reasoning: dict[frozenset[str], str] = {}
+        self.request_usage: list[dict[str, int]] = []
 
     def prepare(self, body: dict) -> None:
+        self.request_usage.append({})
+        body["stream_options"] = {"include_usage": True}
         # Qwen4-Max counts thinking and the answer against the shared output cap.
         body.update(enable_thinking=True, preserve_thinking=True, thinking_budget=1024)
         if (max_tokens := body.pop("max_tokens", None)) is not None:
@@ -42,6 +45,15 @@ class BailianTurn:
             data = "\n".join(line[5:].lstrip(" ") for line in event if line.startswith("data:"))
             if data and data != "[DONE]":
                 frame = json.loads(data)
+                usage = frame.get("usage")
+                if self.request_usage and isinstance(usage, dict):
+                    counts = self.request_usage[-1]
+                    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        if type(usage.get(field)) is int and usage[field] >= 0:
+                            counts[field] = usage[field]
+                    details = usage.get("prompt_tokens_details")
+                    if isinstance(details, dict) and type(details.get("cached_tokens")) is int:
+                        counts["cached_tokens"] = details["cached_tokens"]
                 for choice in frame.get("choices", []):
                     delta = choice.get("delta") or {}
                     if fragment := delta.pop("reasoning_content", None):

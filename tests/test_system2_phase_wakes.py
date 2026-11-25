@@ -1,7 +1,7 @@
 """Exercise semantic phase and power wakes through the production desktop composition."""
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 from threading import Event
 from types import SimpleNamespace
@@ -192,6 +192,14 @@ def test_resume_merges_elapsed_break_and_soft_recheck_after_restoring_timers(des
     elapsed, = turn["event"]["phase_elapsed"]
     assert elapsed["phase_id"] == rest.id
     assert elapsed["transition_reason"] == "elapsed_during_sleep"
+    wakes = {wake["reason"]: wake for wake in turn["event"]["wakes"]}
+    assert wakes["phase_elapsed"]["phase_elapsed"] == elapsed
+    assert wakes["phase_elapsed"]["subject_refs"] == [rest.id]
+    assert wakes["resume"]["occurrence_id"] is None
+    for reason in ("scheduled_recheck", "window_open"):
+        assert wakes[reason]["occurrence_id"] == result.view.occurrence_id
+        assert wakes[reason]["task_version"] == result.view.version
+        assert wakes[reason]["subject_refs"] == ["stretch"]
     assert turn["context"]["current_phase"] is None
     assert not runtime.host.pump()
 
@@ -428,6 +436,187 @@ def test_claim_merges_a_reason_committed_after_initial_poll(desktop, monkeypatch
     assert pending_wakes() == ()
 
 
+@pytest.mark.parametrize(("wake", "new_domain"), [("tick", "focus"), ("resume", "reminder")])
+def test_scope_change_opens_a_fresh_admission_after_a_committed_recheck(desktop, wake, new_domain):
+    runtime, env, engine, _ = desktop
+    runtime.settings.update(expected_version=runtime.settings.read().version, auto_adjust=False)
+    if wake == "tick":
+        env.clock.advance(60)
+        runtime.scheduler.poll()
+    else:
+        runtime.scheduler.resume()
+    now = env.clock.wall_now()
+    retry_at = now + timedelta(seconds=30)
+    outcomes = {}
+
+    def act(turn, invoke):
+        wake_entry, *carried = turn["event"]["wakes"]
+        if "scope_review_of" not in wake_entry:
+            assert not carried
+            assert wake_entry["reason"] == wake
+            assert "proposal.offer" not in turn["grants"] and "reminder.present" not in turn["grants"]
+            outcomes["defer"] = invoke("decision.recheck", "prior", {
+                "purpose": "pet_presentation", "recheck_at": retry_at.isoformat(),
+            })
+            if new_domain == "focus":
+                runtime.settings.update(expected_version=runtime.settings.read().version, auto_adjust=True)
+            else:
+                outcome = env.tasks.apply(TaskCommand(
+                    command_id="create:new", task_id="new", kind="create_registered",
+                    payload={"draft": {"content": "收衣服", "mode": "soft", "earliest_at": now}},
+                ))
+                assert outcome.status == "applied"
+            outcomes["stale"] = invoke("context.read", "changed", {})
+            return
+        assert wake_entry["reason"] == "tick" and wake_entry["occurrence_id"] is None
+        assert wake_entry["subject_refs"] == []
+        if wake == "resume":
+            original, = carried
+            assert original["reason"] == "resume" and original["carried_for_scope_review"]
+        else:
+            assert not carried
+        prior, = turn["context"]["recent_decisions"]
+        assert prior["decision_id"] == wake_entry["scope_review_of"]
+        assert prior["action_results"][0]["outcome"] == "deferred"
+        outcomes["duplicate"] = invoke("decision.recheck", "do-not-repeat", {
+            "purpose": "pet_presentation", "recheck_at": (retry_at + timedelta(seconds=5)).isoformat(),
+        })
+        if new_domain == "focus":
+            assert "phase.start" in turn["grants"]["proposal.offer"]["functions"]
+            outcomes["fresh"] = invoke("proposal.offer", "fresh-proposal", {
+                "function": "phase.start", "args": {"kind": "focus", "planned_duration_s": 1500},
+                "display_text": "开始专注？", "presentation": {"level": "passive"},
+            })
+        else:
+            occurrence, = turn["grants"]["reminder.present"]["occurrences"]
+            outcomes["fresh"] = invoke("reminder.present", "fresh-reminder", {
+                "occurrence_ids": [occurrence], "presentation": {"level": "passive"}, "reason_code": "available",
+            })
+
+    engine.action = act
+    assert runtime.host.pump()
+    assert outcomes["defer"]["outcome"] == "deferred"
+    assert outcomes["stale"]["error_code"] == "STALE_CONTEXT"
+    assert runtime.host.pump()
+    assert outcomes["duplicate"]["status"] == "duplicate"
+    assert outcomes["fresh"]["status"] in {"applied", "pending"}
+    assert len(engine.turns) == 2
+    assert not runtime.host.pump()
+    env.clock.advance(30)
+    pending, = runtime.scheduler.pending_wakes()
+    assert pending.reason == "pet_presentation" and pending.at == retry_at
+
+
+def test_scope_review_preserves_independent_wakes_and_does_not_chain(desktop):
+    runtime, env, engine, _ = desktop
+    runtime.settings.update(expected_version=runtime.settings.read().version, auto_adjust=False)
+    env.clock.advance(60)
+    now = env.clock.wall_now()
+
+    def create_reminder(task_id, **timing):
+        result = env.tasks.apply(TaskCommand(
+            command_id=f"create:{task_id}", task_id=task_id, kind="create_registered",
+            payload={"draft": {"content": task_id, "mode": "soft", "earliest_at": now, **timing}},
+        ))
+        assert result.status == "applied"
+        return result.view.occurrence_id
+
+    old = create_reminder("old")
+    runtime.scheduler.poll()
+    outcomes = {}
+
+    def act(turn, invoke):
+        wakes = turn["event"]["wakes"]
+        if len(engine.turns) == 1:
+            assert {entry["reason"] for entry in wakes} == {"tick", "window_open"}
+            outcomes["old"] = invoke("reminder.present", "old", {
+                "occurrence_ids": [old], "presentation": {"level": "passive"}, "reason_code": "available",
+            })
+            outcomes["independent"] = create_reminder("independent")
+            runtime.scheduler.poll()
+            runtime.settings.update(expected_version=runtime.settings.read().version, auto_adjust=True)
+            outcomes["first_change"] = invoke("context.read", "changed", {})
+        elif len(engine.turns) == 2:
+            independent, = wakes
+            assert independent["occurrence_id"] == outcomes["independent"]
+            assert "scope_review_of" not in independent
+        else:
+            review, original = wakes
+            assert review["scope_review_of"] and review["occurrence_id"] is None
+            assert original["occurrence_id"] == old and original["carried_for_scope_review"]
+            outcomes["duplicate"] = invoke("reminder.present", "old-again", {
+                "occurrence_ids": [old], "presentation": {"level": "passive"}, "reason_code": "busy",
+            })
+            create_reminder("estimate", target_at=now + timedelta(minutes=10))
+            outcomes["second_change"] = invoke("context.read", "changed-again", {})
+
+    engine.action = act
+    assert runtime.host.pump()
+    assert outcomes["old"]["status"] == "applied"
+    assert outcomes["first_change"]["error_code"] == "STALE_CONTEXT"
+    assert runtime.host.pump()
+    assert runtime.host.pump()
+    assert outcomes["duplicate"]["status"] == "duplicate"
+    assert outcomes["second_change"]["error_code"] == "STALE_CONTEXT"
+    assert not runtime.host.pump()
+
+
+@pytest.mark.parametrize("edit_original", [False, True])
+def test_scope_review_rechecks_unfinished_phase_and_occurrence_against_current_bounds(desktop, edit_original):
+    runtime, env, engine, _ = desktop
+    now = env.clock.wall_now()
+    phase = start(env, "focus", planned_duration_s=10)
+    earliest = now + timedelta(minutes=3)
+    old = env.tasks.apply(TaskCommand(
+        command_id="create:later", task_id="later", kind="create_registered",
+        payload={"draft": {"content": "稍后", "mode": "soft", "earliest_at": earliest}},
+    )).view
+    runtime.scheduler.schedule_recheck(occurrence_id=old.occurrence_id, run_at=now + timedelta(seconds=10))
+    env.clock.advance(10)
+    env.sessions.pump()
+
+    def act(turn, invoke):
+        assert turn["context"]["eligible_items"] == []
+        deferred = invoke("decision.recheck", "committed", {
+            "purpose": "pet_presentation", "recheck_at": (now + timedelta(seconds=30)).isoformat(),
+        })
+        assert deferred["outcome"] == "deferred"
+        new = env.tasks.apply(TaskCommand(
+            command_id="create:new", task_id="new", kind="create_registered",
+            payload={"draft": {"content": "新提醒", "mode": "soft", "target_at": now + timedelta(minutes=2)}},
+        ))
+        assert new.status == "applied"
+        assert invoke("context.read", "changed", {})["error_code"] == "STALE_CONTEXT"
+
+    engine.action = act
+    assert runtime.host.pump()
+    if edit_original:
+        edited = runtime.gateway.execute_local("item.update", {
+            "id": old.task_id, "expected_version": old.version, "patch": {"title": "新的内容"},
+        }, event_id="edit-original-after-claim")
+        assert edited.status == "applied"
+    engine.action = None
+    assert runtime.host.pump()
+    initial, resumed = engine.turns
+    assert initial["event"]["trigger_ids"] != resumed["event"]["trigger_ids"]
+    wakes = {entry["reason"]: entry for entry in resumed["event"]["wakes"]}
+    assert "scope_review_of" in wakes["tick"] and len(resumed["event"]["trigger_ids"]) == 1
+    assert wakes["phase_elapsed"]["carried_for_scope_review"]
+    assert wakes["phase_elapsed"]["phase_elapsed"]["phase_id"] == phase.id
+    if edit_original:
+        assert "scheduled_recheck" not in wakes
+        assert resumed["context"]["recheck_items"] == []
+    else:
+        assert wakes["scheduled_recheck"]["carried_for_scope_review"]
+        assert wakes["scheduled_recheck"]["occurrence_id"] == old.occurrence_id
+        recheck, = resumed["context"]["recheck_items"]
+        assert recheck["occurrence_id"] == old.occurrence_id
+        assert datetime.fromisoformat(recheck["rule"]["remind_after"]) == earliest
+    eligible, = resumed["context"]["eligible_items"]
+    assert eligible["id"] == "new"
+    assert old.occurrence_id not in resumed["grants"]["reminder.present"]["occurrences"]
+
+
 @pytest.mark.parametrize("wake_kind", ["phase_elapsed", "timer", "observation"])
 def test_transient_background_failure_retries_one_shot_wake_once(desktop, wake_kind):
     runtime, env, engine, store = desktop
@@ -457,8 +646,16 @@ def test_transient_background_failure_retries_one_shot_wake_once(desktop, wake_k
     first, second = [turn["event"] for turn in engine.turns]
     assert first["trigger_ids"] != second["trigger_ids"]
     assert second["trigger_reasons"] == first["trigger_reasons"]
+    original, = first["wakes"]
+    retry, = second["wakes"]
+    assert retry["retry_of_event_id"] == original["event_id"]
+    assert (retry["kind"], retry["reason"]) == (original["kind"], original["reason"])
     if wake_kind == "phase_elapsed":
         assert second["phase_elapsed"] == first["phase_elapsed"]
+    if wake_kind == "observation":
+        assert original["change_categories"] == retry["change_categories"] == ["activity_state"]
+        assert original["after_cursor"] == retry["after_cursor"] == 1
+        assert original["publication_cursor"] == retry["publication_cursor"] == 2
     env.clock.advance(5)
     assert not runtime.host.pump()
 

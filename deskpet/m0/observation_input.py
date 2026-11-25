@@ -1,6 +1,7 @@
 """Live Observation reads for the desktop. A failed read closes the soft-reminder gate."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import logging
 from pathlib import Path
@@ -92,9 +93,13 @@ class DesktopObservationInput:
                 context.current, current_at, started, (allowed, generation),
             ):
                 context = self.reader.read_realtime_context(
-                    as_of, include_current=False, busy_timeout_s=timeout,
+                    as_of, include_current=False, busy_timeout_s=timeout, policy_generation=generation,
                     history_start=history_start, history_end=history_end,
                 )
+            if self._policy(timeout=timeout) != (allowed, generation):
+                return replace(ObservationContext.empty(as_of), current_status="context_changed")
+            if not allowed:
+                context = replace(context, activity_timeline=None)
         except (sqlite3.Error, OSError, ValueError) as exc:
             self._failed(exc)
             return ObservationContext.empty(as_of)

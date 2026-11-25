@@ -13,6 +13,7 @@ import sqlite3
 from threading import Lock
 import time
 from typing import Literal
+import unicodedata
 
 from .documents import document_source_allowed, is_mochi_app, native_document_source, sanitize_document_name
 from .realtime import CLOCK_TOLERANCE_S, boot_id as system_boot_id, clocks_agree
@@ -22,6 +23,7 @@ from .vision import (
 )
 
 _HOUR = timedelta(hours=1)
+_FOCUS_WINDOW = timedelta(minutes=2)
 _GAP = timedelta(seconds=45)
 _RECENT_LIMIT = 3
 _SEGMENT_LIMIT = 8
@@ -73,6 +75,21 @@ class ActivityDetail:
     hidden: bool = False
     capture_id: str | None = None
     screen_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class _ActivitySpan:
+    started_at: datetime
+    ended_at: datetime
+    recorded_fraction: float
+    detail: ActivityDetail
+    frames: tuple[ActivityDetail, ...]
+
+
+@dataclass(frozen=True)
+class _ActivityTimeline:
+    spans: tuple[_ActivitySpan, ...] = ()
+    complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -171,10 +188,13 @@ class ObservationContext:
     history_end: datetime | None = None
     recent_activities: tuple[ActivityDetail, ...] | None = None
     current_visual: ActivityDetail | None = None
+    activity_timeline: _ActivityTimeline | None = None
+    realtime_confirmed: bool = False
+    document_names: frozenset[str] = frozenset()
 
     @classmethod
     def empty(cls, as_of: datetime) -> ObservationContext:
-        return cls(as_of, None, "no_data", _history([], None))
+        return cls(as_of, None, "no_data", _history([], None), activity_timeline=_ActivityTimeline())
 
     def to_dict(self) -> dict:
         return project_observation_context(self, share_summary=True)
@@ -200,7 +220,7 @@ class RealtimeBridge:
 
 OBSERVATION_CONTEXT_FIELDS = frozenset({
     "current", "current_status", "history", "current_context", "last_observed_activity", "interruptibility",
-    "history_1h", "capture_health",
+    "history_1h", "capture_health", "activity_windows", "focus_evidence_2m",
 })
 
 
@@ -308,6 +328,122 @@ def _excluded(detail: ActivityDetail, apps: tuple[str, ...], domains: tuple[str,
             or any(domain == host or domain.endswith(f".{host}") for host in domains))
 
 
+def _name_key(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _without_document_name(value: str | None, names: frozenset[str]) -> str | None:
+    if value and names:
+        key = _name_key(value)
+        if any(name in key for name in names):
+            return None
+    return value
+
+
+def _scrub_document_text(value: dict | list, names: frozenset[str]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"summary", "foreground_app"} and isinstance(child, str):
+                value[key] = _without_document_name(child, names)
+            elif isinstance(child, (dict, list)):
+                _scrub_document_text(child, names)
+    else:
+        for child in value:
+            if isinstance(child, (dict, list)):
+                _scrub_document_text(child, names)
+
+
+def _activity_window(spans: tuple[_ActivitySpan, ...], end: datetime, duration_s: int,
+                     document_names: frozenset[str]) -> dict:
+    start = end - timedelta(seconds=duration_s)
+    seconds = dict.fromkeys(_KINDS, 0.0)
+    representatives = []
+    for span in spans:
+        left, right = max(span.started_at, start), min(span.ended_at, end)
+        if right <= left or span.recorded_fraction <= 0:
+            continue
+        # A frame labels the remainder of its own continuous foreground activity,
+        # until another ready category or a recorded foreground boundary.
+        active = span.detail
+        best = None
+        for following in (*span.frames, None):
+            if following is not None and following.observed_at <= left:
+                active = following
+                continue
+            boundary = min(right, following.observed_at) if following is not None else right
+            classified_s = (boundary - left).total_seconds() * span.recorded_fraction
+            seconds[active.activity_kind] += classified_s
+            if (classified_s > 0 and active.observed_at >= start
+                    and (summary := _without_document_name(active.summary, document_names))):
+                rank = (classified_s, active.observed_at)
+                if best is None or rank > best[0]:
+                    best = (rank, {"observed_at": active.observed_at.isoformat(),
+                                   "activity_kind": active.activity_kind, "summary": summary})
+            if boundary == right:
+                break
+            left, active = boundary, following
+        if best is not None:
+            span_s = (right - max(span.started_at, start)).total_seconds() * span.recorded_fraction
+            representatives.append(((span_s, span.started_at, span.detail.activity_id), best[1]))
+    seconds = {kind: round(value, 6) for kind, value in seconds.items()}
+    seconds["unobserved"] = max(0, round(duration_s - sum(seconds.values()), 6))
+    # Rounding fractional recorded durations must preserve the full denominator.
+    if (excess := round(sum(seconds.values()) - duration_s, 6)) > 0:
+        largest = max(_KINDS, key=seconds.__getitem__)
+        seconds[largest] = round(seconds[largest] - excess, 6)
+    return {
+        "from_at": start.isoformat(), "to_at": end.isoformat(), "duration_s": duration_s, "seconds": seconds,
+        "percent": {kind: round(100 * value / duration_s, 2) for kind, value in seconds.items()},
+        "representative_summaries": [item for _, item in sorted(
+            representatives, key=lambda entry: entry[0], reverse=True,
+        )[:2]],
+    }
+
+
+def _focus_evidence(context: ObservationContext, timeline: _ActivityTimeline,
+                    spans: tuple[_ActivitySpan, ...]) -> dict:
+    end = context.as_of
+    start = end - _FOCUS_WINDOW
+    gaps = []
+    captures = []
+    covered = start
+    signals = context.current_context
+    for span in spans:
+        captures.extend(frame for frame in span.frames if start <= frame.observed_at <= end)
+        if span.ended_at < start or span.started_at > end:
+            continue
+        left, right = max(span.started_at, start), min(span.ended_at, end)
+        # Small wall/monotonic drift is expected. A material deficit leaves the
+        # covered locations uncertain, so it cannot bridge the focus evidence.
+        unconfirmed = (right - left).total_seconds() * (1 - span.recorded_fraction)
+        if not span.frames or span.recorded_fraction <= 0 or unconfirmed > CLOCK_TOLERANCE_S:
+            continue
+        if (context.realtime_confirmed and signals.activity_id == span.detail.activity_id
+                and signals.observed_at == span.ended_at):
+            # The validated sampler clock can bridge the tail to this admission.
+            # This never contributes time to the historical activity windows.
+            right = end
+        if right <= left:
+            continue
+        if left > covered:
+            gaps.append((covered, left))
+        covered = max(covered, right)
+    if covered < end:
+        gaps.append((covered, end))
+    return {
+        "from_at": start.isoformat(), "to_at": end.isoformat(), "complete": timeline.complete,
+        "gaps": [{"from_at": left.isoformat(), "to_at": right.isoformat()} for left, right in gaps],
+        "visual_observations": [
+            {
+                "observed_at": frame.observed_at.isoformat(), "activity_kind": frame.activity_kind,
+                "summary": frame.summary,
+                "scene_elements": list(frame.scene_elements), "late": frame.late,
+            }
+            for frame in sorted(captures, key=lambda detail: (detail.observed_at, detail.activity_id))
+        ],
+    }
+
+
 def _restrict_legacy_summaries(view: dict) -> None:
     if "summary" in view:
         view["summary"] = cloud_screen_text(view["summary"], summary=True)
@@ -341,6 +477,11 @@ def project_observation_context(
     details = () if paused else tuple(detail for detail in context.activities
                                      if not _excluded(detail, excluded_apps, excluded_domains))
     recent_details = context.recent_activities if context.recent_activities is not None else details
+    document_names = context.document_names.union(
+        name
+        for detail in (*context.activities, *recent_details, context.current_visual)
+        if detail is not None and detail.document_name and (name := _name_key(detail.document_name))
+    )
     history = (_history([], None) if paused else context.history).to_dict(share_summary=share_summary)
     if not paused and (context.activities or excluded_apps or excluded_domains):
         # Legacy descriptions have no source metadata to recheck against exclusions.
@@ -400,8 +541,21 @@ def project_observation_context(
     }
     if include_capture_health:
         result["capture_health"] = context.capture_health if not protected else None
+    if (timeline := context.activity_timeline) is not None:
+        spans = tuple(span for span in timeline.spans
+                      if share_summary and not _excluded(span.detail, excluded_apps, excluded_domains))
+        result["activity_windows"] = {
+            name: _activity_window(spans, context.as_of, seconds, document_names)
+            for name, seconds in (("last_15m", 900), ("last_60m", 3600))
+        }
+        if share_summary and not historical and (spans or not timeline.spans):
+            result["focus_evidence_2m"] = _focus_evidence(context, timeline, spans)
     if restrict_legacy_summaries and result["current"] is not None:
         _restrict_legacy_summaries(result["current"])
+    if document_names:
+        # Document names travel through their separately authorized structured
+        # field. Omitted or compressed rows may still identify text to remove.
+        _scrub_document_text(result, document_names)
     return result
 
 
@@ -509,14 +663,15 @@ def _legacy_activity_kind(connection, frame: sqlite3.Row, as_of: datetime) -> st
     return "unknown"
 
 
-def _activity_details(connection, *, as_of: datetime, since: datetime, until: datetime) -> tuple[ActivityDetail, ...]:
-    if not _columns(connection, "activities"):
-        return ()
-    activities = connection.execute("""
+def _activity_rows(connection, since: datetime, until: datetime) -> list[sqlite3.Row]:
+    return connection.execute("""
         SELECT * FROM activities WHERE ended_at >= ? AND started_at <= ? ORDER BY started_at, activity_id
     """, (_timestamp(since), _timestamp(until))).fetchall()
+
+
+def _screen_rows(connection, as_of: datetime, since: datetime, until: datetime,
+                 screen_columns: set[str]) -> dict[int, list[sqlite3.Row]]:
     screens_by_activity: dict[int, list[sqlite3.Row]] = {}
-    screen_columns = _columns(connection, "screen_observations")
     if screen_columns:
         available = "AND (processed_at IS NULL OR processed_at <= ?)" if "processed_at" in screen_columns else ""
         params = (_timestamp(since), _timestamp(until))
@@ -525,31 +680,71 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
             {available} ORDER BY captured_at, rowid
         """, params + (_timestamp(as_of),) if available else params):
             screens_by_activity.setdefault(row["activity_id"], []).append(row)
+    return screens_by_activity
+
+
+def _foreground_detail(row: sqlite3.Row, started: datetime, coverage: datetime | None = None) -> ActivityDetail:
+    app = row["app_name"]
+    status = _row_value(row, "document_status")
+    source = _row_value(row, "document_source")
+    name = sanitize_document_name(_row_value(row, "document_name"), source) if status == "identified" else None
+    known_source = native_document_source(app, None)
+    seen_kind = {"app:vscode": "ide", "app:microsoft-word": "document",
+                 "app:microsoft-excel": "document"}.get(known_source, "unknown")
+    if name and source.startswith("domain:"):
+        seen_kind = "document"
+    return ActivityDetail(started, row["activity_id"], app, row["domain"],
+                          summary=multimodal_summary(seen_kind, ()), document_name=name, document_source=source,
+                          confirmed_through=coverage,
+                          hidden=row["screen_locked"] == 1 or is_mochi_app(app) or status == "private_window")
+
+
+def _visual_detail(connection, frame: sqlite3.Row, base: ActivityDetail, captured_at: datetime,
+                   as_of: datetime) -> ActivityDetail:
+    source = _row_value(frame, "document_source")
+    name = sanitize_document_name(_row_value(frame, "document_name"), source)
+    elements = validated_scene_elements(_tokens(_row_value(frame, "scene_elements")))
+    changes = validated_visible_changes(_tokens(_row_value(frame, "visible_changes")))
+    kind = _row_value(frame, "activity_kind")
+    summary = multimodal_summary(frame["screen_kind"], elements)
+    if kind not in _KINDS:
+        kind = _legacy_activity_kind(connection, frame, as_of)
+        summary = cloud_screen_text(frame["screen_summary"], summary=True) or summary
+    if _row_value(frame, "unfiltered_desktop") == 1:
+        summary = validated_screen_summary(frame["screen_summary"])
+    return replace(base, observed_at=captured_at, activity_kind=kind, summary=summary,
+                   document_name=base.document_name or (name if source else None),
+                   document_source=base.document_source if base.document_name else source,
+                   scene_elements=elements, visible_changes=changes,
+                   late=_row_value(frame, "realtime_eligible") == 0,
+                   visual=True, capture_id=frame["capture_id"], screen_kind=frame["screen_kind"])
+
+
+def _activity_details(connection, *, as_of: datetime, since: datetime, until: datetime,
+                      inputs: tuple[list[sqlite3.Row], dict[int, list[sqlite3.Row]]] | None = None
+                      ) -> tuple[ActivityDetail, ...]:
+    if inputs is None:
+        if not _columns(connection, "activities"):
+            return ()
+        inputs = (_activity_rows(connection, since, until),
+                  _screen_rows(connection, as_of, since, until, _columns(connection, "screen_observations")))
+    activities, screens_by_activity = inputs
     details: list[ActivityDetail] = []
     for row in activities:
-        activity_id, app = row["activity_id"], row["app_name"]
-        document_status = _row_value(row, "document_status")
         started = _known_time(row["started_at"])
         if started is None:
             continue
-        if row["screen_locked"] == 1 or is_mochi_app(app) or document_status == "private_window":
-            if since < started <= until:
-                details.append(ActivityDetail(started, activity_id, hidden=True))
-            continue
-        frames = screens_by_activity.get(activity_id, ())
-        if not app and not frames:  # Legacy recording intervals have no OS app.
-            continue
         sampled = _known_time(row["system_sampled_at"])
-        name, source = _row_value(row, "document_name"), _row_value(row, "document_source")
-        name = sanitize_document_name(name, source) if document_status == "identified" else None
-        known_source = native_document_source(app, None)
-        seen_kind = {"app:vscode": "ide", "app:microsoft-word": "document",
-                     "app:microsoft-excel": "document"}.get(known_source, "unknown")
-        if name and source.startswith("domain:"):
-            seen_kind = "document"
         coverage = sampled if sampled is not None and sampled <= until else None
-        base = ActivityDetail(started, activity_id, app, row["domain"], document_name=name, document_source=source,
-                              summary=multimodal_summary(seen_kind, ()), confirmed_through=coverage)
+        base = _foreground_detail(row, started, coverage)
+        if base.hidden:
+            if since < started <= until:
+                details.append(ActivityDetail(started, base.activity_id, hidden=True))
+            continue
+        frames = screens_by_activity.get(base.activity_id, ())
+        if not base.app_name and not frames:  # Legacy recording intervals have no OS app.
+            continue
+        name = base.document_name
         change = (_known_time(_row_value(row, "document_change_at"))
                   if name and _row_value(row, "document_change") == "unsaved_changes_appeared" else None)
         change = change if change is not None and since < change <= until else None
@@ -568,32 +763,109 @@ def _activity_details(connection, *, as_of: datetime, since: datetime, until: da
                 continue
             latest_capture = captured_at
             latest_unfiltered = _row_value(frame, "unfiltered_desktop") == 1
-            screen_source = _row_value(frame, "document_source")
-            screen_name = sanitize_document_name(_row_value(frame, "document_name"), screen_source)
-            elements = validated_scene_elements(_tokens(_row_value(frame, "scene_elements")))
-            changes = validated_visible_changes(_tokens(_row_value(frame, "visible_changes")))
-            activity_kind = _row_value(frame, "activity_kind")
-            summary = multimodal_summary(frame["screen_kind"], elements)
-            if activity_kind not in _KINDS:
-                activity_kind = _legacy_activity_kind(connection, frame, as_of)
-                summary = cloud_screen_text(frame["screen_summary"], summary=True) or summary
-            if latest_unfiltered:
-                summary = validated_screen_summary(frame["screen_summary"])
-            detail = replace(
-                base, observed_at=captured_at, activity_kind=activity_kind,
-                summary=summary,
-                document_name=name or (screen_name if screen_source else None),
-                document_source=source if name else screen_source,
-                scene_elements=elements, visible_changes=changes,
-                late=_row_value(frame, "realtime_eligible") == 0,
-                document_change_at=change if change is not None and change <= captured_at else None,
-                visual=True, capture_id=frame["capture_id"], screen_kind=frame["screen_kind"],
-            )
-            details.append(detail)
+            detail = _visual_detail(connection, frame, base, captured_at, as_of)
+            details.append(replace(detail, document_change_at=change
+                                   if change is not None and change <= captured_at else None))
         if sampled is not None and max(started, since, latest_capture or started, change or started) < sampled <= until:
             if not frames or (name and not latest_unfiltered):
                 details.append(replace(base, observed_at=sampled, document_change_at=change))
     return tuple(sorted(details, key=lambda detail: (detail.observed_at, detail.activity_id)))
+
+
+def _activity_timeline(connection, *, as_of: datetime, since: datetime,
+                       activities: list[sqlite3.Row], screens: dict[int, list[sqlite3.Row]],
+                       screen_columns: set[str], policy_generation: int | None,
+                       document_names: set[str]) -> _ActivityTimeline:
+    columns = _columns(connection, "realtime_observation_head")
+    floor = None
+    if "policy_generation" in columns:
+        head = connection.execute("SELECT * FROM realtime_observation_head WHERE singleton = 1").fetchone()
+        if head is not None:
+            floor = _row_value(head, "policy_activity_floor")
+            if policy_generation is not None and (head["policy_generation"] != policy_generation or floor is None):
+                return _ActivityTimeline()
+
+    spans = []
+    focus_start = as_of - _FOCUS_WINDOW
+    complete = {"processed_at", "realtime_eligible"} <= screen_columns
+    available = "AND (processed_at IS NULL OR processed_at <= ?)" if "processed_at" in screen_columns else ""
+    next_start = None
+    for row in sorted(activities, key=lambda item: item["activity_id"], reverse=True):
+        if floor is not None and row["activity_id"] < floor:
+            break
+        started, ended = _known_time(row["started_at"]), _known_time(row["ended_at"])
+        if started is None or ended is None:
+            continue
+        following = next_start
+        # Ownership follows the recorded order even when the wall clock moves
+        # backward. Old rows cannot resume across a newer foreground boundary.
+        next_start = min(started, following) if following is not None else started
+        if following is not None and started >= following:
+            continue
+        base = _foreground_detail(row, started)
+        frames = screens.get(base.activity_id, ())
+        if base.hidden:
+            continue
+        if screen_columns and started < since < min(ended, following or ended):
+            # A single indexed predecessor can classify a continuous carry-in.
+            # It is never emitted as a two-minute capture.
+            params = (base.activity_id, _timestamp(started), _timestamp(since))
+            carry = connection.execute(f"""
+                SELECT * FROM screen_observations
+                WHERE activity_id = ? AND captured_at >= ? AND captured_at <= ? AND status = 'ready'
+                {available} ORDER BY captured_at DESC, rowid DESC LIMIT 1
+            """, params + (_timestamp(as_of),) if available else params).fetchone()
+            if carry is not None:
+                frames = (carry, *frames)
+                if name := _row_value(carry, "document_name"):
+                    document_names.add(_name_key(name))
+        decoded = []
+        for frame in frames:
+            at = _known_time(frame["captured_at"])
+            # A later owner, including a privacy interval, ends the prior
+            # frame's eligible scope even if older wall-time rows overlap.
+            if at is None or not started <= at <= as_of or (following is not None and at >= following):
+                continue
+            processed = _known_time(_row_value(frame, "processed_at"))
+            eligible = _row_value(frame, "realtime_eligible")
+            verified = processed is not None and at <= processed <= as_of and eligible in (0, 1)
+            if at >= focus_start and not verified:
+                complete = False
+            decoded.append(replace(_visual_detail(connection, frame, base, at, as_of),
+                                   late=not verified or not eligible))
+        wall_s = (ended - started).total_seconds()
+        recorded_s = row["duration_s"]
+        fraction = min(1.0, recorded_s / wall_s) if wall_s > 0 and math.isfinite(recorded_s) and recorded_s > 0 else 0
+        if following is not None:
+            # A newer foreground wins overlap, including a privacy boundary.
+            ended = min(ended, following)
+        if base.app_name or base.domain or decoded:
+            left = started if base.app_name or base.domain else decoded[0].observed_at
+            spans.append(_ActivitySpan(left, ended, fraction, base, tuple(decoded)))
+    return _ActivityTimeline(tuple(reversed(spans)), complete)
+
+
+def _read_activity_history(connection, as_of: datetime, since: datetime, until: datetime,
+                           policy_generation: int | None
+                           ) -> tuple[tuple[ActivityDetail, ...], _ActivityTimeline | None, frozenset[str]]:
+    full = since == as_of - _HOUR and until == as_of
+    if not _columns(connection, "activities"):
+        return (), _ActivityTimeline() if full else None, frozenset()
+    rows = _activity_rows(connection, since, until)
+    screen_columns = _columns(connection, "screen_observations")
+    screens = _screen_rows(connection, as_of, since, until, screen_columns)
+    activities = _activity_details(connection, as_of=as_of, since=since, until=until, inputs=(rows, screens))
+    document_names = {
+        _name_key(name)
+        for row in rows for item in (row, *screens.get(row["activity_id"], ()))
+        if (name := _row_value(item, "document_name"))
+    }
+    timeline = (_activity_timeline(connection, as_of=as_of, since=since, activities=rows, screens=screens,
+                                   screen_columns=screen_columns, policy_generation=policy_generation,
+                                   document_names=document_names)
+                if full else None)
+    document_names.discard("")
+    return activities, timeline, frozenset(document_names)
 
 
 def _recent_activity_details(connection, *, as_of: datetime, since: datetime, until: datetime,
@@ -763,7 +1035,8 @@ class ObservationContextReader:
                               row["activity_id"], row["domain"])
 
     def read_observation_context(self, as_of: datetime, *, history_start: datetime | None = None,
-                                 history_end: datetime | None = None) -> ObservationContext:
+                                 history_end: datetime | None = None,
+                                 policy_generation: int | None = None) -> ObservationContext:
         stamp = _timestamp(as_of)
         as_of = as_of.astimezone(UTC)
         since, until = self._history_range(as_of, history_start, history_end)
@@ -773,13 +1046,13 @@ class ObservationContextReader:
             rows = self._history_rows(connection, stamp, since, until, exists, managed)
             current, status = _current(latest, as_of)
             signals = self._historical_signals(connection, as_of)
-            activities = _activity_details(connection, as_of=as_of, since=since, until=until)
+            activities, timeline, names = _read_activity_history(connection, as_of, since, until, policy_generation)
             recent = _recent_activity_details(connection, as_of=as_of, since=since, until=until, details=activities)
             health = _capture_health(connection, as_of)
             visual = _current_visual_detail(connection, current, as_of=as_of, details=recent or activities)
         current_id = latest["observation_id"] if current is not None else None
         return ObservationContext(as_of, current, status, _history(rows, current_id), signals, activities,
-                                  health, since, until, recent, visual)
+                                  health, since, until, recent, visual, activity_timeline=timeline, document_names=names)
 
     def read_privacy_marker(self) -> tuple[str | None, int, bool | None]:
         """Read the producer's lock interval without depending on a current estimator result."""
@@ -1032,10 +1305,12 @@ class ObservationContextReader:
             signals = self._live_signals(connection, live_at, mono, policy_generation) if include_current else CurrentContext()
             if signals.observed_at is not None and signals.observed_at > at:
                 signals = CurrentContext(screen_locked=True if signals.screen_locked else None)
-            activities = _activity_details(connection, as_of=at, since=since, until=until)
+            activities, timeline, names = _read_activity_history(connection, at, since, until, policy_generation)
             recent = _recent_activity_details(connection, as_of=at, since=since, until=until, details=activities)
             health = _capture_health(connection, at)
             visual = _current_visual_detail(connection, head.current, as_of=at, details=recent or activities)
         current_id = head.publication_cursor if head.current is not None else None
         return ObservationContext(at, head.current, head.current_status, _history(rows, current_id), signals,
-                                  activities, health, since, until, recent, visual)
+                                  activities, health, since, until, recent, visual, activity_timeline=timeline,
+                                  realtime_confirmed=signals.observed_at is not None and signals.screen_locked is False,
+                                  document_names=names)

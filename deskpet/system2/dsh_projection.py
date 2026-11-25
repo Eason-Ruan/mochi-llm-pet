@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 
 from deskpet.contracts.models import REMINDER_TIMING_CONTEXT_LIMIT
@@ -35,7 +35,7 @@ _PRIVATE_FIELDS = {
     "description", "timing_context", "review", "confirmed_outcomes", "next_steps", "password", "access_token",
     "document_name", "document_source", "document_local_sources", "document_cloud_sources", "document_change",
     "scene_elements", "visible_changes", "visual_observations", "current_context", "last_observed_activity",
-    "history_1h", "capture_health",
+    "history_1h", "capture_health", "activity_windows", "focus_evidence_2m", "representative_summaries",
 }
 
 
@@ -158,6 +158,92 @@ def _gap_projection(history: dict) -> list[dict]:
     ]
 
 
+_WINDOW_SECONDS = {"last_15m": 900, "last_60m": 3600}
+_DURATION_KINDS = (*_KINDS, "unobserved")
+
+
+def window_within_range(requested: str, at: datetime, start: datetime | None, end: datetime | None) -> bool:
+    duration = _WINDOW_SECONDS["last_60m"] if requested == "both" else _WINDOW_SECONDS[requested]
+    return (start is None or start <= at - timedelta(seconds=duration)) and (end is None or end >= at)
+
+
+def _requested_windows(request: dict, view: dict) -> tuple[str, ...]:
+    key = request.get("activity_window")
+    if not isinstance(key, str) or key not in (*_WINDOW_SECONDS, "both"):
+        return ()
+    if request.get("history_start") or request.get("history_end"):
+        try:
+            at = datetime.fromisoformat(view["as_of"])
+            start = datetime.fromisoformat(request["history_start"]) if request.get("history_start") else None
+            end = datetime.fromisoformat(request["history_end"]) if request.get("history_end") else None
+            if at.utcoffset() is None or not window_within_range(key, at, start, end):
+                return ()
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return ()
+    return tuple(_WINDOW_SECONDS) if key == "both" else (key,)
+
+
+def _activity_windows(windows: dict, requested: tuple[str, ...]) -> dict:
+    result = {}
+    for key in requested:
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            continue
+        duration = _WINDOW_SECONDS[key]
+        start, end = _stamp(window.get("from_at")), _stamp(window.get("to_at"))
+        if not start or not end or (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() != duration:
+            continue
+        seconds = window.get("seconds")
+        if not isinstance(seconds, dict) or any(
+            type(seconds.get(kind)) not in (int, float) or not 0 <= seconds[kind] <= duration
+            for kind in _DURATION_KINDS
+        ):
+            continue
+        if not math.isclose(sum(seconds[k] for k in _DURATION_KINDS), duration, abs_tol=0.01):
+            continue
+        result[key] = {
+            "from_at": start, "to_at": end, "duration_s": duration,
+            "seconds": {kind: seconds[kind] for kind in _DURATION_KINDS},
+            "percent": {kind: round(100 * seconds[kind] / duration, 2) for kind in _DURATION_KINDS},
+            "representative_summaries": [
+                {"observed_at": stamp, "activity_kind": _enum(item.get("activity_kind"), _KINDS, "unknown"),
+                 "summary": summary}
+                for item in _items(window.get("representative_summaries"), 2)
+                if (summary := _summary(item.get("summary"))) and (stamp := _stamp(item.get("observed_at")))
+            ],
+        }
+    return result
+
+
+def _focus_evidence(value: dict) -> dict:
+    start, end = _stamp(value.get("from_at")), _stamp(value.get("to_at"))
+    captures, gaps = [], []
+    complete = value.get("complete") is True and bool(start and end)
+    for key in ("visual_observations", "gaps"):
+        entries = value.get(key)
+        if not isinstance(entries, list):
+            complete = False
+            continue
+        for item in entries:
+            if not isinstance(item, dict):
+                complete = False
+            elif key == "gaps":
+                left, right = _stamp(item.get("from_at")), _stamp(item.get("to_at"))
+                if left and right:
+                    gaps.append({"from_at": left, "to_at": right})
+                else:
+                    complete = False
+            elif (stamp := _stamp(item.get("observed_at"))) and type(item.get("late")) is bool:
+                captures.append({"observed_at": stamp, "late": item["late"],
+                                 "activity_kind": _enum(item.get("activity_kind"), _KINDS, "unknown"),
+                                 "summary": _summary(item.get("summary")),
+                                 "scene_elements": list(validated_scene_elements(item.get("scene_elements")))})
+            else:
+                complete = False
+    return {"from_at": start, "to_at": end, "complete": complete,
+            "gaps": gaps, "visual_observations": captures}
+
+
 def _contains_name(value, names: set[str]):
     return any(name in value.casefold() for name in names) if isinstance(value, str) else False
 
@@ -232,7 +318,8 @@ def include_candidate_timing_context(value: dict, result: dict, *, share: bool) 
                         target["timing_context"] = text.strip()
 
 
-def project_context(value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
+def project_context(value: dict, *, share: bool, document_sources: tuple[str, ...] = (),
+                    windows: tuple[str, ...] = (), focus_evidence: bool = False) -> dict:
     result = {key: _clean(data) for key, data in value.items() if key in _CONTEXT_FIELDS}
     include_candidate_timing_context(value, result, share=share)
     if "recent_contacts" in value:
@@ -306,12 +393,59 @@ def project_context(value: dict, *, share: bool, document_sources: tuple[str, ..
                 "reason": _enum(status.get("reason"), CAPTURE_HEALTH_REASONS, None),
                 **{key: _stamp(status.get(key)) for key in CAPTURE_HEALTH_TIMES},
             }
+    if share and windows and isinstance(value.get("activity_windows"), dict):
+        result["activity_windows"] = _activity_windows(value["activity_windows"], windows)
+    if share and focus_evidence and isinstance(value.get("focus_evidence_2m"), dict):
+        result["focus_evidence_2m"] = _focus_evidence(value["focus_evidence_2m"])
     _remove_document_text(result, observed_document_names(value))
     return result
 
 
+def _initial_fields(selection) -> set[str]:
+    fields = {"as_of", "timezone", "current", "current_status", "current_context", "last_observed_activity",
+              "interruptibility", "current_phase", "enabled_settings", "pending_proposals",
+              "display_capabilities", "recent_contacts", "recent_decisions", "publication_cursor"}
+    if "chat" in selection.domains:
+        fields.update({"recent_user_actions", "items", "habits", "selected_phase", "selected_interval",
+                       "selected_recovery", "candidate_items_truncated", "candidate_habits_truncated"})
+    if "reminder" in selection.domains:
+        fields.update({"eligible_items", "recheck_items", "opportunity_id"})
+    if "phase_elapsed" in selection.domains or "focus" in selection.domains or "resume" in selection.domains:
+        fields.update({"phase_elapsed", "phase_predecessor"})
+    if selection.activity_15m:
+        fields.add("activity_windows")
+    if selection.focus_evidence_2m:
+        fields.add("focus_evidence_2m")
+    return fields
+
+
+def _deduplicate_wake_data(data: dict) -> None:
+    event = data.get("event") or {}
+    context = data["context"]
+    elapsed = [w["phase_elapsed"] for w in event.get("wakes", ()) if isinstance(w, dict) and w.get("phase_elapsed")]
+    if elapsed:
+        for section in (event, context):
+            if section.get("phase_elapsed") == elapsed:
+                section.pop("phase_elapsed")
+    def candidate_key(item):
+        if isinstance(item, dict) and isinstance(item.get("occurrence_id"), str) and type(item.get("version")) is int:
+            return (item["occurrence_id"], item["version"])
+        return None
+
+    eligible = {key: item for item in context.get("eligible_items", ()) if (key := candidate_key(item))}
+    if eligible and "recheck_items" in context:
+        remaining = []
+        for item in context["recheck_items"]:
+            other = eligible.get(candidate_key(item))
+            if other is None or any(k in other and other[k] != v for k, v in item.items()):
+                remaining.append(item)
+            else:
+                other.update(item)
+        context["recheck_items"] = remaining
+
+
 def project_input(payload: dict, *, share: bool, document_sources: tuple[str, ...] = (),
-                  origin: str | None = None) -> tuple[str | None, dict]:
+                  origin: str | None = None, selection=None) -> tuple[str | None, dict]:
     context = payload.get("context")
     data = {key: _clean(payload[key]) for key in ("event", "grants") if key in payload}
     origin = _enum(origin or payload.get("origin"), {"user", "background"}, None)
@@ -320,8 +454,17 @@ def project_input(payload: dict, *, share: bool, document_sources: tuple[str, ..
     for key in ("semantic_chat", "semantic_background"):
         if type(payload.get(key)) is bool:
             data[key] = payload[key]
-    data["context"] = (project_context(context, share=share, document_sources=document_sources)
+    split = selection is not None and bool(selection.section_names)
+    if not split and isinstance(data.get("event"), dict):
+        data["event"].pop("wakes", None)
+    data["context"] = (project_context(context, share=share, document_sources=document_sources,
+                                       windows=("last_15m",) if split and selection.activity_15m else (),
+                                       focus_evidence=split and selection.focus_evidence_2m)
                        if isinstance(context, dict) else {})
+    if split:
+        fields = _initial_fields(selection)
+        data["context"] = {k: v for k, v in data["context"].items() if k in fields}
+        _deduplicate_wake_data(data)
     intent = payload.get("user_intent")
     if origin == "background" or not isinstance(intent, dict):
         return None, data
@@ -339,10 +482,18 @@ def project_business_result(value: dict) -> dict:
     return _clean(value)
 
 
-def project_tool_result(name: str, value: dict, *, share: bool, document_sources: tuple[str, ...] = ()) -> dict:
+def project_tool_result(name: str, value: dict, *, share: bool, document_sources: tuple[str, ...] = (),
+                        args: dict | None = None, include_aggregates: bool = True) -> dict:
     result = project_business_result(value)
     if name in {"context_read", "context.read"}:
         for key in ("view", "data"):
             if isinstance(view := value.get(key), dict):
-                result[key] = project_context(view, share=share, document_sources=document_sources)
+                request = args or {}
+                requested = request.get("activity_window")
+                windows = _requested_windows(request, view) if include_aggregates else ()
+                projected = project_context(view, share=share, document_sources=document_sources,
+                                            windows=windows)
+                if requested and include_aggregates:
+                    projected = {k: v for k, v in projected.items() if k in {"as_of", "activity_windows"}}
+                result[key] = projected
     return result

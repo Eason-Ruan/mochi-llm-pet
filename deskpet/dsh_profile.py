@@ -63,6 +63,7 @@ def _base_entries(
 def write_system2_profile(
     home: Path, *, origin: str, model: str, official: bool,
     prompt: str, tools: list[dict], port_file: Path, sessions: Path, bailian: bool = False,
+    prompt_catalog: dict | None = None,
 ) -> None:
     entries = _base_entries(
         "mochi", origin=origin, model=model, official=official, prompt=prompt,
@@ -73,7 +74,8 @@ def write_system2_profile(
         _row("session-checkpoint-policy"),
         {
             "id": "mochi-bridge", "name": str(Path(__file__).with_name("system2") / "dsh_bridge.mjs"),
-            "config": {"origin": origin, "portFile": str(port_file), "tools": tools},
+            "config": {"origin": origin, "portFile": str(port_file), "tools": tools,
+                       "promptCatalog": prompt_catalog},
         },
     ]
     _write_profile(home, "mochi", entries)

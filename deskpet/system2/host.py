@@ -15,17 +15,19 @@ from pydantic import ValidationError
 
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import RealClock
-from deskpet.observation_v2.context import OBSERVATION_CONTEXT_FIELDS, ObservationContext, project_observation_context
+from deskpet.observation_v2.context import (
+    OBSERVATION_CONTEXT_FIELDS, ObservationContext, ObservationContextReader, project_observation_context,
+)
 from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 from deskpet.timezones import resolve_timezone
 
 from .admission import AdmissionStore, json_text, stable_id, timestamp
-from .dsh_projection import include_candidate_timing_context, project_business_result
+from .dsh_projection import include_candidate_timing_context, project_business_result, window_within_range
 from .intent import (
     chat_grants, materialize_chat_times, proposal_button_grants, ref_id, ref_kind,
 )
-from .prompt import PROMPT_VERSION, SYSTEM_PROMPT
+from .prompt import PROMPT_VERSION, SPLIT_PROMPT_VERSION, select_prompt
 from .protocol import EngineReply, ToolAuthority, TurnRequest
 from .semantic_policy import background_grants, semantic_background_enabled, text_sharing_allowed
 from .tool_schema import READ_TOOLS, canonical_tool_name, validate_tool_args
@@ -74,6 +76,7 @@ _REASONS = {
     "model_unavailable": "这次对话模型没能完成回复。",
     "superseded": "这条请求已经被后续操作替代。",
     "interrupted": "上一轮未完成，已核对保存的执行结果。",
+    "scope_changed": "候选事项已变化，正在按最新状态重新判断。",
     "expired_request": "这条请求已超过可执行时限。",
 }
 _STALE = {"STALE_TASK", "STALE_CONTEXT", "STALE_VERSION", "STALE_PROPOSAL"}
@@ -85,6 +88,33 @@ def _as_dict(value) -> dict:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value.to_dict()
+
+
+def _pause_evidence_available(context: dict) -> bool:
+    """Verify that the model could have seen two current captures in one covered interval."""
+    evidence = context.get("focus_evidence_2m") or {}
+    last = context.get("last_observed_activity") or {}
+    phase = context.get("current_phase") or {}
+    if (evidence.get("complete") is not True or last.get("relation") != "current"
+            or (context.get("interruptibility") or {}).get("status") != "fresh"
+            or (phase.get("kind"), phase.get("state")) != ("focus", "running")):
+        return False
+    try:
+        end = datetime.fromisoformat(context["as_of"])
+        start = end - timedelta(minutes=2)
+        if datetime.fromisoformat(evidence["from_at"]) != start or datetime.fromisoformat(evidence["to_at"]) != end:
+            return False
+        began = datetime.fromisoformat(phase["begin_at"])
+        last_scene = datetime.fromisoformat(last["scene_observed_at"])
+        times = {datetime.fromisoformat(frame["observed_at"]) for frame in evidence["visual_observations"]
+                 if frame.get("late") is False}
+        if last_scene not in times or not start <= last_scene <= end:
+            return False
+        gaps = [(datetime.fromisoformat(g["from_at"]), datetime.fromisoformat(g["to_at"])) for g in evidence["gaps"]]
+        return any(start <= first and began < first <= last_scene - timedelta(seconds=25)
+                   and not any(a < end and b > first for a, b in gaps) for first in times)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
 
 
 def _reason(result: dict) -> str:
@@ -414,15 +444,35 @@ class System2Host:
     def _wake_event(self, wakes, now):
         if not wakes:
             return None
+        carried = [original for wake in wakes for original in getattr(wake, "carried_wakes", ())]
+        causes = [*wakes, *carried]
+        wake_entries = []
+        for index, wake in enumerate(causes):
+            entry = {
+                "kind": wake.kind, "reason": wake.reason, "event_id": wake.event_id,
+                "at": timestamp(wake.at), "occurrence_id": wake.occurrence_id, "subject_refs": list(wake.subject_refs),
+                "publication_cursor": getattr(wake, "publication_cursor", None),
+                "producer_generation": getattr(wake, "producer_generation", None),
+            }
+            for key in ("phase_elapsed", "task_version", "after_cursor", "original_presentation", "retry_of_event_id",
+                        "scope_review_of"):
+                if (value := getattr(wake, key, None)) is not None:
+                    entry[key] = value
+            if changes := getattr(wake, "change_categories", ()):
+                entry["change_categories"] = list(changes)
+            if index >= len(wakes):
+                entry["carried_for_scope_review"] = True
+            wake_entries.append(entry)
         event = {
             "trigger_ids": [wake.event_id for wake in wakes],
-            "trigger_reasons": list(dict.fromkeys(wake.reason for wake in wakes)),
-            "kinds": list(dict.fromkeys(wake.kind for wake in wakes)),
+            "trigger_reasons": list(dict.fromkeys(wake.reason for wake in causes)),
+            "kinds": list(dict.fromkeys(wake.kind for wake in causes)),
             "kind": "background", "at": timestamp(now),
-            "subject_refs": list(dict.fromkeys(ref for wake in wakes for ref in wake.subject_refs)),
-            "occurrence_ids": list(dict.fromkeys(wake.occurrence_id for wake in wakes if wake.occurrence_id)),
+            "subject_refs": list(dict.fromkeys(ref for wake in causes for ref in wake.subject_refs)),
+            "occurrence_ids": list(dict.fromkeys(wake.occurrence_id for wake in causes if wake.occurrence_id)),
+            "wakes": wake_entries,
         }
-        if elapsed := [wake.phase_elapsed for wake in wakes if getattr(wake, "phase_elapsed", None)]:
+        if elapsed := [entry["phase_elapsed"] for entry in wake_entries if "phase_elapsed" in entry]:
             event["phase_elapsed"] = elapsed
         return event, now + self._ttl
 
@@ -525,8 +575,10 @@ class System2Host:
                 reader = reader.reader
             expansion = {key: value for key, value in {"history_start": history_start, "history_end": history_end}.items()
                          if value is not None}
-            observation = reader.read_observation_context(as_of, **expansion)
             settings = self.settings.read()
+            if historical and type(reader) is ObservationContextReader:
+                expansion["policy_generation"] = settings.observation_generation
+            observation = reader.read_observation_context(as_of, **expansion)
             locked = self._observation_privacy_marker()[2] is True
         except (sqlite3.Error, OSError, ValueError):
             return project_observation_context(ObservationContext.empty(as_of))
@@ -541,7 +593,7 @@ class System2Host:
             include_capture_health=include_capture_health, restrict_legacy_summaries=self._trusted_projection,
         )
 
-    def _shares_timing_context(self):
+    def _shares_background_text(self):
         return semantic_background_enabled() and text_sharing_allowed(
             self.settings.read(), self.settings.routes.snapshot(SYSTEM2), self._observation_privacy_marker()[2],
         )
@@ -591,7 +643,7 @@ class System2Host:
         observed_fields = {key: context[key] for key in OBSERVATION_CONTEXT_FIELDS if key in context}
         projected = project_business_result(context) | observed_fields
         if admission.source == "background":
-            include_candidate_timing_context(context, projected, share=self._shares_timing_context())
+            include_candidate_timing_context(context, projected, share=self._shares_background_text())
         return projected, schedule
 
     @staticmethod
@@ -650,7 +702,7 @@ class System2Host:
         if invalid_fields is not None and not semantic:
             return {"call_id": native_call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
         if (admission.source == "background" and _acts_on_timing_context(name, args, context)
-                and not self._shares_timing_context()):
+                and not self._shares_background_text()):
             return {"call_id": native_call_id, "status": "rejected", "error_code": "NOT_AUTHORIZED"}
         attempt_target = _chat_attempt_target(name, args) if semantic else None
         command_id, prior = self._store.register_call(
@@ -706,7 +758,7 @@ class System2Host:
             return not target or target in {selected, (context["current_phase"] or {}).get("id")}
         if name == "command.get_result":
             command_id = args["command_id"]
-            return command_id == selected or any(
+            return any(
                 call[0] == command_id for call in self._store.calls(admission.admission_id)
             )
         return True
@@ -718,6 +770,9 @@ class System2Host:
                 at = datetime.fromisoformat(args["as_of"]) if args.get("as_of") else query_now
                 history_start = datetime.fromisoformat(args["history_start"]) if args.get("history_start") else None
                 history_end = datetime.fromisoformat(args["history_end"]) if args.get("history_end") else None
+                window = args.get("activity_window")
+                if window and not window_within_range(window, at, history_start, history_end):
+                    return {"call_id": authority.call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
                 if at > query_now or not at - timedelta(hours=1) <= (history_start or at - timedelta(hours=1)) < (
                     history_end or at
                 ) <= at:
@@ -725,14 +780,20 @@ class System2Host:
                 document_query = (args.get("include_document_source") is True if admission.source == "user"
                                   else semantic_background_enabled())
                 observation_options = {"document_query": document_query,
-                                       "history_start": history_start,
-                                       "history_end": history_end,
+                                       "history_start": None if window else history_start,
+                                       "history_end": None if window else history_end,
                                        "include_capture_health": args.get("include_capture_health") is True}
                 if args.get("as_of"):
-                    view = {**context, **self._observation(at, historical=True, **observation_options),
+                    business = {key: val for key, val in context.items() if key not in OBSERVATION_CONTEXT_FIELDS}
+                    view = {**business, **self._observation(at, historical=True, **observation_options),
                             "as_of": at.isoformat()}
                 else:
                     view, _ = self._snapshot(admission, at, catalog=catalog, **observation_options)
+                if window:
+                    windows = view.get("activity_windows", {})
+                    view = {"as_of": view["as_of"], "activity_windows": {
+                        key: value for key, value in windows.items() if window in ("both", key)
+                    }}
                 return {"call_id": authority.call_id, "status": "applied", "view": view}
             permitted = self._read_scope(name, args, context, admission) if name in READ_TOOLS else True
             if permitted is False:
@@ -871,17 +932,23 @@ class System2Host:
             engine_reply = EngineReply("")
         response = self._user_reply(admission, receipts, engine_reply, failure)
         decision = self._decision(admission, as_of, receipts, engine_reply, failure, context)
-        recover_wakes = None
-        if (admission.source == "background" and failure in {"interrupted", "model_unavailable", "expired_request"}
-                and semantic_background_enabled() and hasattr(self.scheduler, "retry_wakes")):
+        recover_wakes = review_scope = None
+        if admission.source == "background" and semantic_background_enabled():
             recover_at = self.clock.wall_now()
+            if failure == "scope_changed" and hasattr(self.scheduler, "schedule_scope_review"):
+                def review_scope(db):
+                    self.scheduler.schedule_scope_review(admission.admission_id,
+                                                         trigger_ids=admission.event["trigger_ids"],
+                                                         now=recover_at, db=db)
+            elif (failure in {"interrupted", "model_unavailable", "expired_request"}
+                  and hasattr(self.scheduler, "retry_wakes")):
+                def recover_wakes(db):
+                    self.scheduler.retry_wakes(admission.event["trigger_ids"], now=recover_at,
+                                               immediate=failure == "interrupted", db=db)
 
-            def recover_wakes(db):
-                self.scheduler.retry_wakes(admission.event["trigger_ids"], now=recover_at,
-                                           immediate=failure == "interrupted", db=db)
-
-        self._store.finish(admission, decision, response, engine_reply.session_id, PROMPT_VERSION,
-                           expected_state=current.state, recover_wakes=recover_wakes)
+        version = (engine_reply.metadata or {}).get("prompt_version", PROMPT_VERSION)
+        self._store.finish(admission, decision, response, engine_reply.session_id, version,
+                           expected_state=current.state, recover_wakes=recover_wakes, review_scope=review_scope)
 
     def _chat_after_commit(self, admission, intent, bound, subject_ref, version, catalog):
         context, schedule = self._snapshot(admission, self.clock.wall_now(), catalog=catalog)
@@ -934,6 +1001,17 @@ class System2Host:
         cached = {}
         catalog = {"items": set(), "habits": set()}
         needs_refresh = refreshed = False
+        selection = select_prompt(admission.source, admission.event, context, grants,
+                                  semantic_background=semantic_background)
+        changed_scope = False
+        active_contact_sent = False
+
+        def needs_new_sections(current, current_grants):
+            if not semantic_background or selection.version != SPLIT_PROMPT_VERSION:
+                return False
+            updated = select_prompt(admission.source, admission.event, current, current_grants,
+                                    semantic_background=True)
+            return updated.version != selection.version or not set(updated.section_names).issubset(selection.section_names)
 
         def bind(current, updated, new_grants):
             nonlocal context, bound
@@ -943,20 +1021,43 @@ class System2Host:
                 grants.update(new_grants)
 
         def call_tool(name, call_id, args, *, step_id=None, check_model_policy=None):
-            nonlocal needs_refresh, refreshed
+            nonlocal needs_refresh, refreshed, changed_scope, active_contact_sent
             with tool_lock:
                 try:
+                    function = canonical_tool_name(name)
+                    if function == "reminder.present" and isinstance(args, dict) and isinstance(args.get("presentation"), str):
+                        args = validate_tool_args(function, args)
                     key = name, call_id, json_text(args)
                     previous = cached.get(key)
-                    function = canonical_tool_name(name)
                 except (TypeError, ValueError):
                     return {"call_id": call_id, "status": "rejected", "error_code": "INVALID_ARGUMENT"}
                 if previous is not None:
                     return previous
+                if changed_scope:
+                    return {"call_id": call_id, "status": "rejected", "error_code": "STALE_CONTEXT"}
+                proactive = semantic_background and selection.version == SPLIT_PROMPT_VERSION and function in {
+                    "proposal.offer", "reminder.present", "pet.present",
+                }
+                if (proactive and function == "proposal.offer" and isinstance(args, dict)
+                        and args.get("function") in ("phase.pause", "phase_pause")
+                        and (not selection.focus_evidence_2m or not self._shares_background_text()
+                             or not _pause_evidence_available(context))):
+                    return {"call_id": call_id, "status": "rejected", "error_code": "STALE_CONTEXT"}
+                presentation = (args.get("presentation") or {}) if isinstance(args, dict) else {}
+                level = args.get("level") if function == "pet.present" and isinstance(args, dict) else (
+                    presentation.get("level") if isinstance(presentation, dict) else None
+                )
+                active_contact = proactive and level not in ("quiet", "passive")
+                if active_contact and active_contact_sent:
+                    return {"call_id": call_id, "status": "rejected", "error_code": "NOT_AUTHORIZED",
+                            "message": "本轮已发起主动提醒，其他候选可静默处理或安排复查。"}
                 if (needs_refresh and not refreshed and function == "context.read"
                         and isinstance(args, dict) and not args.get("as_of")):
                     current, current_schedule = self._snapshot(admission, self.clock.wall_now(), catalog=catalog)
                     new_grants = chat_grants(intent, current) if semantic_chat else background_grants(current)
+                    if needs_new_sections(current, new_grants):
+                        changed_scope = True
+                        return {"call_id": call_id, "status": "rejected", "error_code": "STALE_CONTEXT"}
                     if semantic_chat or semantic_background or new_grants == grants:
                         # Refresh guards only for functions offered in the original turn.
                         bind(current, self._authority_context(current, current_schedule),
@@ -964,7 +1065,16 @@ class System2Host:
                     refreshed = True
                 result = self._call(admission, bound, context, grants, name, call_id, args, step_id=step_id,
                                     check_model_policy=check_model_policy, catalog=catalog)
+                if (semantic_background and selection.version == SPLIT_PROMPT_VERSION and function == "context.read"
+                        and not args.get("as_of") and not args.get("activity_window")
+                        and isinstance(view := result.get("view"), dict)
+                        and needs_new_sections(view, background_grants(view))):
+                    changed_scope = True
+                    return {"call_id": call_id, "status": "rejected", "error_code": "STALE_CONTEXT"}
                 cached[key] = result
+                if (active_contact and result.get("outcome") not in {"quiet", "deferred", "rejected"} and
+                        (result.get("delivery_id") or result.get("status") in {"applied", "accepted", "timeout"})):
+                    active_contact_sent = True
                 if semantic_chat and result.get("status") == "applied" and function in {"item.list", "habit.list"}:
                     field = "items" if function == "item.list" else "habits"
                     candidates = {view["id"]: view for view in context[field]}
@@ -986,7 +1096,7 @@ class System2Host:
                 return result
 
         request = TurnRequest(
-            admission.admission_id, admission.step_id, SYSTEM_PROMPT, json_text({
+            admission.admission_id, admission.step_id, selection.text, json_text({
                 "origin": admission.source,
                 "semantic_chat": semantic_chat,
                 "semantic_background": semantic_background,
@@ -994,7 +1104,8 @@ class System2Host:
                 "context": context,
                 "user_intent": intent,
                 "grants": grants,
-            }), self.user_scope, PROMPT_VERSION, admission.source,
+            }), self.user_scope, selection.version, admission.source, prompt_selection=selection,
+            is_scope_current=lambda: not changed_scope,
             allowed_tools=tuple(sorted(READ_TOOLS | grants.keys())), expires_at=admission.expires_at,
             observation_generation=observation_generation, observation_privacy_marker=observation_marker,
             observation_document_query=semantic_background,
@@ -1006,6 +1117,8 @@ class System2Host:
         except Exception as exc:
             log.info("System 2 model turn failed (%s)", type(exc).__name__)
             reply, failure = EngineReply(""), "model_unavailable"
+        if changed_scope:
+            reply, failure = EngineReply(""), "scope_changed"
         if not admission.created_at <= self.clock.wall_now() < admission.expires_at:
             reply, failure = EngineReply(""), "expired_request"
         if not self._stopping.is_set():

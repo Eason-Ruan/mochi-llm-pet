@@ -17,6 +17,7 @@ from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 
 from .contact_history import recent_contacts
+from .prompt import split_prompt_enabled
 from .semantic_policy import semantic_background_enabled
 
 
@@ -67,6 +68,10 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS system2_wake_retries (
         event_id TEXT PRIMARY KEY REFERENCES system2_wakes(event_id),
         retry_id TEXT UNIQUE NOT NULL REFERENCES system2_wakes(event_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS system2_scope_reviews (
+        event_id TEXT PRIMARY KEY REFERENCES system2_wakes(event_id),
+        admission_id TEXT UNIQUE NOT NULL, trigger_ids TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS system2_presentation_context (
         delivery_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, channel TEXT NOT NULL,
@@ -122,6 +127,13 @@ class WakeEvent:
     publication_cursor: int | None = None
     producer_generation: str | None = None
     phase_elapsed: dict | None = None
+    task_version: int | None = None
+    after_cursor: int | None = None
+    change_categories: tuple[str, ...] = ()
+    original_presentation: dict | None = None
+    retry_of_event_id: str | None = None
+    scope_review_of: str | None = None
+    carried_wakes: tuple[WakeEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -329,14 +341,15 @@ class Scheduler:
 
     def _enqueue(self, db, *, event_id: str, kind: str, at: datetime, reason: str,
                  task: TaskView | None = None, valid_until: datetime | None = None,
-                 waiter_id: str | None = None, head: RealtimeHead | None = None) -> None:
+                 waiter_id: str | None = None, publication_cursor: int | None = None,
+                 producer_generation: str | None = None) -> None:
         db.execute("""INSERT OR IGNORE INTO system2_wakes
             (event_id,user_scope,kind,at,reason,task_id,occurrence_id,task_version,valid_until,
              waiter_id,producer_generation,publication_cursor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
             event_id, self.user_scope, kind, _stamp(at), reason, task.task_id if task else None,
             _occurrence(task) if task else None, task.version if task else None,
             _stamp(valid_until) if valid_until else None, waiter_id,
-            head.producer_generation if head else None, head.publication_cursor if head else None,
+            producer_generation, publication_cursor,
         ))
 
     def resume(self, now: datetime | None = None, *, db=None) -> str:
@@ -398,17 +411,18 @@ class Scheduler:
         }
 
     @staticmethod
-    def _has_wait_change(previous, current):
+    def _wait_changes(previous, current):
+        changes = []
         for key, previous_value in previous.items():
             actual = current[key]
             if actual is None:
                 continue
             if key == "activity_context" and previous_value is not None:
                 if actual[0] != previous_value[0] or (actual[1] and previous_value[1] and actual[1] != previous_value[1]):
-                    return True
+                    changes.append(key)
             elif actual != previous_value:
-                return True
-        return False
+                changes.append(key)
+        return changes
 
     def _cancel_deferred_waits(self, db, purpose, occurrence_id):
         db.execute("""UPDATE system2_waiters SET state='cancelled' WHERE user_scope=? AND purpose=?
@@ -454,6 +468,7 @@ class Scheduler:
             if cursor is None or cursor <= waiter["after_cursor"]:
                 continue
             deadline = _time(waiter["valid_until"])
+            changes = []
             if waiter["evidence"] is not None:
                 if not semantic_background_enabled():
                     db.execute("UPDATE system2_waiters SET state='cancelled' WHERE waiter_id=?", (waiter["waiter_id"],))
@@ -461,7 +476,10 @@ class Scheduler:
                 if current_evidence is None:
                     current_evidence = self._wait_evidence(head)
                 baseline = json.loads(waiter["evidence"])
-                if not self._has_wait_change(baseline, current_evidence):
+                # A waiter can survive a producer restart. An observation from
+                # that new source cannot identify what changed in the old one.
+                changes = self._wait_changes(baseline, current_evidence)
+                if not changes:
                     previous_context = baseline.get("activity_context")
                     observed_context = current_evidence["activity_context"]
                     if (previous_context and previous_context[1] is None
@@ -476,7 +494,11 @@ class Scheduler:
             until = min(observation_limit, deadline) if observation_limit is not None else deadline
             event_id = self._event_id("observation_ready", waiter["waiter_id"])
             self._enqueue(db, event_id=event_id, kind="observation_ready", at=now, reason=waiter["purpose"],
-                          task=task, valid_until=until, waiter_id=waiter["waiter_id"], head=head)
+                          task=task, valid_until=until, waiter_id=waiter["waiter_id"],
+                          publication_cursor=cursor, producer_generation=head.producer_generation)
+            if changes and waiter["producer_generation"] and waiter["producer_generation"] == head.producer_generation:
+                db.execute("INSERT OR IGNORE INTO system2_defer_context VALUES (?, ?)",
+                           (event_id, json.dumps({"change_categories": changes})))
             db.execute("""UPDATE system2_waiters SET state='consumed', wake_event_id=?, consumed_cursor=?,
                           consumed_generation=? WHERE waiter_id=?""",
                        (event_id, cursor, head.producer_generation, waiter["waiter_id"]))
@@ -667,7 +689,9 @@ class Scheduler:
         if tick_at <= now:
             tick_at += ((now - tick_at) // TICK_INTERVAL) * TICK_INTERVAL
             # A blocked/offline model needs one catch-up tick, not a backlog of idle prompts.
-            pending = db.execute("SELECT 1 FROM system2_wakes WHERE user_scope=? AND kind='tick' AND state='pending'",
+            pending = db.execute("""SELECT 1 FROM system2_wakes w
+                WHERE w.user_scope=? AND w.kind='tick' AND w.state='pending'
+                AND NOT EXISTS (SELECT 1 FROM system2_scope_reviews r WHERE r.event_id=w.event_id)""",
                                  (self.user_scope,)).fetchone()
             if not pending:
                 tick_sequence += 1
@@ -723,7 +747,8 @@ class Scheduler:
             AND (reason IN ('phase_elapsed','presentation_context_changed')
                  OR (kind='recheck' AND reason IN ('focus_suggestion','pet_presentation'))
                  OR EXISTS (SELECT 1 FROM system2_defer_context AS c WHERE c.id=w.event_id OR c.id=w.waiter_id)
-                 OR EXISTS (SELECT 1 FROM system2_wake_retries AS r WHERE r.retry_id=w.event_id))""",
+                 OR EXISTS (SELECT 1 FROM system2_wake_retries AS r WHERE r.retry_id=w.event_id)
+                 OR EXISTS (SELECT 1 FROM system2_scope_reviews AS r WHERE r.event_id=w.event_id))""",
                    (self.user_scope,))
         db.execute("""UPDATE system2_waiters AS w SET state='cancelled' WHERE user_scope=? AND state='waiting'
             AND EXISTS (SELECT 1 FROM system2_defer_context AS c WHERE c.id=w.waiter_id)""", (self.user_scope,))
@@ -747,27 +772,63 @@ class Scheduler:
             return bool(eligible and task.version == row["task_version"] and _occurrence(task) == row["occurrence_id"])
         return True
 
+    _WAKE_VIEW = """SELECT w.*, wait.after_cursor, def.evidence, retry.event_id AS retry_of_event_id,
+                   review.admission_id AS scope_review_of, review.trigger_ids AS carried_ids
+            FROM system2_wakes w
+            LEFT JOIN system2_waiters wait ON wait.waiter_id=w.waiter_id
+            LEFT JOIN system2_defer_context def ON def.id=w.event_id
+            LEFT JOIN system2_wake_retries retry ON retry.retry_id=w.event_id
+            LEFT JOIN system2_scope_reviews review ON review.event_id=w.event_id
+    """
+
+    def _wake_view(self, db, row, *, carried_wakes=()) -> WakeEvent:
+        phase_elapsed = None
+        if row["reason"] == "phase_elapsed":
+            phase = db.execute("SELECT details FROM system2_phase_wakes WHERE event_id=?",
+                               (row["event_id"],)).fetchone()
+            phase_elapsed = json.loads(phase[0]) if phase else None
+        evidence = json.loads(row["evidence"]) if row["evidence"] else {}
+        original_presentation = evidence.get("original_presentation")
+        subject_id = (row["task_id"] or (phase_elapsed or {}).get("phase_id")
+                      or (original_presentation or {}).get("proposal_id"))
+        return WakeEvent(
+            row["event_id"], row["kind"], _time(row["at"]), self.user_scope,
+            (subject_id,) if subject_id else (), row["occurrence_id"], row["reason"],
+            publication_cursor=row["publication_cursor"], producer_generation=row["producer_generation"],
+            phase_elapsed=phase_elapsed, task_version=row["task_version"], after_cursor=row["after_cursor"],
+            change_categories=tuple(evidence.get("change_categories", ())),
+            original_presentation=original_presentation, retry_of_event_id=row["retry_of_event_id"],
+            scope_review_of=row["scope_review_of"], carried_wakes=carried_wakes,
+        )
+
+    def _scope_review_wakes(self, db, carried_ids, now, settings) -> tuple[WakeEvent, ...]:
+        carried = []
+        for event_id in json.loads(carried_ids):
+            original = db.execute(self._WAKE_VIEW + """WHERE w.user_scope=? AND w.event_id=?
+                AND w.state='acked' AND w.kind!='tick' AND review.event_id IS NULL""",
+                                  (self.user_scope, event_id)).fetchone()
+            if original is None or not self._wake_live(db, original, now, settings):
+                continue
+            at = _time(original["at"])
+            if at <= now and (original["task_id"] or original["valid_until"] or now < at + _ACTIONABLE_WAKE_LIFETIME):
+                carried.append(self._wake_view(db, original))
+        return tuple(carried)
+
     def _pending_wakes(self, db, now: datetime, ids: set[str] | None = None) -> tuple[WakeEvent, ...]:
         self._discard_disabled_wakes(db)
         settings = self._settings(db)
-        rows = db.execute("""SELECT * FROM system2_wakes WHERE user_scope=? AND state='pending' AND at<=?
-            ORDER BY at, rowid""", (self.user_scope, _stamp(now))).fetchall()
+        rows = db.execute(self._WAKE_VIEW + """WHERE w.user_scope=? AND w.state='pending' AND w.at<=?
+            ORDER BY w.at, w.rowid""", (self.user_scope, _stamp(now))).fetchall()
         events = []
+        split_prompt = split_prompt_enabled()
         for row in rows:
             if ids is not None and row["event_id"] not in ids:
                 continue
-            if not self._wake_live(db, row, now, settings):
+            if (row["scope_review_of"] and not split_prompt) or not self._wake_live(db, row, now, settings):
                 db.execute("UPDATE system2_wakes SET state='cancelled' WHERE event_id=?", (row["event_id"],))
                 continue
-            phase_elapsed = None
-            if row["reason"] == "phase_elapsed":
-                phase = db.execute("SELECT details FROM system2_phase_wakes WHERE event_id=?",
-                                   (row["event_id"],)).fetchone()
-                phase_elapsed = json.loads(phase[0]) if phase else None
-            events.append(WakeEvent(row["event_id"], row["kind"], _time(row["at"]), self.user_scope,
-                                    (row["task_id"],) if row["task_id"] else (), row["occurrence_id"],
-                                    row["reason"], row["publication_cursor"], row["producer_generation"],
-                                    phase_elapsed))
+            carried = self._scope_review_wakes(db, row["carried_ids"], now, settings) if row["carried_ids"] else ()
+            events.append(self._wake_view(db, row, carried_wakes=carried))
         return tuple(events)
 
     def pending_wakes(self) -> tuple[WakeEvent, ...]:
@@ -778,8 +839,23 @@ class Scheduler:
         """Recheck and acknowledge candidates inside the admission write transaction."""
         with self._transaction(db) as tx:
             wakes = self._pending_wakes(tx, now, None if coalesce else set(ids))
+            if wakes:
+                # Separate a continuation from independent events. Its receipt
+                # fence and one-review limit apply only to the fresh review.
+                wakes = wakes[:1] if wakes[0].scope_review_of else tuple(wake for wake in wakes if not wake.scope_review_of)
             self.ack_wakes((wake.event_id for wake in wakes), db=tx)
             return wakes
+
+    def schedule_scope_review(self, admission_id: str, *, trigger_ids: Iterable[str], now: datetime, db=None) -> None:
+        """Schedule one fresh review and revalidate the original wakes at claim."""
+        if not semantic_background_enabled() or not split_prompt_enabled():
+            return
+        with self._transaction(db) as tx:
+            event_id = self._event_id("scope_review", admission_id)
+            self._enqueue(tx, event_id=event_id, kind="tick", at=now, reason="tick",
+                          valid_until=now + TICK_INTERVAL)
+            tx.execute("INSERT OR IGNORE INTO system2_scope_reviews VALUES (?, ?, ?)",
+                       (event_id, admission_id, json.dumps(list(dict.fromkeys(trigger_ids)))))
 
     def retry_wakes(self, ids: Iterable[str], *, now: datetime, immediate=False, db=None) -> None:
         """Recover one-shot wakes once, carrying over their original evidence and limits."""
@@ -976,13 +1052,27 @@ class Scheduler:
         except (sqlite3.Error, OSError, ValueError):
             return False
 
-    def _context_recheck(self, db, *, presentation_kind, task, cursor, generation, now):
+    def _context_recheck(self, db, *, presentation_kind, task, cursor, generation, now,
+                         previous=None, locked=False):
         # Repeated renders and action retries from the same publication can
         # request one new judgment. A reminder remains bound to its occurrence.
         subject = (_occurrence(task), task.version) if task else ()
-        event_id = self._event_id("presentation_changed", presentation_kind, *subject, generation, cursor)
+        delivery_id = previous["delivery_id"] if previous is not None else None
+        event_id = self._event_id("presentation_changed", presentation_kind, *subject,
+                                  delivery_id, "locked" if locked else generation, cursor)
         self._enqueue(db, event_id=event_id, kind="recheck", at=now, reason="presentation_context_changed",
-                      task=task, valid_until=now + _ACTIONABLE_WAKE_LIFETIME)
+                      task=task, valid_until=now + _ACTIONABLE_WAKE_LIFETIME,
+                      publication_cursor=cursor, producer_generation=generation)
+        if previous is not None:
+            original = {"kind": presentation_kind, "delivery_id": delivery_id, "channel": previous["channel"]}
+            if presentation_kind == "proposal" and _table(db, "system2_proposal_presentations"):
+                proposal = db.execute("""SELECT proposal_id, proposal_version
+                    FROM system2_proposal_presentations WHERE delivery_id=? AND user_scope=?""",
+                                      (delivery_id, self.user_scope)).fetchone()
+                if proposal:
+                    original.update(dict(proposal))
+            db.execute("INSERT OR IGNORE INTO system2_defer_context VALUES (?, ?)",
+                       (event_id, json.dumps({"original_presentation": original})))
 
     def _presentation_error(self, db, *, now, presentation_kind, channel, context_revision,
                             observation_cursor, observation_generation, context_valid_until,
@@ -1003,7 +1093,8 @@ class Scheduler:
             if locked is not False:
                 if locked is True and previous is not None:
                     self._context_recheck(db, presentation_kind=presentation_kind, task=task,
-                                          cursor=previous["publication_cursor"], generation="locked", now=now)
+                                          cursor=previous["publication_cursor"], now=now, previous=previous,
+                                          generation=previous["observation_generation"], locked=True)
                 return "STALE_CONTEXT"
         route_version = self._route_version(db)
         if previous is not None:
@@ -1029,7 +1120,8 @@ class Scheduler:
             return "STALE_CONTEXT"
         if self._material_change(head, now, context_revision, observation_cursor, observation_generation):
             self._context_recheck(db, presentation_kind=presentation_kind, task=task,
-                                  cursor=head.publication_cursor, generation=head.producer_generation, now=now)
+                                  cursor=head.publication_cursor, generation=head.producer_generation, now=now,
+                                  previous=previous)
             return "STALE_CONTEXT"
         if capture and recheck_key:
             valid_until = context_valid_until or now + _PRESENTATION_LEASE

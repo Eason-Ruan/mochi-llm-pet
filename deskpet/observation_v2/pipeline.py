@@ -93,6 +93,7 @@ class ObservationStore(ActivityStore):
                     screen_summary TEXT
                 );
                 CREATE INDEX IF NOT EXISTS screen_captured_at ON screen_observations (captured_at);
+                CREATE INDEX IF NOT EXISTS screen_activity_time ON screen_observations (activity_id, captured_at);
                 CREATE TABLE IF NOT EXISTS effective_observations (
                     observation_id INTEGER PRIMARY KEY,
                     activity_kind TEXT NOT NULL,
@@ -146,7 +147,7 @@ class ObservationStore(ActivityStore):
                 self._add_columns("realtime_observation_head", {
                     "policy_generation": "INTEGER", "activity_id": "INTEGER", "app_name": "TEXT",
                     "screen_locked": "INTEGER", "idle_s": "REAL", "system_sampled_at": "TEXT",
-                    "lock_epoch": "INTEGER NOT NULL DEFAULT 0",
+                    "lock_epoch": "INTEGER NOT NULL DEFAULT 0", "policy_activity_floor": "INTEGER",
                 })
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS observation_capture_health (
@@ -187,12 +188,19 @@ class ObservationStore(ActivityStore):
             previous = self.connection.execute("""
                 SELECT observation_id, context_revision FROM effective_observations ORDER BY observation_id DESC LIMIT 1
             """).fetchone()
+            policy = self.connection.execute("""
+                SELECT policy_generation, policy_activity_floor FROM realtime_observation_head WHERE singleton = 1
+            """).fetchone()
+            activity_floor = (policy["policy_activity_floor"] if policy is not None
+                              and policy["policy_generation"] == policy_generation else None)
+            if activity_floor is None:
+                activity_floor = self.connection.execute("SELECT coalesce(max(activity_id), 0) + 1 FROM activities").fetchone()[0]
             self.connection.execute("""
                 INSERT OR REPLACE INTO realtime_observation_head
-                (singleton, generation, boot_id, publication_cursor, policy_generation)
-                VALUES (1, ?, ?, ?, ?)
+                (singleton, generation, boot_id, publication_cursor, policy_generation, policy_activity_floor)
+                VALUES (1, ?, ?, ?, ?, ?)
             """, (uuid4().hex, self._boot_id or system_boot_id(),
-                  previous[0] if previous is not None else None, policy_generation))
+                  previous[0] if previous is not None else None, policy_generation, activity_floor))
             if monotonic_s is not None:
                 self._record_live_sample(as_of, monotonic_s)
         return previous[1] if previous is not None else 0

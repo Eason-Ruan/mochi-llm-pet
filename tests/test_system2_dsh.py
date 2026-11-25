@@ -7,6 +7,9 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+from pathlib import Path
+import shutil
+import subprocess
 from threading import Event, Thread
 from types import SimpleNamespace
 from uuid import uuid4
@@ -21,6 +24,7 @@ from deskpet.observation_v2.routes import (
 from deskpet.settings import SettingsStore
 from deskpet.system2.dsh import DSHEngine, verify_system2_route
 from deskpet.system2.dsh_projection import project_input, project_tool_result
+from deskpet.system2.prompt import PROMPT_CORE, PROMPT_SECTIONS, PROMPT_VERSION, SPLIT_PROMPT_VERSION, SYSTEM_PROMPT
 from deskpet.system2.tool_schema import tool_definitions
 
 SUMMARY = "SYNTHETIC-PRIVATE-ACTIVITY"
@@ -350,6 +354,154 @@ def test_native_projection_tools_metadata_and_restart(tmp_path, endpoints, monke
         engine.close()
 
 
+@pytest.mark.parametrize("reason,semantic,split,version", [
+    ("tick", True, True, SPLIT_PROMPT_VERSION),
+    ("unrecognized", True, True, PROMPT_VERSION),
+    ("tick", False, True, PROMPT_VERSION),
+    ("tick", True, False, PROMPT_VERSION),
+])
+def test_native_prompt_sections_and_fallback(tmp_path, endpoints, monkeypatch, reason, semantic, split, version):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1" if split else "0")
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1" if semantic else "0")
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint)
+    request = turn()
+    request.source, request.prompt_version, request.system_prompt = "background", PROMPT_VERSION, SYSTEM_PROMPT
+    context = snapshot()
+    request.input_json = json.dumps({
+        "origin": request.source, "semantic_background": semantic,
+        "event": {"kind": reason, "kinds": [reason], "trigger_reasons": [reason]},
+        "context": context, "grants": {},
+    })
+
+    def respond(body):
+        if body["messages"][-1]["role"] == "tool":
+            return {"content": RECEIPT}, "stop"
+        return {"tool_calls": [{
+            "index": 0, "id": "fixture-read", "type": "function",
+            "function": {"name": "context_read", "arguments": "{}"},
+        }]}, "tool_calls"
+
+    def tool_reply(name, call_id, arguments, *, step_id):
+        assert name == "context_read" and call_id == "fixture-read" and arguments == {}
+        assert step_id.endswith(":1:1")
+        return {"status": "applied", "message": RECEIPT, "view": context}
+
+    endpoint.respond = respond
+    context_tool = next(tool for tool in tool_definitions if tool.canonical_name == "context.read")
+    engine = DSHEngine(tmp_path, settings=settings, tools=[context_tool, definitions()[1]])
+    try:
+        result = engine.run(request, tool_reply)
+        assert result.metadata["prompt_version"] == version
+        assert result.metadata["model_requests"] == 2
+        assert len(endpoint.requests) == 2
+        system = [next(msg["content"] for msg in body["messages"] if msg["role"] == "system")
+                  for body in endpoint.requests]
+        assert system[0] == system[1]
+        if version == SPLIT_PROMPT_VERSION:
+            assert system[0] == "\n\n".join((
+                PROMPT_CORE, PROMPT_SECTIONS["background_arbitration"], PROMPT_SECTIONS["periodic_check"],
+            ))
+        else:
+            assert system[0].strip() == SYSTEM_PROMPT.strip()
+        for body in endpoint.requests:
+            assert [tool["function"]["name"] for tool in body["tools"]] == ["context_read"]
+            properties = body["tools"][0]["function"]["parameters"]["properties"]
+            assert ("activity_window" in properties) is (version == SPLIT_PROMPT_VERSION)
+            assert FRAME not in json.dumps(body) and SUMMARY not in json.dumps(body)
+    finally:
+        engine.close()
+
+
+def test_native_bridge_rejects_unbound_and_mismatched_steps():
+    executable = shutil.which("node")
+    if executable is None:
+        pytest.skip("Node is unavailable for the bridge contract test")
+    test = Path(__file__).with_name("system2_dsh_bridge.mjs")
+    process = subprocess.run([executable, "--test", str(test)], capture_output=True, text=True, timeout=15)
+    if process.returncode and "listen EPERM" in process.stdout:
+        pytest.skip("Loopback bind is unavailable")
+    assert process.returncode == 0, process.stdout + process.stderr
+
+
+def test_native_scope_change_stops_tool_continuation(tmp_path, endpoints, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1")
+    monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1")
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint)
+    request = turn()
+    request.source, request.prompt_version, request.system_prompt = "background", PROMPT_VERSION, SYSTEM_PROMPT
+    request.input_json = json.dumps({
+        "semantic_background": True, "event": {"kinds": ["tick"], "trigger_reasons": ["tick"]},
+        "context": snapshot(),
+    })
+    authorised = Event()
+    authorised.set()
+    request.is_scope_current = authorised.is_set
+
+    def change_scope(*args, **kwargs):
+        authorised.clear()
+        return reply(*args, **kwargs)
+
+    engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+    try:
+        with pytest.raises(CloudRouteError, match="requires a new prompt admission"):
+            engine.run(request, change_scope)
+        assert len(endpoint.requests) == 1
+        authorised.set()
+        request.admission_id = uuid4().hex
+        assert engine.run(request, reply).metadata["prompt_version"] == SPLIT_PROMPT_VERSION
+        assert len(endpoint.requests) == 3
+    finally:
+        engine.close()
+
+
+def test_native_split_chat_restores_only_recent_text_in_same_privacy_epoch(tmp_path, endpoints, monkeypatch):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1")
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint, permission=True)
+    historical = "SYNTHETIC-PRIVATE-CHAT-RESTART"
+
+    def run(message):
+        request = turn(message, tools=())
+        request.prompt_version, request.system_prompt = PROMPT_VERSION, SYSTEM_PROMPT
+        request.input_json = json.dumps({
+            "semantic_chat": True, "event": {"kind": "user_message", "trigger_reasons": ["user_message"]},
+            "user_intent": {"utterance": message}, "context": snapshot(),
+        }, ensure_ascii=False)
+        engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+        try:
+            return engine.run(request, reply)
+        finally:
+            engine.close()
+
+    first = run(historical)
+    assert first.metadata["prompt_version"] == SPLIT_PROMPT_VERSION
+    paths = list(tmp_path.rglob("recent-chat.json"))
+    assert len(paths) == 1
+    assert json.loads(paths[0].read_text()) == [{"user": historical, "assistant": RECEIPT}]
+    assert not list(tmp_path.rglob("session.v4.jsonl"))
+    second = run("Continue the same conversation")
+    assert second.session_id != first.session_id
+    messages = endpoint.requests[-1]["messages"]
+    assert len(messages) == 3
+    assert historical in json.dumps(messages) and RECEIPT in json.dumps(messages)
+    assert messages[0]["content"] == "\n\n".join((
+        PROMPT_CORE, PROMPT_SECTIONS["chat_exchange"], PROMPT_SECTIONS["chat_items_reminders"],
+        PROMPT_SECTIONS["chat_timers_habits_settings"],
+    ))
+    assert json.dumps(messages).count(SUMMARY) <= 1
+
+    settings.routes.set_permission(SYSTEM2, False, expected=settings.routes.snapshot(SYSTEM2))
+    post_revoke = run("Check in after changing permission")
+    assert post_revoke.session_id not in (first.session_id, second.session_id)
+    assert historical not in json.dumps(endpoint.requests[-1])
+    assert RECEIPT not in json.dumps(endpoint.requests[-1])
+
+
 def test_revocation_between_tool_and_follow_up_rotates_all_history(tmp_path, endpoints):
     endpoint = endpoints()
     settings = SettingsStore(tmp_path / "business.sqlite")
@@ -374,7 +526,9 @@ def test_revocation_between_tool_and_follow_up_rotates_all_history(tmp_path, end
         engine.close()
 
 
-def test_document_titles_reach_the_wire_only_on_authorized_tool_queries(tmp_path, endpoints):
+@pytest.mark.parametrize("split", [False, True])
+def test_document_titles_reach_the_wire_only_on_authorized_tool_queries(tmp_path, endpoints, monkeypatch, split):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1" if split else "0")
     endpoint = endpoints()
     settings = SettingsStore(tmp_path / "business.sqlite")
     install_route(settings, endpoint, permission=True)
@@ -416,9 +570,16 @@ def test_document_titles_reach_the_wire_only_on_authorized_tool_queries(tmp_path
         request.source = source
         request.observation_document_query = source == "background"
         request.observation_generation = settings.read().observation_generation
-        request.input_json = json.dumps({"user_intent": {"utterance": text}, "context": context}, ensure_ascii=False)
+        payload = {"user_intent": {"utterance": text}, "context": context}
+        if split and source == "user":
+            request.prompt_version, request.system_prompt = PROMPT_VERSION, SYSTEM_PROMPT
+            payload.update(semantic_chat=True,
+                           event={"kind": "user_message", "trigger_reasons": ["user_message"]})
+        request.input_json = json.dumps(payload, ensure_ascii=False)
         start = len(endpoint.requests)
         response = engine.run(request, result)
+        if split and source == "user":
+            assert response.metadata["prompt_version"] == SPLIT_PROMPT_VERSION
         return response.text, [json.dumps(body, ensure_ascii=False) for body in endpoint.requests[start:]]
 
     engine = DSHEngine(tmp_path, settings=settings, tools=[tool for tool in tool_definitions
@@ -447,6 +608,8 @@ def test_document_titles_reach_the_wire_only_on_authorized_tool_queries(tmp_path
         answer, packets = run("这次打开的是哪份文档？", include_document_source=True)
         assert answer == RECEIPT
         assert all(shared not in body and local_only not in body for body in packets)
+        assert all(shared not in path.read_text() and local_only not in path.read_text()
+                   for path in tmp_path.rglob("recent-chat.json"))
     finally:
         engine.close()
 
@@ -570,8 +733,11 @@ def test_bailian_native_tool_continuation_and_credential_scope(tmp_path, endpoin
 
     engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
     try:
-        assert engine.run(turn(), reply).text == RECEIPT
-        assert engine.run(turn("Repeat the receipt."), reply).text == RECEIPT
+        first = engine.run(turn(), reply)
+        follow_up = engine.run(turn("Repeat the receipt."), reply)
+        assert first.text == follow_up.text == RECEIPT
+        assert [row["prompt_tokens"] for row in first.metadata["provider_request_usage"]] == [33_500, 33_500]
+        assert [row["prompt_tokens"] for row in follow_up.metadata["provider_request_usage"]] == [33_500]
         assert admissions == [True, True, False, False, False]
         reasoning = "".join(endpoint.reasoning_parts)
         for first, continuation in [(0, 1), (2, 3)]:
