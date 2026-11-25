@@ -27,6 +27,7 @@ from .dsh_projection import include_candidate_timing_context, project_business_r
 from .intent import (
     chat_grants, materialize_chat_times, proposal_button_grants, ref_id, ref_kind,
 )
+from .jev_shadow import JevShadow, is_pure_tick
 from .prompt import PROMPT_VERSION, SPLIT_PROMPT_VERSION, select_prompt
 from .protocol import EngineReply, ToolAuthority, TurnRequest
 from .semantic_policy import background_grants, semantic_background_enabled, text_sharing_allowed
@@ -245,7 +246,7 @@ class System2Host:
     def __init__(
         self, data_dir: Path | str, *, scheduler, gateway, engine=None, context_reader=None,
         settings_store=None, clock=None, user_scope="default", display_capabilities=None,
-        timezone=None, manage_scheduler=True, turn_timeout_s=45.0,
+        timezone=None, manage_scheduler=True, turn_timeout_s=45.0, jev_settings_provider=None, jev_client=None,
     ):
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.user_scope = user_scope
@@ -282,6 +283,8 @@ class System2Host:
         self._lifecycle_lock = Lock()
         self._worker = None
         self._maintenance = None
+        self._jev = JevShadow(self._store, self.clock, self._jev_context, self._stopping,
+                              settings_provider=jev_settings_provider, client=jev_client)
 
     @staticmethod
     def _event_id(value) -> str:
@@ -374,6 +377,9 @@ class System2Host:
     def decision_records(self, *, limit=12):
         return self._store.decisions(min(max(limit, 1), 50))
 
+    def jev_shadow_records(self, *, limit=12):
+        return self._jev.records(min(max(limit, 1), 50))
+
     def pending_proposals(self):
         return self._pending_proposals(self.clock.wall_now())
 
@@ -427,6 +433,7 @@ class System2Host:
 
     def suspend_background(self):
         self._background_suspended.set()
+        self._jev.invalidate()
 
     def fence_background(self, db):
         self._store.interrupt_background(db)
@@ -566,6 +573,43 @@ class System2Host:
             reader = reader.reader
         read = getattr(reader, "read_privacy_marker", None)
         return read() if read is not None else (None, 0, None)
+
+    def _jev_context(self, admission, as_of):
+        if self._background_suspended.is_set():
+            return {"bypass": "background_suspended"}
+        marker = self._observation_privacy_marker()
+        if marker[2] is True:
+            return {"bypass": "observation_unavailable"}
+        schedule = self.scheduler.jev_tick_context(as_of)
+        if "bypass" in schedule:
+            return schedule
+        settings, head = schedule["settings"], schedule["head"]
+        raw = self.context_reader.read_observation_context(as_of)
+        if raw.current_context.screen_locked is True or self._observation_privacy_marker() != marker:
+            return {"bypass": "observation_unavailable"}
+        # The Jev projection derives closed-set facts locally. Document detail
+        # has no Jev grant and never enters this projection.
+        observation = project_observation_context(
+            raw, share_summary=True, excluded_apps=settings.observation_excluded_apps,
+            excluded_domains=settings.observation_excluded_domains, restrict_legacy_summaries=True,
+        )
+        current = observation.get("current")
+        if current and (head.current is None or head.current_status != "fresh"
+                        or (current["activity_kind"], current["state"]) != (head.current.activity_kind, head.current.state)):
+            observation.update(current=None, current_status="context_changed",
+                               interruptibility={"status": "context_changed", "current": None})
+        caps = self.display_capabilities() if callable(self.display_capabilities) else self.display_capabilities
+        context = {
+            **observation, "as_of": as_of.isoformat(), "trigger_reasons": admission.event["trigger_reasons"],
+            "current_phase": schedule["current_phase"], "enabled_settings": settings.to_dict(),
+            "display_capabilities": caps or {}, "eligible_items": schedule["eligible_items"],
+            "pending_proposals": schedule["pending_proposals"], "recent_contacts": schedule["recent_contacts"],
+            "jev_feedback_proposals": schedule["jev_feedback_proposals"], "jev_activity_scope": head.foreground_key,
+            "jev_exact_feedback_provenance": True,
+        }
+        return {"context": context, "next_tick_in_s": schedule["next_tick_in_s"], "share_text": marker[2] is False,
+                "guard": (marker, head.producer_generation, raw.current_context.activity_id,
+                          settings.observation_generation, settings.version)}
 
     def _observation(self, as_of, *, historical=False, document_query=False, include_capture_health=False,
                      history_start=None, history_end=None):
@@ -922,7 +966,7 @@ class System2Host:
         return {"text": "\n".join(part["text"] for part in parts), "status": status,
                 **({"actions": actions} if actions else {}), "parts": parts}
 
-    def _finish(self, admission, engine_reply, failure, context, as_of, *, button_result=None):
+    def _finish(self, admission, engine_reply, failure, context, as_of, *, button_result=None, real_review=None):
         current = self._store.state(admission.admission_id)
         receipts = self._receipts(admission.admission_id)
         if not receipts and button_result is not None:
@@ -930,6 +974,9 @@ class System2Host:
         if current.state in {"superseded", "interrupted"}:
             failure = current.state
             engine_reply = EngineReply("")
+        reviewed_at = jev_review = None
+        if not failure and real_review is not None:
+            reviewed_at, jev_review = real_review
         response = self._user_reply(admission, receipts, engine_reply, failure)
         decision = self._decision(admission, as_of, receipts, engine_reply, failure, context)
         recover_wakes = review_scope = None
@@ -948,7 +995,8 @@ class System2Host:
 
         version = (engine_reply.metadata or {}).get("prompt_version", PROMPT_VERSION)
         self._store.finish(admission, decision, response, engine_reply.session_id, version,
-                           expected_state=current.state, recover_wakes=recover_wakes, review_scope=review_scope)
+                           expected_state=current.state, recover_wakes=recover_wakes, review_scope=review_scope,
+                           model_reviewed_at=reviewed_at, jev_review=jev_review)
 
     def _chat_after_commit(self, admission, intent, bound, subject_ref, version, catalog):
         context, schedule = self._snapshot(admission, self.clock.wall_now(), catalog=catalog)
@@ -1122,7 +1170,12 @@ class System2Host:
         if not admission.created_at <= self.clock.wall_now() < admission.expires_at:
             reply, failure = EngineReply(""), "expired_request"
         if not self._stopping.is_set():
-            self._finish(admission, reply, failure, context, as_of)
+            review = None
+            if admission.source == "background" and failure is None:
+                review = (self.clock.wall_now(), self._jev.capture_real_review(
+                    {**context, "jev_activity_scope": schedule.get("foreground_key")},
+                ))
+            self._finish(admission, reply, failure, context, as_of, real_review=review)
 
     def pump(self) -> bool:
         """Run one admitted turn. Qt uses start() and consumes the durable UI outbox."""
@@ -1141,6 +1194,12 @@ class System2Host:
                 return False
             # A user command can commit between the polling sample and the claim.
             as_of = self.clock.wall_now()
+            try:
+                if (admission.source == "background" and background is not None and is_pure_tick(background[0])
+                        and hasattr(self.scheduler, "jev_tick_context")):
+                    self._jev.start(admission, as_of)
+            except Exception as exc:
+                log.info("Jev shadow dispatch failed (%s)", type(exc).__name__)
             try:
                 self._run(admission, as_of)
             except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:

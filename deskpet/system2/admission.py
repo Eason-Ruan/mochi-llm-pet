@@ -57,7 +57,7 @@ _SCHEMA = (
         UNIQUE(admission_id, native_call_id))""",
     """CREATE TABLE IF NOT EXISTS s2_decisions(
         decision_id TEXT PRIMARY KEY, user_scope TEXT NOT NULL, as_of TEXT NOT NULL,
-        record TEXT NOT NULL)""",
+        record TEXT NOT NULL, model_reviewed_at TEXT, jev_review TEXT)""",
     """CREATE TABLE IF NOT EXISTS s2_ui_outbox(
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, user_scope TEXT NOT NULL,
         answer_id TEXT NOT NULL UNIQUE, reply_to_message_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -107,6 +107,10 @@ class AdmissionStore:
                 db.execute("ALTER TABLE s2_calls ADD COLUMN declared_reason TEXT")
             if "review_key" not in call_columns:
                 db.execute("ALTER TABLE s2_calls ADD COLUMN review_key TEXT")
+            decision_columns = {row["name"] for row in db.execute("PRAGMA table_info(s2_decisions)")}
+            for column in ("model_reviewed_at", "jev_review"):
+                if column not in decision_columns:
+                    db.execute(f"ALTER TABLE s2_decisions ADD COLUMN {column} TEXT")
             db.execute("""
                 INSERT INTO s2_owners VALUES (?, ?) ON CONFLICT(user_scope)
                 DO UPDATE SET token = excluded.token
@@ -396,7 +400,7 @@ class AdmissionStore:
         return _failure(command_id, "RESULT_UNKNOWN") if uncertain else None
 
     def finish(self, admission, decision, reply, session_id, prompt_version, *, expected_state,
-               recover_wakes=None, review_scope=None):
+               recover_wakes=None, review_scope=None, model_reviewed_at=None, jev_review=None):
         with self.write() as db:
             if not self._owned(db):
                 return
@@ -404,8 +408,11 @@ class AdmissionStore:
                                (admission.admission_id,)).fetchone()
             if not state or state[0] != expected_state:
                 return
-            inserted = db.execute("INSERT OR IGNORE INTO s2_decisions VALUES (?, ?, ?, ?)",
-                                  (admission.admission_id, self.scope, decision["as_of"], json_text(decision)))
+            inserted = db.execute("""INSERT OR IGNORE INTO s2_decisions
+                (decision_id, user_scope, as_of, record, model_reviewed_at, jev_review) VALUES (?, ?, ?, ?, ?, ?)""",
+                                  (admission.admission_id, self.scope, decision["as_of"], json_text(decision),
+                                   timestamp(model_reviewed_at) if model_reviewed_at is not None else None,
+                                   json_text(jev_review) if jev_review is not None else None))
             if inserted.rowcount != 1:
                 return
             if admission.source == "background" and not _scope_review_origin(admission.event):
@@ -428,6 +435,24 @@ class AdmissionStore:
             db.execute("""
                 UPDATE s2_admissions SET state = 'complete' WHERE admission_id = ? AND state = 'running'
             """, (admission.admission_id,))
+
+    def jev_tick_current(self, admission_id, *, db) -> bool:
+        return self._owned(db) and db.execute("""
+            SELECT 1 FROM s2_admissions AS tick
+            WHERE tick.admission_id=? AND tick.user_scope=? AND tick.owner=?
+              AND tick.state IN ('running','complete')
+              AND NOT EXISTS (
+                SELECT 1 FROM s2_admissions AS newer
+                WHERE newer.user_scope=tick.user_scope AND (newer.sequence>tick.sequence
+                    OR (newer.source='user' AND newer.state IN ('queued','running'))))
+        """, (admission_id, self.scope, self.owner)).fetchone() is not None
+
+    def jev_previous_review(self, admission_id, *, db):
+        return db.execute("""
+            SELECT model_reviewed_at, jev_review FROM s2_decisions
+            WHERE user_scope=? AND decision_id!=? AND model_reviewed_at IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1
+        """, (self.scope, admission_id)).fetchone()
 
     def decisions(self, count=12, *, background_only=False, user_only=False, db=None):
         with (self.connect() if db is None else nullcontext(db)) as db:

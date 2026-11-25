@@ -112,8 +112,9 @@ def configured_route(path):
     return route, row[3], row[4]
 
 
-def run_case(settings_path, case, split):
+def run_case(settings_path, case, split, *, payload=None):
     route, generation, consent = configured_route(settings_path)
+    custom_case = payload is not None
 
     def marker():
         current, current_generation, current_consent = configured_route(settings_path)
@@ -128,8 +129,10 @@ def run_case(settings_path, case, split):
         snapshot = settings.routes.configure(SYSTEM2, route)
         snapshot = settings.routes.set_permission(SYSTEM2, True, expected=snapshot)
         settings.routes.record_result(snapshot, probe=True)
-        payload = fixture(case)
+        if payload is None:
+            payload = fixture(case)
         ctx, source, grants = payload["context"], payload["origin"], payload["grants"]
+        as_of = datetime.fromisoformat(ctx["as_of"])
         selection = select_prompt(source, payload["event"], ctx, grants, semantic_background=source == "background")
         expected_version = "system2.zh.v14" if split else "system2.zh.v13"
         if selection.version != expected_version:
@@ -148,7 +151,7 @@ def run_case(settings_path, case, split):
                 return dict(status="rejected", error_code="NOT_AUTHORIZED", call_id=call_id)
             if name == "context_read":
                 if window_key := args.get("activity_window"):
-                    at = datetime.fromisoformat(args["as_of"]) if args.get("as_of") else AS_OF
+                    at = datetime.fromisoformat(args["as_of"]) if args.get("as_of") else as_of
                     start = datetime.fromisoformat(args["history_start"]) if args.get("history_start") else None
                     end = datetime.fromisoformat(args["history_end"]) if args.get("history_end") else None
                     if not window_within_range(window_key, at, start, end):
@@ -167,15 +170,19 @@ def run_case(settings_path, case, split):
             if name == "phase_get":
                 return dict(status="applied", view=ctx["current_phase"], call_id=call_id)
             if name == "item_create" and case == "chat_reminder":
-                materialized = materialize_chat_times("item.create", args, AS_OF, "Asia/Shanghai")
-                clock = FakeClock(AS_OF)
+                materialized = materialize_chat_times("item.create", args, as_of, "Asia/Shanghai")
+                clock = FakeClock(as_of)
                 with closing(SQLiteTaskService(clock, FakeDeliveryPort(clock), lambda *_, **__: None,
                                                path=Path(temp) / "tasks.sqlite3", auto_opportunity=False)) as tasks:
                     items = ItemService(tasks, timezone="Asia/Shanghai")
                     return {**items.execute("item.create", materialized, command_id=call_id, expected_version=0),
                             "call_id": call_id}
-            if name == "proposal_offer" and case == "focus_entertainment" and args.get("function") in ("phase.pause", "phase_pause"):
-                return dict(status="pending", outcome="pending_display", call_id=call_id, delivery_id="example-card")
+            if name == "proposal_offer" and source == "background":
+                function = canonical_tool_name(args["function"])
+                practice_actions = grants.get("proposal.offer", {}).get("functions", ())
+                if (custom_case and function in practice_actions
+                        or case == "focus_entertainment" and function == "phase.pause"):
+                    return dict(status="pending", outcome="pending_display", call_id=call_id, delivery_id="example-card")
             if name == "reminder_present" and case == "elapsed_and_reminder":
                 return dict(status="pending", outcome="pending_display", call_id=call_id, delivery_id="example-reminder")
             if name in {"observation_wait_fresh", "decision_recheck", "reminder_recheck"}:

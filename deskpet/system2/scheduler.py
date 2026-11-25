@@ -16,6 +16,7 @@ from deskpet.observation_v2.realtime import sample_realtime_clock
 from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 
+from . import proposals
 from .contact_history import recent_contacts
 from .prompt import split_prompt_enabled
 from .semantic_policy import semantic_background_enabled
@@ -285,7 +286,9 @@ class Scheduler:
         return task if task and _occurrence(task) == occurrence_id else None
 
     def _bridge_read(self, db, now: datetime) -> RealtimeBridge:
-        settings = self._settings(db)
+        return self._read_bridge(now, self._settings(db))
+
+    def _read_bridge(self, now: datetime, settings) -> RealtimeBridge:
         if self.observation is None:
             return RealtimeBridge(RealtimeHead(None, "no_data"))
         if settings.observation_paused:
@@ -916,8 +919,92 @@ class Scheduler:
             items = [self._candidate_view(db, task) for task in candidates]
             return {"eligible_items": items, "opportunity_id": self.get_opportunity(db=db),
                     "producer_generation": head.producer_generation, "publication_cursor": head.publication_cursor,
+                    "foreground_key": head.foreground_key,
                     "current_phase": _phase(db), "current_status": head.current_status, "current": head.current,
                     "recent_contacts": self._recent_contacts(db, as_of) if semantic_background_enabled() else []}
+
+    def jev_tick_context(self, as_of: datetime) -> dict:
+        """Read the idle-review context without opening opportunities or consuming wakes."""
+        if self._lock_state() is not False:
+            return {"bypass": "observation_unavailable"}
+        with self._transaction(write=False) as db:
+            next_tick = _time(self._schedule(db)["tick_at"])
+            phase = _phase(db)
+            if db.execute("""SELECT 1 FROM system2_wakes WHERE user_scope=? AND state='pending'
+                AND at<=? AND (valid_until IS NULL OR valid_until>?) AND (kind!='tick' OR reason!='tick') LIMIT 1""",
+                          (self.user_scope, _stamp(max(as_of, next_tick)), _stamp(as_of))).fetchone():
+                return {"bypass": "priority_wake"}
+            tasks = tuple(self._tasks(db))
+            if self._jev_deadline_near(tasks, phase, as_of, next_tick):
+                return {"bypass": "deadline_near"}
+            settings = self._settings(db)
+            if settings.observation_paused:
+                return {"bypass": "observation_unavailable"}
+            contacts = self._recent_contacts(db, as_of)
+            pending, feedback = (), {}
+            if _table(db, "system2_proposals"):
+                pending = proposals.pending(db, self.user_scope)
+                for contact in contacts:
+                    if contact["kind"] == "proposal" and (subject := contact.get("subject_ref")):
+                        proposal, _ = proposals.get(db, self.user_scope, subject.removeprefix("proposal:"))
+                        if proposal is not None:
+                            feedback[proposal.id] = self._jev_offer(db, proposal)
+            candidates = [task for task in tasks if _eligible(task, as_of)]
+            if semantic_background_enabled():
+                candidates = [task for task in candidates if not self._deadline_owner(db, task, allow_fallback_transfer=True)]
+            else:
+                candidates.sort(key=lambda task: self._priority(task, as_of))
+            context = {
+                "next_tick_in_s": max(0.0, (next_tick - as_of).total_seconds()),
+                "settings": settings,
+                "current_phase": phase,
+                "eligible_items": [self._candidate_view(db, task) for task in candidates],
+                "pending_proposals": [self._jev_offer(db, proposal) for proposal in pending if as_of < proposal.valid_until],
+                "jev_feedback_proposals": feedback,
+                "recent_contacts": contacts,
+            }
+        if self._lock_state() is not False:
+            return {"bypass": "observation_unavailable"}
+        return {**context, "head": self._read_bridge(as_of, settings).head}
+
+    def _jev_offer(self, db, offer):
+        view = offer.model_dump(mode="json")
+        delivery = proposals.latest_delivery(db, self.user_scope, offer.id)
+        view["jev_displayed"] = bool(delivery and delivery["state"] == "displayed"
+                                     and delivery["proposal_version"] == offer.version)
+        if _table(db, "s2_decisions"):
+            reviewed = db.execute("""SELECT d.jev_review, d.model_reviewed_at FROM s2_decisions AS d
+                JOIN s2_admissions AS a ON a.admission_id=d.decision_id
+                WHERE d.user_scope=? AND json_extract(a.event,'$.trigger_ids[0]')=?
+                  AND d.jev_review IS NOT NULL ORDER BY a.sequence DESC LIMIT 1""",
+                                  (self.user_scope, offer.origin_trigger)).fetchone()
+            if reviewed:
+                baseline = json.loads(reviewed["jev_review"])
+                view["jev_origin_activity"] = baseline.get("activity")
+                view["jev_origin_phase"] = baseline.get("phase")
+                view["jev_origin_review_at"] = reviewed["model_reviewed_at"]
+        return view
+
+    def _jev_deadline_near(self, tasks, phase, now, next_tick):
+        horizon = max(next_tick, now + REMINDER_PRIORITY_HORIZON)
+        if phase and phase.get("state") == "running":
+            due = phase.get("phase_due_at")
+            if due and _time(due) <= horizon:
+                return True
+        for task in tasks:
+            draft = task.draft
+            if _active(task, now):
+                if draft.hard_deadline is not None and draft.hard_deadline <= horizon:
+                    return True
+                if any(edge is not None and now <= edge <= horizon
+                       for edge in (draft.expires_at, draft.window_close_at)):
+                    return True
+                if draft.urgency_until and now < draft.urgency_until and (draft.opens_at is None or draft.opens_at <= horizon):
+                    return True
+            if (task.archived_at is None and task.effective_issue_status not in {"completed", "cancelled"}
+                    and draft.due_at is not None and now <= draft.due_at <= horizon):
+                return True
+        return False
 
     def _candidate_view(self, db, task):
         view = self.items.get(task.task_id, db=db) if self.items else task.model_dump(mode="json")

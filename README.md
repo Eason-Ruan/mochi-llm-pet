@@ -175,6 +175,21 @@ be enabled in settings.
 Run `python -m deskpet --legacy` to open the original LLM pet, or
 `scripts/start_ui_refine.command` on macOS to open the scripted Refine demo.
 
+### Jev shadow evaluation
+
+Set `MOCHI_JEV_SHADOW=1` when launching Mochi to send eligible background
+ticks to TypeSafe. Supply a TypeSafe key through `JEV_API_KEY`. On macOS,
+the app can also read service `Mochi Jev`, account `default`, from Keychain.
+Enable `MOCHI_JEV_SHARE_TEXT=1` to also share the allowed, sanitized activity
+descriptions. The shadow result is recorded locally and System 2 still handles
+each scheduled turn. The default model is `jev-1.14.0`.
+
+Run `uv run --locked python -m evaluation.jev_shadow_replay --jev fixture --output report.json`
+for the synthetic replay with an offline stand-in. Use `--jev real` with
+shadow mode and a configured key to collect live Jev measurements. The optional
+`--system2-settings PATH` reads a verified Bailian route from a settings
+database and measures System 2 on those synthetic snapshots.
+
 ### System notification setup
 
 Run the quick-start dependency install first. Then choose the setup for your
