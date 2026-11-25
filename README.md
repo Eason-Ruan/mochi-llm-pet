@@ -7,6 +7,7 @@ The macOS bundle is `Mochi.app` (`io.github.mochi.deskpet`).
 
 - [Install and launch](#quick-start-windows-and-macos)
 - [Configure chat and Observation](#configure-system-2-and-observation)
+- [Try the agent](#try-the-agent)
 - [Grant macOS permissions](#macos-permissions)
 - [Verify a fresh install](#verify-a-fresh-install)
 - [Troubleshoot or uninstall](#troubleshoot-or-uninstall-on-macos)
@@ -98,6 +99,27 @@ screenshots, turn off **允许截取屏幕图像**, run the check, and look for
 **连接已验证**. In Terminal, use `--share-images` after reviewing
 [screenshot scope](#screen-recording). Use `--share-activity` separately
 to share published activity summaries with System 2.
+
+## Try the agent
+
+After verifying the System 2 connection, open chat from the cat's toolbar.
+Send these requests one at a time.
+
+1. **Start a Pomodoro.** “Start a 15-minute focus session now.”
+   「现在开始 15 分钟专注。」 Check that the focus timer starts.
+2. **Extend your focus session.** “Add 3 minutes to my current focus session.”
+   「给当前这段专注加 3 分钟。」 Check the updated timer and the execution receipt
+   in chat.
+3. **Set a soft reminder.** “Remind me to stand up and stretch around 5 minutes
+   from now. No earlier than 3 minutes from now and no later than 7 minutes from
+   now. Please don't play a sound.”
+   「大约 5 分钟后提醒我起来伸展，最早 3 分钟后，最晚 7 分钟后，不要播放声音。」
+   Check the saved window under the bell icon.
+
+For activity-aware reminder timing, enable [live Observation](#screen-recording)
+and share activity summaries with System 2. Carrot can choose a moment within
+the requested window, with local delivery scheduled for the latest time if
+the reminder is still pending.
 
 ## macOS permissions
 
