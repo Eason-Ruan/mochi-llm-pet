@@ -117,24 +117,55 @@ focus, chat, or settings. The focus panel can start a timer with the supplied
 duration and an optional title. Text chat also accepts local commands such as
 「开始 25 分钟」 and 「暂停专注」.
 
-System 2 defaults to Alibaba Cloud Model Studio (阿里云百炼) and `qwen4-max`.
-Run `uv run --locked python -m deskpet --configure-system2` to open the local
-key form. Enter a Beijing pay-as-you-go **百炼 API Key** and choose **保存并验证**.
-Mochi saves the secret in the system credential store and tests the connection
-with a synthetic tool call. The form uses the desktop's profile and also accepts
-`--data-dir PATH`. A regional workspace can use its matching official endpoint.
-[Model details](https://help.aliyun.com/zh/model-studio/qwen4-max) ·
-[Regional endpoints](https://help.aliyun.com/zh/model-studio/base-url) ·
-[Create a Bailian API key](https://help.aliyun.com/zh/model-studio/get-api-key).
+### Configure System 2 and Observation
 
-From the cat, open **设置 → 模型与隐私 → 对话与动作 → 配置** to change the
-connection and use **验证能力** to test it. Existing profiles can select
-**阿里云百炼** there. Manual timers and explicit reminder deadlines also work
-offline.
+Each role has its own **API Base URL**, **API Key**, and **model**. You can
+configure one role or both, and use different OpenAI-compatible services for
+each. New profiles suggest the Beijing Bailian endpoint and `qwen4-max` for
+System 2 or `qwen3.7-flash` for Observation. All three fields are editable.
+If you use Bailian, choose a pay-as-you-go key and the matching official endpoint.
+[Create a Bailian API key](https://help.aliyun.com/zh/model-studio/get-api-key) ·
+[Regional endpoints](https://help.aliyun.com/zh/model-studio/base-url).
 
-Configure the screen transcriber and Observation state model independently in
-the same panel. Image sharing, filtered screen text, and published activity
-summaries each have a separate control for their respective recipient.
+- **GUI.** In Mochi, open **设置 → 模型与隐私 → 配置模型连接**. Select the
+  roles to save, fill in their fields, and choose **保存并验证**. You can also
+  open the same dialog from the checkout before launching Mochi:
+
+  ```sh
+  uv run --locked python -m deskpet --configure-models
+  ```
+
+- **Terminal.** Choose System 2, Observation, or both. The command prompts for
+  each selected role's fields and masks the key input:
+
+  ```sh
+  uv run --locked python -m deskpet --configure-models --terminal
+  ```
+
+  Use `--role system2`, `--role observation`, or `--role both` to select the
+  roles in the command. Provide URLs and model IDs with `--system2-base-url`,
+  `--system2-model`, `--observation-base-url`, and `--observation-model`.
+  Keys are entered interactively. Add `--share-images` to authorize approved
+  screenshots and `--share-activity` to authorize sharing published activity
+  summaries with System 2.
+
+Both methods read and write the same `business.sqlite3` configuration file
+in Mochi's local profile. It stores API Base URLs, model IDs, and references
+to secrets in macOS Keychain or Windows Credential Manager. If Mochi was
+launched with `--data-dir PATH`, pass that same argument during setup. Leave
+a role's key blank to retain its current credential at the same Base URL,
+including when changing only the model. Enter a key for a new non-loopback URL.
+Advanced settings for each role are available in the individual model rows.
+
+Activity-summary sharing with System 2 and screenshot sharing with Observation
+are separate choices. Both are off by default when changing the URL, model,
+or key unless you explicitly enable sharing for the connection. Verification uses
+synthetic inputs and reports each role separately. The cloud vision check
+requires screenshot sharing consent. For live screen understanding,
+also enable **允许截取屏幕图像**
+and grant Screen Recording access on macOS. The **活动状态判断（旧版／对照）** row
+is used for older two-model comparisons. Manual timers and explicit reminder
+deadlines work offline.
 
 Mochi stores its reminders, focus history, settings, chat, and draft in the
 platform's local application data directory. Use `python -m deskpet --data-dir PATH`
@@ -383,12 +414,13 @@ information to rule it out before a browser window can be included. The
 selected cloud vision provider receives the image under its existing consent.
 macOS Screen Recording permission is also required.
 
-The Observation state model can receive structured signals and, with separate
-permission, filtered screen text. System 2 receives current and compressed
-historical state. Sharing published activity summaries with a cloud System 2
-model is a separate choice. User messages and relevant user-entered items are
-included when needed for a requested action. Credentials are referenced through
-the local credential store. [Observation design](docs/adr/0009-observation-v2.md)
+The current vision model can interpret the screenshot and classify activity in
+one call. Recent system signals are a separate opt-in for that recipient.
+System 2 can receive current and compressed historical state. Sharing published
+activity summaries with a cloud System 2 model requires its own consent. User
+messages and relevant user-entered items are included when needed for a requested
+action. Credentials are referenced through the local credential store.
+[Observation design](docs/adr/0009-observation-v2.md)
 
 ### Privacy in the original sprite pet
 

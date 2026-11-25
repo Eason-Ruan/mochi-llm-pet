@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -231,25 +232,39 @@ class ObservationCloudSettings:
     def configure(
         self, role: Role, route: CloudRoute | None, *, expected: CloudRouteSnapshot | None = None,
     ) -> CloudRouteSnapshot:
-        if route is not None and route.provider_kind == BAILIAN and role != SYSTEM2:
-            raise ValueError("Alibaba Cloud Model Studio is available for System 2 only")
+        return self.configure_many(
+            {role: (route, None)}, expected=None if expected is None else {role: expected},
+        )[role]
+
+    def configure_many(
+        self,
+        updates: Mapping[Role, tuple[CloudRoute | None, bool | None]],
+        *,
+        expected: Mapping[Role, CloudRouteSnapshot] | None = None,
+    ) -> dict[Role, CloudRouteSnapshot]:
+        """Commit related routes and explicit sharing choices in one transaction."""
         with observation_privacy_gate(self.path), self._write() as connection:
-            current = self._get(connection, role)
-            if expected is not None:
-                self._require_current(current, expected)
-            if current.route == route:
-                return current
-            # Even a change to a model or credential invalidates the queued authorization.
-            connection.execute("""
-                INSERT OR REPLACE INTO observation_cloud_routes
-                (user_scope, role, route, route_generation, consent_generation, permission, verified,
-                 last_success, last_failure)
-                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL)
-            """, (
-                self.user_scope, role, json.dumps(asdict(route)) if route else None,
-                current.route_generation + 1, current.consent_generation + 1,
-            ))
-            return self._get(connection, role)
+            for role, (route, permission) in updates.items():
+                current = self._get(connection, role)
+                if expected is not None:
+                    self._require_current(current, expected[role])
+                if route is not None and route.provider_kind == BAILIAN and role != SYSTEM2:
+                    raise ValueError("Alibaba Cloud Model Studio is available for System 2 only")
+                if current.route != route:
+                    # A new route or credential invalidates queued requests and verification.
+                    connection.execute("""
+                        INSERT OR REPLACE INTO observation_cloud_routes
+                        (user_scope, role, route, route_generation, consent_generation, permission, verified,
+                         last_success, last_failure)
+                        VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL)
+                    """, (
+                        self.user_scope, role, json.dumps(asdict(route)) if route else None,
+                        current.route_generation + 1, current.consent_generation + 1,
+                    ))
+                    current = self._get(connection, role)
+                if permission is not None:
+                    self._set_permission(connection, current, permission)
+            return {role: self._get(connection, role) for role in updates}
 
     def clear(self, role: Role, *, expected: CloudRouteSnapshot) -> CloudRouteSnapshot:
         return self.configure(role, None, expected=expected)
@@ -257,22 +272,27 @@ class ObservationCloudSettings:
     def set_permission(
         self, role: Role, allow: bool, *, expected: CloudRouteSnapshot,
     ) -> CloudRouteSnapshot:
-        if type(allow) is not bool:
-            raise ValueError("Observation permission must be enabled or disabled")
         with observation_privacy_gate(self.path), self._write() as connection:
             current = self._get(connection, role)
             self._require_current(current, expected)
-            if current.route is None:
-                raise CloudRouteError("Configure the recipient before changing its permission")
-            if allow and not current.route.is_cloud:
-                raise CloudRouteError("Local models do not require cloud permission")
-            if current.permission != allow:
-                connection.execute("""
-                    UPDATE observation_cloud_routes
-                    SET consent_generation = consent_generation + 1, permission = ?, vision_signals_permission = 0
-                    WHERE user_scope = ? AND role = ?
-                """, (allow, self.user_scope, role))
+            self._set_permission(connection, current, allow)
             return self._get(connection, role)
+
+    def _set_permission(
+        self, connection: sqlite3.Connection, current: CloudRouteSnapshot, allow: bool,
+    ) -> None:
+        if type(allow) is not bool:
+            raise ValueError("Observation permission must be enabled or disabled")
+        if current.route is None:
+            raise CloudRouteError("Configure the recipient before changing its permission")
+        if allow and not current.route.is_cloud:
+            raise CloudRouteError("Local models do not require cloud permission")
+        if current.permission != allow:
+            connection.execute("""
+                UPDATE observation_cloud_routes
+                SET consent_generation = consent_generation + 1, permission = ?, vision_signals_permission = 0
+                WHERE user_scope = ? AND role = ?
+            """, (allow, self.user_scope, current.role))
 
     def set_vision_signals_permission(self, allow: bool, *, expected: CloudRouteSnapshot) -> CloudRouteSnapshot:
         """Allow this screenshot recipient to receive recent typed signals as well."""

@@ -10,10 +10,11 @@ import sys
 from types import SimpleNamespace
 from uuid import uuid4
 
-from PyQt6.QtCore import QLockFile, QPoint, QSettings, QStandardPaths, Qt, QTimer
+from PyQt6.QtCore import QLockFile, QPoint, QSettings, Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
+from deskpet.desktop_profile import DESKTOP_NAME, desktop_data_dir
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
 from deskpet.perception.macos import screen_recording_access
@@ -838,12 +839,10 @@ def run_gui(args):
 def _desktop_profile(data_dir):
     set_dpi_awareness()
     app = QApplication.instance() or QApplication(["Mochi"])
-    app.setOrganizationName("Mochi")
-    app.setApplicationName("Mochi")
+    app.setOrganizationName(DESKTOP_NAME)
+    app.setApplicationName(DESKTOP_NAME)
     app.setQuitOnLastWindowClosed(False)
-    if data_dir is None:
-        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
-    data_dir = Path(data_dir).expanduser().resolve()
+    data_dir = desktop_data_dir(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     return app, data_dir
 
@@ -886,6 +885,18 @@ def configure_system2(data_dir=None):
     outcome.probe_finished.connect(finished)
     verify_route_in_background(store.routes, SYSTEM2, outcome.probe_finished)
     outcome.exec()
+    return 0
+
+
+def configure_models(data_dir=None):
+    """Open the model connections dialog without starting the pet or Observation."""
+    from deskpet.settings import SettingsStore
+    from .model_setup import ModelSetupDialog
+
+    app, data_dir = _desktop_profile(data_dir)
+    store = SettingsStore(data_dir / "business.sqlite3")
+    dialog = ModelSetupDialog(store.routes)
+    dialog.exec()
     return 0
 
 

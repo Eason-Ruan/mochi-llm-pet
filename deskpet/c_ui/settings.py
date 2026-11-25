@@ -15,15 +15,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL, VISION
+from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL, SYSTEM2, VISION
 from deskpet.perception.macos import screen_recording_access
 from deskpet.settings import Habit, HabitBehavior, Settings, SettingsConflict
 
-from .work_panel import MinutesSpinBox
-
+from .model_setup import ModelSetupDialog
 from .refine_style import (
     DETAIL_CONTROL_STYLE, MUTED, MenuField, Toggle, _CONTROL_STYLE, _Panel, _card, _scroll_area, _text, _title, stepper,
 )
+from .work_panel import MinutesSpinBox
 
 
 _ROLES = {
@@ -222,6 +222,10 @@ class SettingsPanel(_Panel):
 
     def _build_models(self):
         section = self._section("模型与隐私")
+        self._model_setup = QPushButton("配置模型连接")
+        self._model_setup.setObjectName("settings-model-setup")
+        self._model_setup.clicked.connect(self._configure_models)
+        section.addWidget(self._model_setup)
         for key in ("observation_paused", "observation_screenshots"):
             section.addWidget(self._checkboxes[key])
         self._screen_scope = MenuField()
@@ -270,7 +274,6 @@ class SettingsPanel(_Panel):
         self._document_permissions_label = _text(size=11, color=MUTED, wrap=True)
         section.addWidget(self._document_permissions_label)
         self._route_labels = {}
-        self._route_buttons = {}
         self._verify_buttons = {}
         for role, (name, _) in _ROLES.items():
             section.addWidget(_text(name, bold=True))
@@ -278,11 +281,10 @@ class SettingsPanel(_Panel):
             self._route_labels[role] = status
             section.addWidget(status)
             row = QHBoxLayout()
-            configure = QPushButton("配置")
+            configure = QPushButton("高级配置" if role in {SYSTEM2, VISION} else "配置")
             configure.setObjectName(f"settings-route-{role}")
             configure.setAccessibleName(f"配置{name}")
             configure.clicked.connect(lambda _, key=role: self._configure_route(key))
-            self._route_buttons[role] = configure
             verify = QPushButton("验证能力")
             verify.setObjectName(f"settings-verify-{role}")
             verify.setAccessibleName(f"验证{name}能力")
@@ -536,8 +538,7 @@ class SettingsPanel(_Panel):
         return self._habit_selector.currentData()
 
     def show_system2_route(self):
-        button = self._route_buttons["system2"]
-        QTimer.singleShot(0, lambda: self._scroll.ensureWidgetVisible(button))
+        QTimer.singleShot(0, lambda: self._scroll.ensureWidgetVisible(self._model_setup))
 
     def _render_routes(self):
         for role, label in self._route_labels.items():
@@ -545,8 +546,7 @@ class SettingsPanel(_Panel):
             route = snapshot.route
             local = route is not None and route.provider_kind == "local_ollama"
             if route is None:
-                status = ("配置阿里云百炼 API Key 后，点击验证能力。"
-                          if role == "system2" else "本地默认路由")
+                status = "尚未配置对话模型。" if role == SYSTEM2 else "本地默认路由"
             else:
                 if role == VISION and not (local or snapshot.permission):
                     capability = "请先授权该接收方，再验证识图能力"
@@ -577,6 +577,12 @@ class SettingsPanel(_Panel):
 
     def _configure_route(self, role):
         dialog = _RouteEditor(self.store.routes, role, self)
+        dialog.exec()
+        dialog.deleteLater()
+        self._render_routes()
+
+    def _configure_models(self):
+        dialog = ModelSetupDialog(self.store.routes, self)
         dialog.exec()
         dialog.deleteLater()
         self._render_routes()
