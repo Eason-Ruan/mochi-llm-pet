@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 
+from deskpet.i18n import tr
+
 
 APP_ID = "Mochi.DeskPet"
 ARGUMENTS = "-m deskpet"
@@ -64,14 +66,16 @@ def activate_notification_identity() -> str:
     try:
         installed = _belongs_to_checkout(_shortcut_path())
     except pythoncom.com_error as error:
-        raise RuntimeError("无法读取 Mochi Windows 开始菜单快捷方式") from error
+        raise RuntimeError(tr("无法读取 Mochi Windows 开始菜单快捷方式",
+                              "Could not read the Mochi shortcut in the Windows Start menu")) from error
     if not installed:
-        raise RuntimeError("系统通知需要先安装 Mochi Windows 开始菜单快捷方式")
+        raise RuntimeError(tr("系统通知需要先安装 Mochi Windows 开始菜单快捷方式",
+                              "Install the Mochi shortcut in the Windows Start menu to use system notifications"))
     set_identity = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
     set_identity.argtypes = [ctypes.c_wchar_p]
     set_identity.restype = ctypes.c_long
     if set_identity(APP_ID) != 0:
-        raise RuntimeError("无法设置 Mochi Windows 应用标识")
+        raise RuntimeError(tr("无法设置 Mochi Windows 应用标识", "Could not set the Mochi Windows app identity"))
     return APP_ID
 
 

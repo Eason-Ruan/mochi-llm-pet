@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .i18n import LANGUAGES, set_language
+
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Mochi desktop pet")
     parser.add_argument("--data-dir", type=Path, help="directory for the desktop pet's local data")
+    parser.add_argument("--language", choices=LANGUAGES,
+                        help="override the desktop language for this launch (zh or en)")
     parser.add_argument("--legacy", action="store_true", help="launch the original LLM pet")
     parser.add_argument("--config", help="configuration file for the original LLM pet")
     setup = parser.add_mutually_exclusive_group()
@@ -50,11 +54,16 @@ def main(argv=None) -> int:
     if args.request_screen_recording and (args.legacy or args.config is not None or configuring):
         parser.error("--request-screen-recording requires a normal Mochi desktop launch")
     if args.legacy or args.config is not None:
-        if args.data_dir is not None or configuring:
-            parser.error("--data-dir and model setup are only available for the Mochi desktop pet")
+        if args.data_dir is not None or args.language is not None or configuring:
+            parser.error("--data-dir, --language and model setup are only available for the Mochi desktop pet")
         from .app import Application
 
         return Application(config_path=args.config).main()
+
+    if not args.terminal:
+        from .desktop_profile import desktop_data_dir, read_desktop_language
+
+        set_language(args.language or read_desktop_language(desktop_data_dir(args.data_dir)))
 
     if args.configure_models:
         if args.terminal:

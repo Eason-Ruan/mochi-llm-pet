@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import httpx
 
+from .i18n import tr
 from .observation_v2.openai_cloud import (
     _resolve_credential, delete_route_credential, store_route_credential, verify_cloud_route,
 )
@@ -27,6 +28,10 @@ class ModelInput:
     model: str
     api_key: str = field(default="", repr=False)
     permission: bool | None = None
+
+
+def bailian_display_name() -> str:
+    return tr("阿里云百炼", "Alibaba Cloud Model Studio")
 
 
 def model_setup_defaults(routes: ObservationCloudSettings) -> dict[Role, CloudRouteSnapshot]:
@@ -78,7 +83,7 @@ def _prepare_route(snapshot: CloudRouteSnapshot, value: ModelInput) -> tuple[Clo
     if not key and reference is not None and saved.provider_kind != provider:
         # Only rebind an existing key when the normalized recipient URL is identical.
         key = _resolve_credential(saved)
-    name = "阿里云百炼" if is_bailian_endpoint(endpoint) else httpx.URL(endpoint).host
+    name = bailian_display_name() if is_bailian_endpoint(endpoint) else httpx.URL(endpoint).host
     route = CloudRoute(
         provider, endpoint, model, saved.display_name if saved is not None else name,
         uuid4().hex if key else reference, saved.timeout_s if saved is not None else 90.0,

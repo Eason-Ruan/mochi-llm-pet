@@ -34,7 +34,8 @@ from .bailian import BailianTurn
 from .dsh_projection import observed_document_names, project_input, project_tool_result
 from .gateway import ModelGateway, SendPolicy
 from .prompt import (
-    PROMPT_CORE, PROMPT_SECTIONS, PROMPT_VERSION, SPLIT_PROMPT_VERSION, SYSTEM_PROMPT, PromptSelection, select_prompt,
+    PROMPT_CORE, PROMPT_SECTIONS, PROMPT_VERSION, SPLIT_PROMPT_VERSION, SYSTEM_PROMPT,
+    PromptSelection, output_language_instruction, select_prompt,
 )
 from .semantic_policy import semantic_background_enabled, text_sharing_allowed
 from .tool_schema import READ_TOOLS, canonical_tool_name, legacy_context_tool_schema
@@ -522,6 +523,9 @@ class DSHEngine:
         if chat and storage is None and not self._chat_generation:
             with suppress(OSError):
                 self._mark_legacy_chat_profile(path)
+        # The display language belongs to the current prompt, not the saved chat identity.
+        if prompt_version in {PROMPT_VERSION, SPLIT_PROMPT_VERSION}:
+            prompt += output_language_instruction()
         runtime = _Runtime(
             path, policy, session_id=session_id, prompt=prompt, tools=tools,
             credential=self._credential, share=share, closing=self._closing, document_sources=sources,

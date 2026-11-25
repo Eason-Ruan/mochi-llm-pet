@@ -7,6 +7,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
 )
 
+from deskpet.i18n import tr
+
 
 class ProposalCard(QFrame):
     def __init__(self, resolve, reply):
@@ -51,8 +53,9 @@ class ProposalCard(QFrame):
     def _amend(self, proposal):
         function = proposal["function"]
         args = proposal["args"].get("patch", {}) if function == "item.update" else proposal["args"]
-        titles = {"title": "标题", "description": "说明", "planned_duration_s": "总时长",
-                  "total_s": "总时长", "add_s": "增加时间"}
+        duration_label = tr("总时长", "Total duration")
+        titles = {"title": tr("标题", "Title"), "description": tr("说明", "Description"),
+                  "planned_duration_s": duration_label, "total_s": duration_label, "add_s": tr("增加时间", "Add time")}
         if function in {"phase.start", "item.create", "item.update"}:
             fields = {key: args.get(key) or "" for key in ("title", "description")}
             if args.get("planned_duration_s") is not None:
@@ -65,7 +68,7 @@ class ProposalCard(QFrame):
             self._reply(proposal)
             return
         dialog = QDialog(self)
-        dialog.setWindowTitle("修改提议")
+        dialog.setWindowTitle(tr("修改提议", "Edit proposal"))
         layout = QFormLayout(dialog)
         editors = {}
         for key, value in fields.items():
@@ -75,14 +78,14 @@ class ProposalCard(QFrame):
             else:
                 field = QSpinBox()
                 field.setRange(1, 86_400)
-                field.setSuffix(" 秒")
+                field.setSuffix(tr(" 秒", " sec"))
                 field.setValue(round(value))
             field.setObjectName(f"proposal-edit-{key}")
             layout.addRow(titles[key], field)
             editors[key] = field
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("修改并接受")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("返回")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(tr("修改并接受", "Save and accept"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("返回", "Back"))
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
@@ -105,10 +108,10 @@ class ProposalCard(QFrame):
         proposal = self._proposals.get(self._selected)
         if proposal is None:
             return
-        heading = "待确认提议"
+        heading = tr("待确认提议", "Pending proposal")
         ids = tuple(self._proposals)
         if len(ids) > 1:
-            heading = f"待确认提议 {ids.index(self._selected) + 1}/{len(ids)}"
+            heading += f" {ids.index(self._selected) + 1}/{len(ids)}"
         self._layout.addWidget(QLabel(heading))
         message = QLabel(proposal["display_text"])
         message.setObjectName("refine-proposal-text")
@@ -119,10 +122,10 @@ class ProposalCard(QFrame):
         actions = QHBoxLayout(controls)
         actions.setContentsMargins(0, 0, 0, 0)
         for name, label, run in (
-            ("accept", "接受", lambda: self._send(proposal, "accept")),
-            ("reject", "拒绝", lambda: self._send(proposal, "reject")),
-            ("amend", "修改", lambda: self._amend(proposal)),
-            ("reply", "回复", lambda: self._reply(proposal)),
+            ("accept", tr("接受", "Accept"), lambda: self._send(proposal, "accept")),
+            ("reject", tr("拒绝", "Reject"), lambda: self._send(proposal, "reject")),
+            ("amend", tr("修改", "Edit"), lambda: self._amend(proposal)),
+            ("reply", tr("回复", "Reply"), lambda: self._reply(proposal)),
         ):
             button = QPushButton(label)
             button.setObjectName(f"refine-proposal-{name}")
@@ -130,7 +133,7 @@ class ProposalCard(QFrame):
             button.clicked.connect(run)
             actions.addWidget(button)
         if len(ids) > 1:
-            button = QPushButton("下一条")
+            button = QPushButton(tr("下一条", "Next"))
             button.setObjectName("refine-proposal-next")
             button.clicked.connect(lambda: self.select(ids[(ids.index(self._selected) + 1) % len(ids)]))
             actions.addWidget(button)

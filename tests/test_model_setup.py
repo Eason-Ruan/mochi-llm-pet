@@ -1,6 +1,6 @@
 import pytest
 
-from deskpet import model_setup
+from deskpet import i18n, model_setup
 from deskpet.model_setup import ModelInput
 from deskpet.observation_v2 import openai_cloud
 from deskpet.observation_v2.routes import (
@@ -88,6 +88,19 @@ def test_model_switch_can_rebind_bailian_key_at_the_same_recipient(setup):
     assert changed.route.provider_kind == "openai_compatible"
     assert not changed.permission and not changed.verified
     assert openai_cloud._resolve_credential(changed.route) == SYSTEM2_KEY
+
+
+def test_bailian_setup_localizes_new_names_and_keeps_saved_route_identity(setup, monkeypatch):
+    monkeypatch.setattr(i18n, "_language", "en")
+    routes, entries = setup
+    defaults = model_setup.model_input_defaults(routes.snapshot(SYSTEM2))
+    saved = model_setup.configure_models(routes, {SYSTEM2: ModelInput(*defaults, SYSTEM2_KEY, True)})[SYSTEM2]
+    assert saved.route.display_name == "Alibaba Cloud Model Studio"
+
+    i18n.set_language("zh")
+    assert model_setup.configure_models(routes, {SYSTEM2: ModelInput(*defaults)})[SYSTEM2] == saved
+    assert len(entries) == 1
+    assert openai_cloud._resolve_credential(saved.route) == SYSTEM2_KEY
 
 
 def test_changed_url_cannot_inherit_a_key_or_change_the_other_route(setup):

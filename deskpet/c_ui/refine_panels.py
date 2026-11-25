@@ -16,13 +16,24 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from deskpet.i18n import tr
+
 from .refine_icons import icon
 from .refine_style import (
     CARD_OUTLINE, GREEN, GREEN_TINT, INK, MUTED, OUTLINE, PANEL_WIDTH, PAPER, SAND,
     _Panel, _card, _font, _scroll_area, _text, _title,
 )
-from .time_format import local_time
+from .time_format import format_clock, format_day_clock, local_time
 from .work_panel import STATES, duration_text
+
+
+WORK_STATES = {
+    **STATES,
+    "running": ("休息中", "On break"),
+    "elapsed": ("休息结束", "Break ended"),
+    "ready": ("待开始", "Ready"),
+}
+
 
 def active_reminders(snapshot: dict) -> list[dict]:
     return sorted(
@@ -64,33 +75,32 @@ def _schedule(draft, reference, zone=None):
     today = local_time(reference, zone=zone).date() if reference is not None else None
 
     def day_and_clock(when):
-        delta = (when.date() - today).days if today is not None else None
-        day = {-1: "昨天", 0: "今天", 1: "明天"}.get(
-            delta, f"{when.year}年{when.month}月{when.day}日",
-        )
-        return f"{day} {clock(when)}"
-
-    def clock(when):
-        return when.strftime("%H:%M:%S" if when.second else "%H:%M")
+        return format_day_clock(when, today)
 
     if draft["mode"] == "hard" and end_value:
-        return f"{day_and_clock(local_time(end_value, zone=zone))} · 到点提醒"
+        when = day_and_clock(local_time(end_value, zone=zone))
+        return tr("{when} · 到点提醒", "{when} · At set time").format(when=when)
     if not (start_value and end_value):
-        for key, label in (("target_at", "目标"), ("remind_after", "最早"), ("remind_by", "最迟")):
+        for key, label in (
+            ("target_at", tr("目标", "Target")),
+            ("remind_after", tr("最早", "From")),
+            ("remind_by", tr("最迟", "By")),
+        ):
             if draft.get(key):
-                return f"{label} {day_and_clock(local_time(draft[key], zone=zone))} · 柔性提醒"
-        return "择机提醒"
+                when = day_and_clock(local_time(draft[key], zone=zone))
+                return tr("{label} {when} · 柔性提醒", "{label} {when} · Flexible").format(label=label, when=when)
+        return tr("择机提醒", "Flexible reminder")
     start = local_time(start_value, zone=zone)
     end = local_time(end_value, zone=zone)
-    finish = clock(end) if end.date() == start.date() else day_and_clock(end)
-    return f"{day_and_clock(start)}–{finish} · 柔性提醒"
+    finish = format_clock(end) if end.date() == start.date() else day_and_clock(end)
+    return tr("{start}–{end} · 柔性提醒", "{start}–{end} · Flexible").format(start=day_and_clock(start), end=finish)
 
 
-def _size_wrapped_label(label, line_height, line_width):
+def _size_wrapped_label(label, line_width):
     if label.fontMetrics().horizontalAdvance(label.text()) <= line_width and "\n" not in label.text():
-        label.setFixedHeight(line_height)
+        label.setFixedHeight(label.heightForWidth(line_width))
     else:
-        label.setMinimumHeight(line_height)
+        label.setMinimumHeight(label.fontMetrics().height())
         label.setMaximumHeight(16777215)
 
 
@@ -104,10 +114,10 @@ class RefineReminders(_Panel):
         self._customize = customize
         self._busy = busy
         self.setObjectName("refine-reminders")
-        self.count = _badge("0 项")
+        self.count = _badge(tr("0 项", "0 items"))
         self.count.setObjectName("refine-reminder-count")
-        self.body.addLayout(_title("提醒事项", self.count))
-        self._empty = _text("暂无活跃提醒", color=MUTED)
+        self.body.addLayout(_title(tr("提醒事项", "Reminders"), self.count))
+        self._empty = _text(tr("暂无活跃提醒", "No active reminders"), color=MUTED)
         self.body.addWidget(self._empty)
         cards = QWidget()
         self._cards = QVBoxLayout(cards)
@@ -142,7 +152,8 @@ class RefineReminders(_Panel):
         if rows == self._rows:
             return
         self._rows = rows
-        self.count.setText(f"{len(rows)} 项")
+        units = tr("{count} 项", "{count} item" if len(rows) == 1 else "{count} items")
+        self.count.setText(units.format(count=len(rows)))
         self._empty.setVisible(not rows)
         self._scroll.setVisible(bool(rows))
         scroll_position = self._scroll.verticalScrollBar().value()
@@ -161,14 +172,17 @@ class RefineReminders(_Panel):
             minimum_height += height
             row = QHBoxLayout()
             row.setSpacing(7)
+            status = tr("待处理", "Pending") if pending else tr("已登记", "Scheduled")
+            badge = _badge(status, positive=pending)
             name_label = _text(name, bold=True, wrap=True)
-            _size_wrapped_label(name_label, 19, 175)
+            # Account for the card gutters and the scrollbar when reserving room for the badge.
+            name_width = PANEL_WIDTH - 50 - row.spacing() - badge.sizeHint().width()
+            _size_wrapped_label(name_label, name_width)
             row.addWidget(name_label, 1)
-            row.addWidget(_badge("待处理" if pending else "已登记", positive=pending),
-                          alignment=Qt.AlignmentFlag.AlignTop)
+            row.addWidget(badge, alignment=Qt.AlignmentFlag.AlignTop)
             stack.addLayout(row)
             schedule_label = _text(schedule, size=11, color=MUTED, wrap=True)
-            _size_wrapped_label(schedule_label, 13, 225)
+            _size_wrapped_label(schedule_label, 225)
             stack.addWidget(schedule_label)
             if can_respond:
                 stack.addLayout(self._action_row(subject, name, expires_at))
@@ -185,16 +199,16 @@ class RefineReminders(_Panel):
     def _action_row(self, subject, name, expires_at):
         row = QHBoxLayout()
         row.setSpacing(6)
-        acknowledge = QPushButton("确认收到")
+        acknowledge = QPushButton(tr("确认收到", "Acknowledge"))
         acknowledge.setObjectName("refine-reminder-ack")
         acknowledge.clicked.connect(lambda checked=False: self._respond("ack", *subject))
-        snooze = QPushButton("稍后提醒")
+        snooze = QPushButton(tr("稍后提醒", "Snooze"))
         snooze.setObjectName("refine-reminder-snooze")
         menu = QMenu(snooze)
         presets = {}
         for minutes in (5, 10, 30):
             seconds = minutes * 60
-            action = menu.addAction(f"{minutes} 分钟后")
+            action = menu.addAction(tr("{minutes} 分钟后", "In {minutes} min").format(minutes=minutes))
             action.setObjectName(f"refine-reminder-snooze-{seconds}")
             action.triggered.connect(lambda checked=False, delay=seconds: self._respond("snooze", *subject, seconds=delay))
             presets[seconds] = action
@@ -208,7 +222,7 @@ class RefineReminders(_Panel):
 
             menu.aboutToShow.connect(update_presets)
         menu.addSeparator()
-        menu.addAction("自定时长…", lambda: self._customize(*subject))
+        menu.addAction(tr("自定时长…", "Custom delay…"), lambda: self._customize(*subject))
         snooze.setMenu(menu)
         for button in (acknowledge, snooze):
             button.setAccessibleName(f"{button.text()} · {name}")
@@ -246,14 +260,14 @@ def _work_duration(seconds: float) -> str:
     seconds = math.ceil(seconds)
     minutes, rest = divmod(seconds, 60)
     if not rest:
-        return f"{minutes} 分钟"
+        return tr("{minutes} 分钟", "{minutes} min").format(minutes=minutes)
     if not minutes:
-        return f"{rest} 秒"
-    return f"{minutes} 分 {rest} 秒"
+        return tr("{seconds} 秒", "{seconds} s").format(seconds=rest)
+    return tr("{minutes} 分 {seconds} 秒", "{minutes} min {seconds} s").format(minutes=minutes, seconds=rest)
 
 
 def _review(values) -> str:
-    return "\n".join(f"• {item}" for item in values) or "未填写"
+    return "\n".join(f"• {item}" for item in values) or tr("未填写", "Not entered")
 
 
 class RefineWork(_Panel):
@@ -262,9 +276,9 @@ class RefineWork(_Panel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("refine-work")
-        self.status = _badge("未开始", positive=False)
-        self.body.addLayout(_title("专注与回顾", self.status))
-        self.empty = _text("当前没有专注工作段", color=MUTED, wrap=True)
+        self.status = _badge(tr("未开始", "Not started"), positive=False)
+        self.body.addLayout(_title(tr("专注与回顾", "Focus & review"), self.status))
+        self.empty = _text(tr("当前没有专注工作段", "No active focus session"), color=MUTED, wrap=True)
         self.body.addWidget(self.empty)
 
         self.summary = QWidget()
@@ -272,15 +286,15 @@ class RefineWork(_Panel):
         stack = QVBoxLayout(self.summary)
         stack.setContentsMargins(0, 0, 0, 0)
         stack.setSpacing(8)
-        stack.addWidget(_text("当前目标", size=11, color=MUTED, height=13))
+        stack.addWidget(_text(tr("当前目标", "Current goal"), size=11, color=MUTED))
         self.goal = _text(size=16, bold=True, wrap=True)
         stack.addWidget(self.goal)
         timing = QHBoxLayout()
         timing.setSpacing(8)
-        self.countdown = _text(size=23, color=GREEN, bold=True, height=28)
+        self.countdown = _text(size=23, color=GREEN, bold=True)
         self.countdown.setObjectName("refine-work-countdown")
         timing.addWidget(self.countdown)
-        self.duration = _text(size=11, color=MUTED, height=13)
+        self.duration = _text(size=11, color=MUTED, wrap=True)
         timing.addWidget(self.duration, 1)
         stack.addLayout(timing)
         linked = QHBoxLayout()
@@ -297,11 +311,11 @@ class RefineWork(_Panel):
         review.setContentsMargins(0, 0, 0, 0)
         review.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinimumSize)
         review.setSpacing(5)
-        review.addWidget(_text("本轮回顾", bold=True))
-        review.addWidget(_text("已完成", size=11, color=MUTED))
+        review.addWidget(_text(tr("本轮回顾", "Session review"), bold=True))
+        review.addWidget(_text(tr("已完成", "Completed work"), size=11, color=MUTED))
         self.outcomes = _text(size=12, wrap=True)
         review.addWidget(self.outcomes)
-        review.addWidget(_text("下一步", size=11, color=MUTED))
+        review.addWidget(_text(tr("下一步", "Next steps"), size=11, color=MUTED))
         self.next_steps = _text(size=12, wrap=True)
         review.addWidget(self.next_steps)
         self._review_scroll = _scroll_area(self.review)
@@ -320,7 +334,7 @@ class RefineWork(_Panel):
         self.empty.setVisible(view is None)
         if view is None:
             if self._last_detail is not None:
-                self.status.setText("未开始")
+                self.status.setText(tr("未开始", "Not started"))
                 _style_badge(self.status, False)
             self._last_detail = None
             return
@@ -329,7 +343,7 @@ class RefineWork(_Panel):
         task_id = view.get("task_id")
         task = next(
             (task["draft"]["content"] for task in snapshot.get("tasks", ()) if task["task_id"] == task_id),
-            "无" if task_id is None else "事项不可用",
+            tr("无", "None") if task_id is None else tr("事项不可用", "Item unavailable"),
         )
         detail = (
             view["state"], view["goal"], view.get("duration_s"), task,
@@ -339,13 +353,16 @@ class RefineWork(_Panel):
             return
         self._last_detail = detail
         state, goal, duration, task, outcomes, next_steps = detail
-        self.status.setText({"running": "休息中", "elapsed": "休息结束", "ready": "待开始"}.get(state) or STATES[state])
+        self.status.setText(tr(*WORK_STATES[state]))
         _style_badge(self.status, state == "focusing")
         self.goal.setText(goal)
-        _size_wrapped_label(self.goal, 19, PANEL_WIDTH - 26)
-        self.duration.setText(f"剩余 / 共 {_work_duration(duration)}" if duration is not None else "剩余")
-        self.task.setText(f"关联事项 · {task}")
-        _size_wrapped_label(self.task, 15, PANEL_WIDTH - 47)
+        _size_wrapped_label(self.goal, PANEL_WIDTH - 26)
+        self.duration.setText(
+            tr("剩余 / 共 {total}", "Remaining / {total} total").format(total=_work_duration(duration))
+            if duration is not None else tr("剩余", "Remaining")
+        )
+        self.task.setText(tr("关联事项 · {item}", "Linked item · {item}").format(item=task))
+        _size_wrapped_label(self.task, PANEL_WIDTH - 47)
         self._review_scroll.setVisible(state == "ended")
         if state == "ended":
             self.outcomes.setText(_review(outcomes))
@@ -363,27 +380,30 @@ class RefineSettings(_Panel):
     def __init__(self, parent=None, *, voice_available=True):
         super().__init__(parent)
         self.setObjectName("refine-settings")
-        self.body.addLayout(_title("设置"))
+        self.body.addLayout(_title(tr("设置", "Settings")))
 
         pomodoro, pomodoro_stack = _card(spacing=0)
         policy = QHBoxLayout()
-        policy.addWidget(_text("自动番茄钟", bold=True), 1)
-        self.policy_badge = _badge("开始前询问")
+        policy.addWidget(_text(tr("自动番茄钟", "Auto Pomodoro"), bold=True), 1)
+        self.policy_badge = _badge(tr("开始前询问", "Ask before starting"))
         self.policy_badge.setFixedHeight(23)
         policy.addWidget(self.policy_badge)
         pomodoro_stack.addLayout(policy)
         self.body.addWidget(pomodoro)
 
         preference, preference_stack = _card(spacing=6)
-        preference_stack.addWidget(_text("默认输入方式", bold=True, height=16))
+        preference_stack.addWidget(_text(tr("默认输入方式", "Default input"), bold=True))
         choices = QHBoxLayout()
         choices.setSpacing(9)
         self._modes = {}
         self._group = QButtonGroup(self)
-        for mode, text, glyph in (("voice", "语音", "mic"), ("typing", "打字", "keyboard")):
+        for mode, text, glyph in (
+            ("voice", tr("语音", "Voice"), "mic"),
+            ("typing", tr("打字", "Typing"), "keyboard"),
+        ):
             button = QPushButton(text)
             button.setObjectName(f"refine-settings-{mode}")
-            button.setAccessibleName(f"默认输入方式：{text}")
+            button.setAccessibleName(tr("默认输入方式：{mode}", "Default input · {mode}").format(mode=text))
             button.setCheckable(True)
             button.setFixedHeight(33)
             button.setFixedWidth(116)
@@ -401,8 +421,11 @@ class RefineSettings(_Panel):
             self._modes[mode] = button
         choices.addStretch()
         preference_stack.addLayout(choices)
-        hint = "输入中长按方式图标，只切换本次输入。" if voice_available else "当前版本支持文字输入。"
-        preference_stack.addWidget(_text(hint, size=11, color=MUTED, height=13))
+        hint = tr(
+            "输入中长按方式图标，只切换本次输入。",
+            "Hold the input icon to switch modes for this message.",
+        ) if voice_available else tr("当前版本支持文字输入。", "Typing is available in this version.")
+        preference_stack.addWidget(_text(hint, size=11, color=MUTED, wrap=True))
         self.body.addWidget(preference)
         if not voice_available:
             self._modes["voice"].setEnabled(False)

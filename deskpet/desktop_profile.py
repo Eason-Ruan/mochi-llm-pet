@@ -4,6 +4,7 @@ from pathlib import Path
 from platform import mac_ver
 from sys import platform
 
+from .i18n import DEFAULT_LANGUAGE, LANGUAGES, Language
 from .settings import Settings, SettingsStore
 
 
@@ -20,6 +21,29 @@ def desktop_data_dir(data_dir: Path | str | None = None) -> Path:
         if not data_dir:
             raise RuntimeError("The platform did not provide a Mochi data directory")
     return Path(data_dir).expanduser().resolve()
+
+
+def _window_settings(data_dir: Path):
+    from PyQt6.QtCore import QSettings
+
+    return QSettings(str(data_dir / "window.ini"), QSettings.Format.IniFormat)
+
+
+def read_desktop_language(data_dir: Path) -> Language:
+    selected = _window_settings(data_dir).value("uiLanguage", DEFAULT_LANGUAGE, type=str)
+    return selected if selected in LANGUAGES else DEFAULT_LANGUAGE
+
+
+def save_desktop_language(data_dir: Path, selected: Language) -> None:
+    from PyQt6.QtCore import QSettings
+
+    if selected not in LANGUAGES:
+        raise ValueError("Unsupported desktop language")
+    settings = _window_settings(data_dir)
+    settings.setValue("uiLanguage", selected)
+    settings.sync()
+    if settings.status() != QSettings.Status.NoError:
+        raise OSError("Could not save desktop language")
 
 
 def desktop_settings_store(data_dir: Path) -> SettingsStore:

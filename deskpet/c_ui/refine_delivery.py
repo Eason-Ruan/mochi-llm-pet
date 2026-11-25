@@ -10,6 +10,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtGui import QFont, QFontMetrics
 
 from deskpet.contracts import DisplayCommand
+from deskpet.i18n import tr
 from deskpet.system2.semantic_policy import semantic_background_enabled
 
 from .native_notifications import SNOOZE_SECONDS
@@ -78,7 +79,7 @@ class RefineDeliveryMixin:
         if self.production:
             for command in self._reminder_pending.values():
                 if self._valid_command(command):
-                    notes.setdefault(command.task_id, "待展示")
+                    notes.setdefault(command.task_id, tr("待展示", "Waiting to display"))
         self.waiting_prompts = deque(item for item in self.waiting_prompts if self._valid_prompt(item))
         if self.prompt and not self._valid_prompt(self.prompt):
             self._retire_prompt()
@@ -245,10 +246,12 @@ class RefineDeliveryMixin:
         metrics = QFontMetrics(font)
         visible = tuple(command for command in commands if "\n" not in command.content
                         and metrics.horizontalAdvance("• " + command.content) <= 240)[:2]
-        text = [f"{len(commands)} 条提醒同时到期"]
+        text = [tr("{count} 条提醒同时到期", "{count} reminders due at the same time").format(count=len(commands))]
         text.extend("• " + command.content for command in visible)
         if len(visible) < len(commands):
-            text.append(f"还有 {len(commands) - len(visible)} 条，打开列表查看")
+            text.append(tr("还有 {count} 条，打开列表查看", "Open the list to see {count} more").format(
+                count=len(commands) - len(visible),
+            ))
         return "\n".join(text), visible
 
     def _native_followup_prompt(self):
@@ -265,8 +268,7 @@ class RefineDeliveryMixin:
             return current() and self.presentation.native_followup_current(followup, mark_painted=True)
 
         def can_snooze():
-            return (followup.expires_at is None
-                    or self.presentation.now() + timedelta(seconds=SNOOZE_SECONDS) < followup.expires_at)
+            return self._can_snooze_reminder(followup.expires_at)
 
         offer_snooze = can_snooze()
 
@@ -280,11 +282,12 @@ class RefineDeliveryMixin:
             else:
                 self._customize_reminder_snooze(followup.task_id, followup.occurrence)
 
-        title = "提醒" if followup.delivered else "待确认提醒"
-        return Prompt("native_reminder", f"{title}：{followup.content}", on_answer=answer, valid=current,
+        text = (tr("提醒：{content}", "Reminder: {content}") if followup.delivered
+                else tr("待确认提醒：{content}", "Reminder to acknowledge: {content}"))
+        return Prompt("native_reminder", text.format(content=followup.content), on_answer=answer, valid=current,
                       delivery_id=followup.delivery_id,
                       before_paint=lambda: current() and self.presentation.native_followup_current(followup),
-                      on_painted=painted, answer_labels=("确认收到", "5 分钟后" if offer_snooze else "查看详情"))
+                      on_painted=painted, answer_labels=self._reminder_answer_labels(offer_snooze))
 
     def _show_foreground_reminder(self, identifier, decide):
         row, task = self.presentation.foreground_target(identifier)
@@ -354,15 +357,17 @@ class RefineDeliveryMixin:
             group.clear()
             return True
 
-        item = Prompt("foreground_reminder", f"提醒：{task.draft.content}", valid=current, before_paint=permit,
+        text = tr("提醒：{content}", "Reminder: {content}").format(content=task.draft.content)
+        item = Prompt("foreground_reminder", text, valid=current, before_paint=permit,
                       delivery_id=row["delivery_id"],
                       on_painted=painted, on_answer=lambda yes: self._answer_reminder(yes, task.task_id,
                                                                                     task.occurrence),
-                      answer_labels=self._reminder_answer_labels(task.draft.expires_at))
+                      answer_labels=self._reminder_answer_labels(self._can_snooze_reminder(task.draft.expires_at)))
         self._show_prompt(item)
 
-    def _reminder_answer_labels(self, expiry):
-        return "确认收到", "5 分钟后" if self._can_snooze_reminder(expiry) else "查看详情"
+    @staticmethod
+    def _reminder_answer_labels(can_snooze):
+        return tr("确认收到", "Got it"), tr("5 分钟后", "In 5 min") if can_snooze else tr("查看详情", "View details")
 
     def _can_snooze_reminder(self, expiry):
         return expiry is None or self.presentation.now() + timedelta(seconds=SNOOZE_SECONDS) < expiry
@@ -418,7 +423,7 @@ class RefineDeliveryMixin:
             if siblings:
                 text, preview = self._group_preview((command, *siblings))
             else:
-                text = (f"提醒：{command.content}" if self.production
+                text = (tr("提醒：{content}", "Reminder: {content}").format(content=command.content) if self.production
                         else f"现在该{command.content}了。要查看这条提醒吗？")
             item = Prompt("reminder", text, command=command, siblings=siblings, preview=preview)
         else:
@@ -457,11 +462,12 @@ class RefineDeliveryMixin:
 
         labels = item.answer_labels
         if item.kind == "proposal":
-            labels = ("接受", "拒绝") if item.direct_focus else ("查看", "稍后")
+            labels = ((tr("接受", "Accept"), tr("拒绝", "Reject")) if item.direct_focus
+                      else (tr("查看", "View"), tr("稍后", "Later")))
         elif self.production and item.command and not item.siblings:
             task = self._current_reminder_occurrence(item.command.task_id, item.command.occurrence)
             expiry = task["draft"].get("expires_at") if task else None
-            labels = self._reminder_answer_labels(datetime.fromisoformat(expiry) if expiry else None)
+            labels = self._reminder_answer_labels(self._can_snooze_reminder(datetime.fromisoformat(expiry) if expiry else None))
         dismissible = (not interactive or item.on_dismiss or (self.production and item.command)
                        or item.kind in {"native_reminder", "foreground_reminder"})
         self.pet.show_bubble(

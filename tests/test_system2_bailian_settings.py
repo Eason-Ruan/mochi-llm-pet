@@ -147,6 +147,29 @@ def test_bailian_workspace_requires_new_key_and_preserves_saved_fields(qt_app, t
     assert len(keyring.entries) == 2
 
 
+def test_english_bailian_editor_uses_localized_defaults_and_keeps_custom_name(qt_app, tmp_path, monkeypatch, keyring):
+    from deskpet import i18n
+    from deskpet.c_ui.settings import _RouteEditor
+
+    monkeypatch.setattr(i18n, "_language", "en")
+    routes = SettingsStore(tmp_path / "business.sqlite3").routes
+    editor = _RouteEditor(routes, SYSTEM2, None)
+    assert editor.provider.currentText() == editor.recipient.text() == "Alibaba Cloud Model Studio"
+    editor.recipient.clear()
+    editor.key.setText("synthetic-bailian-key")
+    _save(editor)
+    saved = routes.snapshot(SYSTEM2)
+    assert saved.route.display_name == "Alibaba Cloud Model Studio"
+
+    customized = routes.configure(SYSTEM2, replace(saved.route, display_name="我的工作空间"), expected=saved)
+    reopened = _RouteEditor(routes, SYSTEM2, None)
+    assert reopened.recipient.text() == "我的工作空间"
+    _save(reopened)
+    assert routes.snapshot(SYSTEM2) == customized
+    assert customized.route.credential_ref == saved.route.credential_ref
+    assert len(keyring.entries) == 1
+
+
 def test_bailian_preset_cancel_and_stale_save_preserve_existing_route(qt_app, tmp_path, keyring):
     from deskpet.c_ui.settings import _RouteEditor
 

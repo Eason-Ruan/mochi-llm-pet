@@ -24,6 +24,7 @@ from deskpet.contracts import (
     DecisionEnvelope, DisplayCommand, DisplayReceipt, ErrorCode, RawSignals, UserCorrection,
     ProposedPlan, SessionCommand, SessionResult, TaskCommand, TaskDraft, ToolCall, UiAction,
 )
+from deskpet.i18n import tr
 
 
 def _id(prefix):
@@ -105,7 +106,7 @@ class ServiceWorker(QObject):
             self.snapshot()
             self.ready.emit()
         except Exception as exc:
-            self.error.emit(f"初始化失败：{type(exc).__name__}: {exc}")
+            self.error.emit(tr("初始化失败：", "Initialization failed: ") + f"{type(exc).__name__}: {exc}")
 
     def snapshot(self):
         if self.env is None:
@@ -165,7 +166,7 @@ class ServiceWorker(QObject):
                         self.result_ready.emit({"event_id": event.reply_to_message_id, "status": "system2_answer"})
             self.snapshot()
         except Exception as exc:
-            self.error.emit(f"pump: {type(exc).__name__}: {exc}")
+            self.error.emit(tr("pump: ", "Service update failed: ") + f"{type(exc).__name__}: {exc}")
 
     def _sync_realtime_scenario(self):
         if self._realtime_scenario_timer is not None:
@@ -279,7 +280,7 @@ class ServiceWorker(QObject):
             elif kind == "sampling_error":
                 self.env.observations.submit_sampling_error(action["error_code"], sampling_name=action.get("sampling_name"))
                 self.pump()
-                self.error.emit(f"真实采样失败：{action['error_code']}")
+                self.error.emit(tr("真实采样失败：{code}", "Desktop sampling failed: {code}").format(code=action["error_code"]))
                 return
             elif kind == "set_signals":
                 if self.args.profile != "scenario":
@@ -457,7 +458,7 @@ class ServiceWorker(QObject):
                     "error_code": "INVALID_ARGUMENT", "message": str(exc)})
                 self.pump()
                 return
-            self.error.emit(f"操作失败：{type(exc).__name__}: {exc}")
+            self.error.emit(tr("操作失败：", "Action failed: ") + f"{type(exc).__name__}: {exc}")
 
     @pyqtSlot()
     def stop(self):
@@ -472,7 +473,7 @@ class ServiceWorker(QObject):
                     try:
                         close()
                     except Exception as exc:
-                        self.error.emit(f"关闭服务失败：{type(exc).__name__}: {exc}")
+                        self.error.emit(tr("关闭服务失败：", "Service shutdown failed: ") + f"{type(exc).__name__}: {exc}")
         self.stopped.emit()
         QThread.currentThread().quit()
 
@@ -710,7 +711,7 @@ class Workbench(QMainWindow):
         self._external_surface_failed = True
         self._external_context._close()
         self._fail_pending_deliveries()
-        self._error(f"小猫界面运行失败：{type(exc).__name__}: {exc}")
+        self._error(tr("小猫界面运行失败：", "The desktop pet could not update: ") + f"{type(exc).__name__}: {exc}")
 
     def _fail_pending_deliveries(self):
         for command in list(self._surface_commands.values()):
@@ -1136,7 +1137,7 @@ class Workbench(QMainWindow):
     def _startup_timeout(self):
         if not self.ready_for_actions and not self._closing:
             self._smoke_checks["service_initialized"] = False
-            self._error("服务初始化超时")
+            self._error(tr("服务初始化超时", "Service startup timed out."))
 
     def _receipt(self, command, outcome="displayed", error=None):
         if self._finishing:
@@ -1526,7 +1527,7 @@ class Workbench(QMainWindow):
             self._live_timer.stop()
         if not self._stop_service_thread():
             self._closing = False
-            self._error("服务线程尚未停止，请稍后重试关闭")
+            self._error(tr("服务线程尚未停止，请稍后重试关闭", "Services are still stopping. Try quitting again shortly."))
             event.ignore()
             return
         if self.surface_context is not None:

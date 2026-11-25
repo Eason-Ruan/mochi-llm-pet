@@ -5,24 +5,40 @@ from datetime import datetime, timedelta
 from functools import partial
 from uuid import uuid4
 
-from PyQt6.QtCore import QDateTime, QSignalBlocker, Qt, QTimer, QTimeZone, pyqtSignal
+from PyQt6.QtCore import QDateTime, QLocale, QSignalBlocker, Qt, QTimer, QTimeZone, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QComboBox, QDateEdit, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPushButton, QSizePolicy, QSpinBox, QTimeEdit, QVBoxLayout, QWidget,
 )
 
 from deskpet.contracts import TaskDraft
+from deskpet.i18n import language, tr
 from deskpet.timezones import resolve_timezone
-from .work_panel import label
+from .presentation import grouped_delivery_note
 from .refine_style import GREEN, MUTED, MenuField, Toggle, _card, _text
-from .time_format import ZONE_NAME, format_time, local_time
+from .time_format import ZONE_NAME, format_day_clock, format_time, format_timezone, local_time
+from .work_panel import label
 
 ERRORS = {
-    "STALE_TASK": "事项已更新，请查看最新安排后重试。",
-    "STALE_SURFACE": "这张卡片已失效，请使用当前事项。",
-    "CANCELLED": "事项已取消。", "NOT_FOUND": "事项不存在。",
-    "INVALID_ARGUMENT": "请检查事项和时间输入。",
-    "INVALID_TRANSITION": "当前状态不支持此操作。",
+    "STALE_TASK": ("事项已更新，请查看最新安排后重试。",
+                   "This item changed. Check the current schedule and try again."),
+    "STALE_SURFACE": ("这张卡片已失效，请使用当前事项。",
+                      "This card is out of date. Open the current item."),
+    "CANCELLED": ("事项已取消。", "Item cancelled."),
+    "NOT_FOUND": ("事项不存在。", "Item not found."),
+    "INVALID_ARGUMENT": ("请检查事项和时间输入。", "Check the item and its times."),
+    "INVALID_TRANSITION": ("当前状态不支持此操作。", "This action is unavailable in the current state."),
+}
+RESULT_MESSAGES = {
+    "create": ("草稿已创建，请核对时间后确认。", "Draft created. Check the schedule and confirm it."),
+    "confirm": ("安排已确认。", "Schedule confirmed."),
+    "done": ("事项已完成。", "Item completed."),
+    "ack": ("已记录确认收到。", "Reminder acknowledged."),
+    "snooze": ("已延后，请查看新的提醒时间。", "Reminder snoozed. Check the new time."),
+    "edit": ("安排已更新。", "Schedule updated."),
+    "cancel": ("事项已取消。", "Item cancelled."),
+    "archive": ("已归档。", "Item archived."),
+    "reopen": ("事项已重开，可重新设置提醒。", "Item reopened. You can set a new reminder."),
 }
 
 
@@ -31,21 +47,40 @@ def display_time(value, reference=None, *, zone=None):
 
 
 def schedule_text(draft, reference=None, *, zone=None):
+    return _schedule_display(draft, reference, zone=zone)[0]
+
+
+def _schedule_display(draft, reference=None, *, zone=None, split_exact_timezone=False):
     show_time = partial(display_time, reference=reference, zone=zone)
     start = draft.get("remind_after") or draft.get("earliest_at")
     deadline = draft.get("remind_by") or draft.get("latest_first_delivery_at")
     parts = []
+    preview_zone = ""
     if not draft.get("reminder_enabled", True):
-        parts.append("未设置提醒")
+        parts.append(tr("未设置提醒", "No reminder set"))
     elif draft["mode"] == "hard" and deadline:
-        parts.append("准点提醒 " + show_time(deadline))
+        if split_exact_timezone:
+            time = local_time(deadline, zone=zone)
+            reference_day = local_time(reference, zone=zone).date() if reference is not None else None
+            parts.append(tr("{time} · 准点提醒", "{time} · At set time").format(
+                time=format_day_clock(time, reference_day),
+            ))
+            preview_zone = format_timezone(time, zone=zone).replace(" UTC", " · UTC")
+        else:
+            parts.append(tr("准点提醒 {time}", "At set time · {time}").format(time=show_time(deadline)))
     elif draft.get("latest_first_delivery_at") and draft.get("earliest_at") and not draft.get("remind_by"):
-        parts.append("柔性提醒窗口 " + show_time(start) + " 至 " + show_time(deadline))
+        parts.append(tr("柔性提醒窗口 {start} 至 {end}", "Flexible reminder window {start} to {end}").format(
+            start=show_time(start), end=show_time(deadline),
+        ))
     else:
-        parts.append("择机提醒")
+        parts.append(tr("择机提醒", "Flexible reminder"))
         if timing_context := draft.get("timing_context"):
-            parts.append("时机条件：" + timing_context)
-        for title, value in (("最早", draft.get("remind_after")), ("目标", draft.get("target_at")), ("最迟", deadline)):
+            parts.append(tr("时机条件：{context}", "Timing condition · {context}").format(context=timing_context))
+        for title, value in (
+            (tr("最早", "Earliest"), draft.get("remind_after")),
+            (tr("目标", "Target"), draft.get("target_at")),
+            (tr("最迟", "Latest"), deadline),
+        ):
             if value:
                 parts.append(title + " " + show_time(value))
         estimate_start = draft.get("window_open_at")
@@ -53,29 +88,40 @@ def schedule_text(draft, reference=None, *, zone=None):
         if estimate_start and estimate_end:
             opened = max(datetime.fromisoformat(value) for value in (estimate_start, start) if value)
             closed = min(datetime.fromisoformat(value) for value in (estimate_end, deadline, draft.get("expires_at")) if value)
-            parts.append("预计在 " + show_time(opened) + " 至 " + show_time(closed) + " 找空档提醒")
-    for title, key in (("提醒失效", "expires_at"), ("事项截止", "due_at")):
+            parts.append(tr("预计在 {start} 至 {end} 找空档提醒", "Likely to remind between {start} and {end}").format(
+                start=show_time(opened), end=show_time(closed),
+            ))
+    for title, key in ((tr("提醒失效", "Reminder expires"), "expires_at"), (tr("事项截止", "Item due"), "due_at")):
         if draft.get(key):
             parts.append(title + " " + show_time(draft[key]))
-    return "\n".join(parts)
+    return "\n".join(parts), preview_zone
 
 
 def task_status(view):
     if view.get("archived_at"):
-        return "已归档"
+        return tr("已归档", "Archived")
     issue = view["draft"].get("item_type") == "issue"
-    issue_label = {"created": "事项待开始", "in_progress": "事项进行中", "paused": "事项已暂停"}
+    issue_label = {
+        "created": ("事项待开始", "Item not started"),
+        "in_progress": ("事项进行中", "Item in progress"),
+        "paused": ("事项已暂停", "Item paused"),
+    }
     if view["status"] == "registered":
         reminder = ""
         if view.get("expired_at"):
-            reminder = "提醒已失效"
+            reminder = tr("提醒已失效", "Reminder expired")
         elif view.get("acknowledged_at"):
-            reminder = "已确认收到"
+            reminder = tr("已确认收到", "Acknowledged")
         elif view["draft"].get("reminder_enabled", True):
-            reminder = "已提醒，待处理" if view["displayed_at"] else "等待提醒"
-        result = issue_label.get(view.get("issue_status"), "事项待开始") if issue else ""
+            reminder = tr("已提醒，待处理", "Awaiting response") if view["displayed_at"] else tr("等待提醒", "Reminder pending")
+        result = tr(*issue_label.get(view.get("issue_status"), issue_label["created"])) if issue else ""
         return " · ".join(part for part in (result, reminder) if part)
-    return {"draft": "草稿，待确认", "completed": "已完成", "cancelled": "已取消"}[view["status"]]
+    states = {
+        "draft": ("草稿，待确认", "Draft awaiting confirmation"),
+        "completed": ("已完成", "Completed"),
+        "cancelled": ("已取消", "Cancelled"),
+    }
+    return tr(*states[view["status"]])
 
 
 class OptionalTime(QWidget):
@@ -95,6 +141,7 @@ class OptionalTime(QWidget):
         fields.setSpacing(7)
         self.date = QDateEdit(calendarPopup=True)
         self.date.setDisplayFormat("yyyy-MM-dd")
+        self.date.calendarWidget().setLocale(QLocale(tr("zh_CN", "en_US")))
         self.time = QTimeEdit()
         self.time.setDisplayFormat("HH:mm:ss")
         self.time.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
@@ -159,7 +206,7 @@ class ReminderPanel(QGroupBox):
     edit_opened = pyqtSignal()
 
     def __init__(self, *, submit, advanced=False, timezone=None, parent=None):
-        super().__init__("提醒事项", parent)
+        super().__init__(tr("提醒事项", "Reminders"), parent)
         self.submit = submit
         self.advanced = advanced
         self.timezone = timezone
@@ -179,39 +226,39 @@ class ReminderPanel(QGroupBox):
             layout.setSpacing(8)
         self.content = QLineEdit()
         self.content.setMaxLength(500)
-        self.content.setPlaceholderText("例如：提交报告")
+        self.content.setPlaceholderText(tr("例如：提交报告", "e.g. Submit the report"))
         self.mode = MenuField() if advanced else QComboBox()
-        self.mode.addItem("到点提醒", "hard")
-        self.mode.addItem("柔性提醒（窗口内择机）", "soft")
+        self.mode.addItem(tr("到点提醒", "At set time"), "hard")
+        self.mode.addItem(tr("柔性提醒（窗口内择机）", "Flexible time"), "soft")
         if advanced:
-            self.mode.addItem("只记录事项", "none")
+            self.mode.addItem(tr("只记录事项", "Item only"), "none")
         self.delay = QSpinBox()
         self.delay.setRange(0, 604800)
         self.delay.setValue(10)
-        self.delay.setSuffix(" 秒后")
+        self.delay.setSuffix(tr(" 秒后", " s later"))
         self.window = QSpinBox()
         self.window.setRange(1, 86400)
         self.window.setValue(20)
-        self.window.setSuffix(" 秒")
+        self.window.setSuffix(tr(" 秒", " s"))
         self.times = {}
         if advanced:
             content_card, content_layout = _card(spacing=6)
-            content_layout.addWidget(_text("事项内容", bold=True))
-            content_layout.addWidget(_text("标题", size=11, color=MUTED, bold=True))
-            self.content.setAccessibleName("标题")
+            content_layout.addWidget(_text(tr("事项内容", "Item details"), bold=True))
+            content_layout.addWidget(_text(tr("标题", "Title"), size=11, color=MUTED, bold=True))
+            self.content.setAccessibleName(tr("标题", "Title"))
             content_layout.addWidget(self.content)
             self.description = QLineEdit()
-            self.description.setAccessibleName("说明")
+            self.description.setAccessibleName(tr("说明", "Description"))
             self.description.setMaxLength(4000)
-            content_layout.addWidget(_text("说明", size=11, color=MUTED, bold=True))
+            content_layout.addWidget(_text(tr("说明", "Description"), size=11, color=MUTED, bold=True))
             content_layout.addWidget(self.description)
             self.item_type = MenuField()
-            self.item_type.addItem("纯提醒", "reminder")
-            self.item_type.addItem("工作事项", "issue")
-            self.item_type.setAccessibleName("类型")
+            self.item_type.addItem(tr("纯提醒", "Reminder"), "reminder")
+            self.item_type.addItem(tr("工作事项", "Work item"), "issue")
+            self.item_type.setAccessibleName(tr("类型", "Type"))
             self.item_type.setFixedWidth(130)
             item_type = QHBoxLayout()
-            item_type.addWidget(_text("类型", size=12), 1)
+            item_type.addWidget(_text(tr("类型", "Type"), size=12), 1)
             item_type.addWidget(self.item_type)
             content_layout.addLayout(item_type)
             self.item_type.currentIndexChanged.connect(self._refresh_controls)
@@ -219,41 +266,49 @@ class ReminderPanel(QGroupBox):
 
             time_card, time_layout = _card(spacing=7)
             mode = QHBoxLayout()
-            mode.addWidget(_text("提醒方式", bold=True), 1)
-            self.mode.setAccessibleName("提醒方式")
+            mode.addWidget(_text(tr("提醒方式", "Timing"), bold=True), 1)
+            self.mode.setAccessibleName(tr("提醒方式", "Reminder type"))
             self.mode.setFixedWidth(148)
             mode.addWidget(self.mode)
             time_layout.addLayout(mode)
             sound_row = QHBoxLayout()
-            sound_row.addWidget(_text("提醒声音", size=12), 1)
+            sound_row.addWidget(_text(tr("提醒声音", "Sound"), size=12), 1)
             self.sound = MenuField()
-            self.sound.setAccessibleName("提醒声音")
-            self.sound.addItem("跟随默认设置", None)
-            self.sound.addItem("仅无声提示", False)
-            self.sound.addItem("允许提示音", True)
+            self.sound.setAccessibleName(tr("提醒声音", "Reminder sound"))
+            self.sound.addItem(tr("跟随默认设置", "Use default"), None)
+            self.sound.addItem(tr("仅无声提示", "Silent"), False)
+            self.sound.addItem(tr("允许提示音", "Play sound"), True)
             self.sound.setFixedWidth(148)
             sound_row.addWidget(self.sound)
             time_layout.addLayout(sound_row)
-            for key, title in (("exact", "准点时间"), ("remind_after", "最早提醒"), ("target_at", "目标时间"),
-                               ("remind_by", "最迟提醒"), ("expires_at", "提醒失效"), ("due_at", "事项截止")):
+            for key, titles, toggle_labels in (
+                ("exact", ("准点时间", "Exact time"), ()),
+                ("remind_after", ("最早提醒", "Earliest reminder"), ("设置最早提醒时间", "Set earliest reminder")),
+                ("target_at", ("目标时间", "Target time"), ("设置目标时间", "Set target time")),
+                ("remind_by", ("最迟提醒", "Latest reminder"), ("设置最迟提醒时间", "Set latest reminder")),
+                ("expires_at", ("提醒失效", "Reminder expires"), ("设置提醒失效时间", "Set reminder expiry")),
+                ("due_at", ("事项截止", "Item due date"), ("设置事项截止时间", "Set item due date")),
+            ):
                 editor = OptionalTime(required=key == "exact", timezone=self.timezone)
-                editor.date.setAccessibleName(f"{title}日期")
-                editor.time.setAccessibleName(f"{title}时刻")
-                if key == "exact":
-                    editor.layout().insertWidget(0, _text(title, size=11, color=MUTED, bold=True))
+                title = tr(*titles)
+                editor.date.setAccessibleName(tr("{title}日期", "{title} · Date").format(title=title))
+                editor.time.setAccessibleName(tr("{title}时刻", "{title} · Time").format(title=title))
+                if toggle_labels:
+                    editor.enabled.setText(tr(*toggle_labels))
                 else:
-                    editor.enabled.setText(f"设置{title}时间")
+                    editor.layout().insertWidget(0, _text(title, size=11, color=MUTED, bold=True))
                 self.times[key] = editor
                 time_layout.addWidget(editor)
                 editor.changed.connect(self._refresh_controls)
             layout.addWidget(time_card)
         else:
-            form.addRow("标题", self.content)
-            form.addRow("提醒方式", self.mode)
-            form.addRow("最早提醒", self.delay)
-            form.addRow("柔性窗口宽度", self.window)
+            form.addRow(tr("标题", "Title"), self.content)
+            form.addRow(tr("提醒方式", "Reminder type"), self.mode)
+            form.addRow(tr("最早提醒", "Earliest reminder"), self.delay)
+            form.addRow(tr("柔性窗口宽度", "Flexible window"), self.window)
             layout.addLayout(form)
-        self.preview = _text("等待服务时间…", size=12, color=GREEN, bold=True, wrap=True) if advanced else label("等待服务时间…")
+        waiting = tr("等待服务时间…", "Waiting for service time…")
+        self.preview = _text(waiting, size=12, color=GREEN, bold=True, wrap=True) if advanced else label(waiting)
         self.preview.setTextFormat(Qt.TextFormat.PlainText)
         if advanced:
             preview = QVBoxLayout()
@@ -268,10 +323,10 @@ class ReminderPanel(QGroupBox):
         self.edit_note = label("")
         layout.addWidget(self.edit_note)
         row = QHBoxLayout()
-        self.create_button = QPushButton("创建草稿")
+        self.create_button = QPushButton(tr("创建草稿", "Create draft"))
         self.create_button.setProperty("primary", True)
-        self.save_edit = QPushButton("保存修改")
-        self.cancel_edit = QPushButton("取消修改")
+        self.save_edit = QPushButton(tr("保存修改", "Save edits"))
+        self.cancel_edit = QPushButton(tr("取消修改", "Cancel"))
         for b in (self.create_button, self.save_edit, self.cancel_edit):
             row.addWidget(b)
         layout.addLayout(row)
@@ -283,13 +338,13 @@ class ReminderPanel(QGroupBox):
         management = layout
         if advanced:
             self.management_card, management = _card(spacing=6)
-            management.addWidget(_text("已添加的事项", bold=True))
+            management.addWidget(_text(tr("已添加的事项", "Added items"), bold=True))
             layout.addWidget(self.management_card)
         self.tasks = QListWidget()
         self.tasks.setMaximumHeight(100)
         self.tasks.currentItemChanged.connect(self._render_details)
         self.group_note = label("")
-        self.group_exit = QPushButton("显示全部事项")
+        self.group_exit = QPushButton(tr("显示全部事项", "Show all items"))
         self.group_exit.clicked.connect(lambda: self.open_delivery_group(None))
         self.group_note.hide()
         self.group_exit.hide()
@@ -299,36 +354,43 @@ class ReminderPanel(QGroupBox):
         self.detail_title = GroupTitle()
         management.addWidget(self.detail_title)
         self.detail_title.hide()
-        self.details = label("尚无事项。创建草稿后，请核对时间并确认。")
+        self.details = label(tr("尚无事项。创建草稿后，请核对时间并确认。", "Create a draft, then check and confirm the schedule."))
         self.details.setTextFormat(Qt.TextFormat.PlainText)
         management.addWidget(self.details)
         row = QGridLayout() if advanced else QHBoxLayout()
         self.buttons = {}
-        buttons = [("confirm", "确认"), ("done", "标记完成"), ("edit", "修改安排"), ("cancel", "取消")]
+        buttons = [
+            ("confirm", tr("确认", "Confirm")),
+            ("done", tr("标记完成", "Mark done")),
+            ("edit", tr("修改安排", "Edit schedule")),
+            ("cancel", tr("取消", "Cancel")),
+        ]
         if advanced:
-            buttons.insert(1, ("ack", "确认收到"))
-            buttons.extend((("archive", "归档"), ("reopen", "重开事项")))
+            buttons.insert(1, ("ack", tr("确认收到", "Acknowledge")))
+            buttons.extend((("archive", tr("归档", "Archive")), ("reopen", tr("重开事项", "Reopen item"))))
+        columns = 2 if language() == "en" else 3
         for index, (kind, title) in enumerate(buttons):
             button = QPushButton(title)
             button.setObjectName(f"c-reminder-{kind}")
             button.clicked.connect(lambda checked=False, k=kind: self._selected_action(k))
             self.buttons[kind] = button
             if advanced:
-                row.addWidget(button, index // 3, index % 3)
+                row.addWidget(button, index // columns, index % columns)
             else:
                 row.addWidget(button)
         management.addLayout(row)
         self.snooze_seconds = QSpinBox()
         self.snooze_seconds.setRange(1, 604800)
         self.snooze_seconds.setValue(300 if advanced else 600)
-        self.snooze_seconds.setSuffix(" 秒后")
-        self.buttons["snooze"] = QPushButton("延后提醒")
+        self.snooze_seconds.setSuffix(tr(" 秒后", " s later"))
+        self.buttons["snooze"] = QPushButton(tr("延后提醒", "Snooze"))
         self.buttons["snooze"].clicked.connect(lambda: self._selected_action("snooze"))
         if advanced:
+            self.snooze_seconds.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.snooze_mode = MenuField()
-            self.snooze_mode.addItem("左右", "flexible_target")
-            self.snooze_mode.addItem("以后", "no_earlier")
-            self.snooze_mode.addItem("准点", "exact")
+            self.snooze_mode.addItem(tr("左右", "Around"), "flexible_target")
+            self.snooze_mode.addItem(tr("以后", "No earlier"), "no_earlier")
+            self.snooze_mode.addItem(tr("准点", "Exactly"), "exact")
             self.snooze_controls = QWidget()
             controls = QGridLayout(self.snooze_controls)
             controls.setContentsMargins(0, 0, 0, 0)
@@ -343,7 +405,8 @@ class ReminderPanel(QGroupBox):
             management.addLayout(row)
         self.snooze_preview = label("")
         management.addWidget(self.snooze_preview)
-        self.result = label("草稿确认前不会调度提醒。")
+        self._draft_note = tr("草稿确认前不会调度提醒。", "Confirm the draft to schedule the reminder.")
+        self.result = label(self._draft_note)
         layout.addWidget(self.result)
         self.content.textChanged.connect(self._refresh_controls)
         self.mode.currentIndexChanged.connect(self._refresh_controls)
@@ -417,17 +480,21 @@ class ReminderPanel(QGroupBox):
     def request(self, kind, task_id, version, payload=None):
         view = self.view(task_id)
         if self.busy(task_id) or (kind != "create" and (not view or view["version"] != version)):
-            self.result.setText("事项已更新或操作尚未完成，请查看最新安排。")
+            self.result.setText(tr(
+                "事项已更新或操作尚未完成，请查看最新安排。",
+                "Check the current schedule. The item changed or an action is still pending.",
+            ))
             return None
         try:
             action = "set_status" if kind == "reopen" else kind
             event_id = self.submit(f"reminder.{action}", task_id=task_id, version=version,
                                    payload={"status": "created"} if kind == "reopen" else payload or {})
         except (RuntimeError, ValueError) as exc:
-            self.result.setText(f"暂时无法提交：{exc}。输入已保留。")
+            self.result.setText(tr("暂时无法提交：{error}。输入已保留。",
+                                   "Could not submit ({error}). Your input was kept.").format(error=exc))
             return None
         self.pending[event_id] = {"kind": kind, "task_id": task_id, "version": version}
-        self.result.setText("正在提交…")
+        self.result.setText(tr("正在提交…", "Submitting…"))
         self._refresh_controls()
         self.actions_changed.emit()
         return event_id
@@ -476,7 +543,10 @@ class ReminderPanel(QGroupBox):
             self.delay.setValue(max(0, round((earliest - now).total_seconds())))
             self.window.setValue(max(1, round((latest - earliest).total_seconds())))
         self._edit_timing = self._timing_input()
-        self.edit_note.setText("正在修改：" + view["draft"]["content"] + "。保存前原安排保持有效。")
+        self.edit_note.setText(tr(
+            "正在修改：{title}。保存前原安排保持有效。",
+            "Editing {title}. The current schedule stays in effect until you save.",
+        ).format(title=view["draft"]["content"]))
         self._refresh_controls()
         self.edit_opened.emit()
 
@@ -504,14 +574,16 @@ class ReminderPanel(QGroupBox):
             result.get("status") == "duplicate" and result.get("message") == "replayed original applied result")
         if success:
             self._select_next = pending["task_id"]
-            titles = {"create": "草稿已创建，请核对时间后确认。", "confirm": "安排已确认。", "done": "事项已完成。", "ack": "已记录确认收到。",
-                      "snooze": "已延后，请查看新的提醒时间。", "edit": "安排已更新。", "cancel": "事项已取消。",
-                      "archive": "已归档。", "reopen": "事项已重开，可重新设置提醒。"}
-            self.result.setText(titles[pending["kind"]])
+            self.result.setText(tr(*RESULT_MESSAGES[pending["kind"]]))
             if pending["kind"] == "edit":
                 self._cancel_edit()
         else:
-            self.result.setText(ERRORS.get(result.get("error_code"), "操作未成功。") + " 输入已保留；修改冲突时请重新点击「修改安排」载入最新版本。")
+            error = result.get("error_code")
+            message = tr(*ERRORS[error]) if error in ERRORS else tr("操作未成功。", "The action could not be completed.")
+            self.result.setText(message + tr(
+                " 输入已保留；修改冲突时请重新点击「修改安排」载入最新版本。",
+                " Your input was kept. If the schedule changed, click Edit schedule to load the latest version.",
+            ))
         self._refresh_controls()
         self.actions_changed.emit()
 
@@ -532,7 +604,7 @@ class ReminderPanel(QGroupBox):
             self.tasks.blockSignals(True)
             self.tasks.clear()
             for view in views:
-                kind = "工作事项" if view["draft"].get("item_type") == "issue" else "纯提醒"
+                kind = tr("工作事项", "Work item") if view["draft"].get("item_type") == "issue" else tr("纯提醒", "Reminder")
                 item = QListWidgetItem(view["draft"]["content"] + " · " + kind + " · " + (self._delivery_note(view) or task_status(view)))
                 item.setData(Qt.ItemDataRole.UserRole, view["task_id"])
                 self.tasks.addItem(item)
@@ -554,11 +626,11 @@ class ReminderPanel(QGroupBox):
             if view:
                 self.detail_title.setText(view["draft"]["content"])
                 self.detail_title.subject = (view["task_id"], view["version"])
-                if self._delivery_note(view).startswith("同批到期"):
+                if self._delivery_note(view) == grouped_delivery_note():
                     self.detail_title.update()
             else:
                 self.detail_title.subject = None
-        detail = "尚无事项。创建草稿后，请核对时间并确认。"
+        detail = tr("尚无事项。创建草稿后，请核对时间并确认。", "Create a draft, then check and confirm the schedule.")
         if view:
             lines = [self._delivery_note(view) or task_status(view), self._schedule(view["draft"])]
             if view["draft"].get("description"):
@@ -578,7 +650,9 @@ class ReminderPanel(QGroupBox):
         self.group_note.setVisible(task_ids is not None)
         self.group_exit.setVisible(task_ids is not None)
         if task_ids is not None:
-            self.group_note.setText(f"同时到期的 {len(task_ids)} 条提醒")
+            self.group_note.setText(tr("同时到期的 {count} 条提醒", "{count} reminders due together").format(
+                count=len(task_ids),
+            ))
         self.render_snapshot(self.snapshot)
 
     def _delivery_note(self, view):
@@ -597,15 +671,10 @@ class ReminderPanel(QGroupBox):
 
     def _render_schedule_preview(self, draft):
         payload = draft.model_dump(mode="json")
-        schedule = self._schedule(payload)
-        zone = ""
-        prefix = "准点提醒 "
-        if schedule.startswith(prefix):
-            first_line, separator, extra = schedule.partition("\n")
-            label, _, zone = first_line.removeprefix(prefix).partition("（")
-            schedule = label + " · 准点提醒" + separator + extra
+        schedule, zone = _schedule_display(payload, self.snapshot.get("now"),
+                                           zone=self._display_zone(payload), split_exact_timezone=True)
         self.preview.setText(schedule)
-        self.preview_timezone.setText(zone.removesuffix("）").replace(" UTC", " · UTC"))
+        self.preview_timezone.setText(zone)
         self.preview_timezone.setVisible(bool(zone))
 
     def _refresh_controls(self):
@@ -618,7 +687,7 @@ class ReminderPanel(QGroupBox):
         if self.advanced:
             self.management_card.setVisible(self.tasks.count() > 0 or self._delivery_group is not None)
             self.edit_note.setVisible(bool(self.edit_note.text()))
-            self.result.setVisible(self.result.text() != "草稿确认前不会调度提醒。")
+            self.result.setVisible(self.result.text() != self._draft_note)
             mode = self.mode.currentData()
             self.sound.setEnabled(mode != "none")
             issue = self.item_type.currentData() == "issue"
@@ -634,7 +703,10 @@ class ReminderPanel(QGroupBox):
                 except ValueError:
                     self.preview_timezone.hide()
                     valid = False
-                    self.preview.setText("请检查最早时间、目标、最迟时间和失效时间的先后顺序。")
+                    self.preview.setText(tr(
+                        "请检查最早时间、目标、最迟时间和失效时间的先后顺序。",
+                        "Check the order of the earliest, target, latest, and expiry times.",
+                    ))
                 else:
                     self._render_schedule_preview(draft)
         self.create_button.setEnabled(valid and self._editing is None and not any(p["kind"] == "create" for p in self.pending.values()))
@@ -663,7 +735,9 @@ class ReminderPanel(QGroupBox):
                     end = start + timedelta(seconds=self.window.value() if self.mode.currentData() == "soft" else 0)
                     draft = {"mode": self.mode.currentData(), "earliest_at": start.isoformat(), "latest_first_delivery_at": end.isoformat()}
                 self.preview.setText(self._schedule(draft))
-            self.snooze_preview.setText("延后时间 " + self._snooze_time(self.snooze_seconds.value(), view))
+            self.snooze_preview.setText(tr("延后时间 {time}", "Snooze time · {time}").format(
+                time=self._snooze_time(self.snooze_seconds.value(), view),
+            ))
 
 
 class ReminderCard(QFrame):
@@ -678,15 +752,15 @@ class ReminderCard(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(label("该提醒到时间了：" + command.content))
+        layout.addWidget(label(tr("该提醒到时间了：{title}", "Reminder due · {title}").format(title=command.content)))
         self.arrangement = label("")
         layout.addWidget(self.arrangement)
         row = QHBoxLayout()
-        self.done = QPushButton("已完成")
+        self.done = QPushButton(tr("已完成", "Done"))
         self.done.clicked.connect(lambda: self._action("done"))
-        self.cancel = QPushButton("取消提醒")
+        self.cancel = QPushButton(tr("取消提醒", "Cancel reminder"))
         self.cancel.clicked.connect(lambda: self._action("cancel"))
-        self.edit = QPushButton("修改安排")
+        self.edit = QPushButton(tr("修改安排", "Edit schedule"))
         self.edit.clicked.connect(lambda: controller.open_edit(command.task_id) if self._valid() else None)
         for button in (self.done, self.edit, self.cancel):
             row.addWidget(button)
@@ -695,8 +769,8 @@ class ReminderCard(QFrame):
         self.snooze_seconds = QSpinBox()
         self.snooze_seconds.setRange(1, 604800)
         self.snooze_seconds.setValue(600)
-        self.snooze_seconds.setSuffix(" 秒后")
-        self.snooze = QPushButton("延后提醒")
+        self.snooze_seconds.setSuffix(tr(" 秒后", " s later"))
+        self.snooze = QPushButton(tr("延后提醒", "Snooze"))
         self.snooze.clicked.connect(lambda: self._action("snooze", self.controller._snooze_payload(self.snooze_seconds.value())))
         self.snooze_preview = label("")
         self.snooze_seconds.valueChanged.connect(self.refresh)
@@ -726,7 +800,9 @@ class ReminderCard(QFrame):
         if view:
             self.arrangement.setText(self.controller._schedule(view["draft"]))
         if self.controller.snapshot:
-            self.snooze_preview.setText("延后后的最早时间：" + self.controller._snooze_time(self.snooze_seconds.value(), view))
+            self.snooze_preview.setText(tr("延后后的最早时间：{time}", "Earliest time after snoozing · {time}").format(
+                time=self.controller._snooze_time(self.snooze_seconds.value(), view),
+            ))
         if not self._reported and not self._retired:
             self.update()
 

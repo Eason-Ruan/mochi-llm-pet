@@ -15,6 +15,7 @@ import psutil
 from pydantic import ValidationError
 
 from deskpet.contracts import ErrorCode, SessionCommand, SessionResult, WorkSession
+from deskpet.i18n import tr
 from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.task_service.sqlite import read_task, task_table_exists, transition_issue_for_interval
 
@@ -24,7 +25,11 @@ from .models import (
     ReviewInput, StartInput,
 )
 
-PHASE_TITLES = {"focus": "专注", "short_break": "短休息", "long_break": "长休息"}
+PHASE_TITLES = {
+    "focus": ("专注", "Focus"),
+    "short_break": ("短休息", "Short break"),
+    "long_break": ("长休息", "Long break"),
+}
 CHECKPOINT_SECONDS = 5
 
 
@@ -720,7 +725,7 @@ class PersistentWorkSessionService:
         duration = duration or defaults["default_focus_s" if args.kind == "focus" else "default_break_s"]
         phase = PhaseView(
             id=command.phase_id, version=1, kind=args.kind,
-            title=(args.title or "").strip() or PHASE_TITLES[args.kind],
+            title=(args.title or "").strip() or tr(*PHASE_TITLES[args.kind]),
             description=(args.description or "").strip() or None,
             state="running", planned_duration_s=duration, remaining_s=duration, actual_focus_s=0,
             created_at=tick.wall, begin_at=tick.wall, phase_due_at=tick.wall + timedelta(seconds=duration),
@@ -811,7 +816,7 @@ class PersistentWorkSessionService:
             raise Rejected(ErrorCode.INVALID_TRANSITION)
         updates = {"version": phase.version + 1}
         if "title" in details.model_fields_set:
-            updates["title"] = (details.title or "").strip() or PHASE_TITLES["focus"]
+            updates["title"] = (details.title or "").strip() or tr(*PHASE_TITLES["focus"])
         if "description" in details.model_fields_set:
             updates["description"] = (details.description or "").strip() or None
         return self._save(db, phase.model_copy(update=updates), active=True)

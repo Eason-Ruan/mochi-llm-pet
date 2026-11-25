@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 import sqlite3
 
+from deskpet.i18n import tr
 from deskpet.observation_v2.routes import SYSTEM2
 from deskpet.settings import SettingsStore
 from deskpet.system2.semantic_policy import semantic_background_enabled
@@ -107,8 +108,11 @@ class DesktopSystem2:
             now = self.env.clock.wall_now()
             created_at = datetime.fromisoformat(queued_at) if queued_at else None
             if created_at is None or not created_at <= now < created_at + self.host.turn_timeout:
-                self.chat.record_status(f"expired-{message_id}", message_id,
-                                        "这条消息在提交前已过期。仍需执行时，请重新发送。")
+                self.chat.record_status(
+                    f"expired-{message_id}", message_id,
+                    tr("这条消息在提交前已过期。仍需执行时，请重新发送。",
+                       "This message expired before submission. Send it again if you still need the action."),
+                )
                 continue
             predecessor = context.pop("supersedes_message_id", None)
             if predecessor:
@@ -116,8 +120,11 @@ class DesktopSystem2:
             try:
                 admission = self.host.submit_user(body, event_id=message_id, created_at=created_at, **context)
             except (ValueError, RuntimeError):
-                self.chat.record_status(f"submission-{message_id}", message_id,
-                                        "这条消息未能提交，请核对当前状态后重试。")
+                self.chat.record_status(
+                    f"submission-{message_id}", message_id,
+                    tr("这条消息未能提交，请核对当前状态后重试。",
+                       "This message could not be submitted. Check the current state and try again."),
+                )
             else:
                 self.chat.record_admission(message_id, admission)
         processed = []
@@ -129,9 +136,12 @@ class DesktopSystem2:
                                             payload.get("text"), parts=payload.get("parts"),
                                             outbox_sequence=event.sequence)
                 except ValueError:
-                    self.chat.record_status(event.answer_id, event.reply_to_message_id,
-                                            "无法显示这条回复。请查看当前状态后重试。",
-                                            outbox_sequence=event.sequence)
+                    self.chat.record_status(
+                        event.answer_id, event.reply_to_message_id,
+                        tr("无法显示这条回复。请查看当前状态后重试。",
+                           "This reply could not be displayed. Check the current state and try again."),
+                        outbox_sequence=event.sequence,
+                    )
             self.host.ack_ui_event(event.sequence)
             processed.append(event)
         return processed

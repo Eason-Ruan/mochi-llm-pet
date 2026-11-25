@@ -6,6 +6,7 @@ from functools import lru_cache
 import sys
 from threading import Lock, Timer
 
+from deskpet.i18n import tr
 from deskpet.task_service.presentation import notification_id
 
 
@@ -18,6 +19,10 @@ SNOOZE_ACTION = "mochi.reminder.snooze.5m"
 REMINDER_CATEGORY = "mochi.reminder.ack.v1"
 SNOOZE_CATEGORY = "mochi.reminder.snooze.v1"
 REMINDER_CATEGORIES = frozenset({REMINDER_CATEGORY, SNOOZE_CATEGORY})
+
+
+def _generic_content() -> tuple[str, str]:
+    return tr(GENERIC_TITLE, "Mochi has a reminder"), tr(GENERIC_BODY, "Open Mochi to view the reminder.")
 
 
 def _valid_identifier(identifier: str) -> bool:
@@ -57,8 +62,10 @@ class UnavailableNotifications:
     can_verify_removal = False
     can_respond = False
 
-    def __init__(self, reason="当前桌面环境不支持系统通知"):
-        self.status = reason
+    def __init__(self, reason=None):
+        self.status = reason if reason is not None else tr(
+            "当前桌面环境不支持系统通知", "System notifications are unsupported on this desktop",
+        )
 
     available = False
 
@@ -89,10 +96,10 @@ class MacNotifications:
 
         bundle = NSBundle.mainBundle()
         if bundle.bundleIdentifier() != MAC_BUNDLE_ID or not str(bundle.bundlePath()).endswith(".app"):
-            raise RuntimeError("系统通知需要从 Mochi.app 启动")
+            raise RuntimeError(tr("系统通知需要从 Mochi.app 启动", "Launch Mochi.app to use system notifications"))
         self.center = UNUserNotificationCenter.currentNotificationCenter()
         self.available = False
-        self.status = "正在查询系统通知权限"
+        self.status = tr("正在查询系统通知权限", "Checking system notification permission")
         self.sound_available = False
         self._refreshing = False
         self._request_pending = False
@@ -131,8 +138,8 @@ class MacNotifications:
         )
 
         options = UNNotificationActionOptionAuthenticationRequired
-        acknowledge = UNNotificationAction.actionWithIdentifier_title_options_(ACK_ACTION, "确认收到", options)
-        snooze = UNNotificationAction.actionWithIdentifier_title_options_(SNOOZE_ACTION, "5 分钟后提醒", options)
+        acknowledge = UNNotificationAction.actionWithIdentifier_title_options_(ACK_ACTION, tr("确认收到", "Acknowledge"), options)
+        snooze = UNNotificationAction.actionWithIdentifier_title_options_(SNOOZE_ACTION, tr("5 分钟后提醒", "Snooze 5 minutes"), options)
         categories = {
             UNNotificationCategory.categoryWithIdentifier_actions_intentIdentifiers_options_(
                 REMINDER_CATEGORY, [acknowledge], [], 0,
@@ -203,20 +210,20 @@ class MacNotifications:
         def checked(settings):
             if settings is None:
                 self.available = self.sound_available = False
-                self.status = "系统通知权限状态暂不可用"
+                self.status = tr("系统通知权限状态暂不可用", "System notification permission status is temporarily unavailable")
                 self._refreshing = False
                 return
             state = settings.authorizationStatus()
             self.available = state == UNAuthorizationStatusAuthorized and settings.alertSetting() == UNNotificationSettingEnabled
             self.sound_available = self.available and settings.soundSetting() == UNNotificationSettingEnabled
             if self.available:
-                self.status = "可用" if self.sound_available else "可用，系统通知音已关闭"
+                self.status = tr("可用", "Available") if self.sound_available else tr("可用，系统通知音已关闭", "Available with system notification sounds off")
             elif state == UNAuthorizationStatusDenied:
-                self.status = "系统通知权限已拒绝"
+                self.status = tr("系统通知权限已拒绝", "System notification permission was denied")
             elif state == UNAuthorizationStatusNotDetermined:
-                self.status = "系统通知尚未授权"
+                self.status = tr("系统通知尚未授权", "System notification permission has not been granted")
             else:
-                self.status = "系统已关闭通知横幅"
+                self.status = tr("系统已关闭通知横幅", "System notification banners are off")
 
             ask = self._request_pending and state == UNAuthorizationStatusNotDetermined
             self._request_pending = False
@@ -244,8 +251,9 @@ class MacNotifications:
             complete("failed", self.status)
             return
         content = UNMutableNotificationContent.alloc().init()
-        content.setTitle_(GENERIC_TITLE)
-        content.setBody_(GENERIC_BODY)
+        title, body = _generic_content()
+        content.setTitle_(title)
+        content.setBody_(body)
         content.setCategoryIdentifier_(SNOOZE_CATEGORY if snooze else REMINDER_CATEGORY)
         if due_at is not None:
             content.setThreadIdentifier_(notification_id(f"deadline:{due_at.astimezone(timezone.utc).isoformat()}"))
@@ -255,14 +263,16 @@ class MacNotifications:
         if due_at is not None:
             delay = (due_at - datetime.now(timezone.utc)).total_seconds()
             if delay < 1:
-                complete("failed", "系统预登记时间已到")
+                complete("failed", tr("系统预登记时间已到", "The scheduled notification time has arrived"))
                 return
             trigger = UNTimeIntervalNotificationTrigger.triggerWithTimeInterval_repeats_(delay, False)
         request = UNNotificationRequest.requestWithIdentifier_content_trigger_(identifier, content, trigger)
 
         def submitted(error):
             if error is not None:
-                complete("failed", f"系统拒绝通知（{error.domain()} {error.code()}）")
+                complete("failed", tr("系统拒绝通知（{domain} {code}）", "System rejected the notification ({domain} {code})").format(
+                    domain=error.domain(), code=error.code(),
+                ))
             else:
                 complete("scheduled" if due_at is not None else "submitted", None)
 
@@ -312,14 +322,19 @@ class WindowsNotifications:
 
         setting = self.notifier.setting
         self.available = setting == NotificationSetting.ENABLED
-        self.status = "可用（Mochi 运行时可发送）" if self.available else f"Windows 通知不可用（{setting.name}）"
+        if self.available:
+            self.status = tr("可用（Mochi 运行时可发送）", "Available while Mochi is running")
+        else:
+            self.status = tr("Windows 通知不可用（{status}）", "Windows notifications are unavailable ({status})").format(
+                status=setting.name,
+            )
 
     def submit(self, identifier, due_at, *, sound, complete):
         from winrt.windows.data.xml.dom import XmlDocument
         from winrt.windows.ui.notifications import ToastNotification
 
         if due_at is not None:
-            complete("failed", "当前 Windows 桌面通道无法提前登记")
+            complete("failed", tr("当前 Windows 桌面通道无法提前登记", "This Windows notification channel cannot schedule notifications"))
             return
         self.refresh()
         if not self.available:
@@ -328,8 +343,9 @@ class WindowsNotifications:
         xml = XmlDocument()
         audio = "" if sound else '<audio silent="true"/>'
         # Only generic constants go to Windows, including when the desktop is locked.
-        xml.load_xml(f'<toast><visual><binding template="ToastGeneric"><text>{GENERIC_TITLE}</text>'
-                     f'<text>{GENERIC_BODY}</text></binding></visual>{audio}</toast>')
+        title, body = _generic_content()
+        xml.load_xml(f'<toast><visual><binding template="ToastGeneric"><text>{title}</text>'
+                     f'<text>{body}</text></binding></visual>{audio}</toast>')
         item = ToastNotification(xml)
         item.tag, item.group = identifier, self.group
         self.notifier.show(item)
@@ -345,11 +361,11 @@ class WindowsNotifications:
 
 def platform_notifications(*, native: bool):
     if not native:
-        return UnavailableNotifications("离屏模式仅验证桌宠通道")
+        return UnavailableNotifications(tr("离屏模式仅验证桌宠通道", "Offscreen mode supports only the pet display"))
     backend = {"darwin": MacNotifications, "win32": WindowsNotifications}.get(sys.platform)
     if backend is None:
         return UnavailableNotifications()
     try:
         return backend()
     except (AttributeError, ImportError, OSError, RuntimeError, TypeError) as exc:
-        return UnavailableNotifications(str(exc) if isinstance(exc, RuntimeError) else "系统通知组件不可用")
+        return UnavailableNotifications(str(exc) if isinstance(exc, RuntimeError) else tr("系统通知组件不可用", "System notifications are unavailable"))

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from deskpet.i18n import tr
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.mocks.clock import RealClock
 from deskpet.observation_v2.context import (
@@ -28,7 +29,7 @@ from .intent import (
     chat_grants, materialize_chat_times, proposal_button_grants, ref_id, ref_kind,
 )
 from .jev_shadow import JevShadow, is_pure_tick
-from .prompt import PROMPT_VERSION, SPLIT_PROMPT_VERSION, select_prompt
+from .prompt import PROMPT_VERSION, SPLIT_PROMPT_VERSION, output_language_instruction, select_prompt
 from .protocol import EngineReply, ToolAuthority, TurnRequest
 from .semantic_policy import background_grants, semantic_background_enabled, text_sharing_allowed
 from .tool_schema import READ_TOOLS, canonical_tool_name, validate_tool_args
@@ -37,49 +38,81 @@ from .tool_schema import READ_TOOLS, canonical_tool_name, validate_tool_args
 log = logging.getLogger(__name__)
 _SUCCESS = frozenset({"applied", "accepted", "pending"})
 _ACTION_LABELS = {
-    "item.create": "已创建事项。",
-    "item.update": "已更新事项。",
-    "item.set_status": "已更新事项状态。",
-    "item.archive": "已归档事项。",
-    "reminder.configure": "已设置提醒。",
-    "reminder.snooze": "已推迟提醒。",
-    "reminder.ack": "已确认提醒。",
-    "phase.start": "已开始计时。",
-    "phase.pause": "已暂停计时。",
-    "phase.resume": "已继续计时。",
-    "phase.adjust": "已调整计时。",
-    "phase.end": "已结束计时。",
-    "phase.skip_break": "已跳过休息。",
-    "phase.set_links": "已更新专注关联。",
-    "settings.update": "已更新设置。",
-    "proposal.offer": "已生成待确认提议。",
-    "proposal.resolve": "已处理提议。",
-    "reminder.present": "已提交提醒展示。",
-    "reminder.recheck": "已登记复查。",
-    "observation.wait_fresh": "已登记等待新观测。",
-    "pet.present": "已提交呈现请求。",
+    "item.create": ("已创建事项。", "Item created."),
+    "item.update": ("已更新事项。", "Item updated."),
+    "item.set_status": ("已更新事项状态。", "Item status updated."),
+    "item.archive": ("已归档事项。", "Item archived."),
+    "reminder.configure": ("已设置提醒。", "Reminder set."),
+    "reminder.snooze": ("已推迟提醒。", "Reminder snoozed."),
+    "reminder.ack": ("已确认提醒。", "Reminder acknowledged."),
+    "phase.start": ("已开始计时。", "Timer started."),
+    "phase.pause": ("已暂停计时。", "Timer paused."),
+    "phase.resume": ("已继续计时。", "Timer resumed."),
+    "phase.adjust": ("已调整计时。", "Timer adjusted."),
+    "phase.end": ("已结束计时。", "Timer ended."),
+    "phase.skip_break": ("已跳过休息。", "Break skipped."),
+    "phase.set_links": ("已更新专注关联。", "Focus session links updated."),
+    "settings.update": ("已更新设置。", "Settings updated."),
+    "proposal.offer": ("已生成待确认提议。", "Suggestion ready for confirmation."),
+    "proposal.resolve": ("已处理提议。", "Suggestion resolved."),
+    "reminder.present": ("已提交提醒展示。", "Reminder submitted for display."),
+    "reminder.recheck": ("已登记复查。", "Follow-up scheduled."),
+    "observation.wait_fresh": ("已登记等待新观测。", "Waiting for a new observation."),
+    "pet.present": ("已提交呈现请求。", "Display requested."),
 }
 _REASONS = {
-    "quiet": "这次没有需要主动打扰的事项。",
-    "busy": "当时的状态适合继续等待。",
-    "focus_active": "当时正在专注，普通提醒继续等待。",
-    "not_fresh": "当时没有可用于判断打扰时机的当前观测。",
-    "no_eligible_items": "当时没有符合时间条件的提醒。",
-    "no_meaningful_change": "没有需要再次提示的新进展。",
-    "awaiting_response": "相关事项已提示，正在等待处理。",
-    "recent_refusal": "这项建议近期已被拒绝。",
-    "habit_successor_started": "习惯已按设定开始下一阶段。",
-    "meeting_preparation": "该事项有临近的准备时限。",
-    "time_sensitive": "继续等待会影响事项所需的时间。",
-    "available": "当时符合提醒的空档条件。",
-    "working": "当时正在工作。",
-    "disabled": "相关设置已关闭。",
-    "model_unavailable": "这次对话模型没能完成回复。",
-    "superseded": "这条请求已经被后续操作替代。",
-    "interrupted": "上一轮未完成，已核对保存的执行结果。",
-    "scope_changed": "候选事项已变化，正在按最新状态重新判断。",
-    "expired_request": "这条请求已超过可执行时限。",
+    "quiet": ("这次没有需要主动打扰的事项。", "Nothing needed your attention this time."),
+    "busy": ("当时的状态适合继续等待。", "It was a good time to wait."),
+    "focus_active": ("当时正在专注，普通提醒继续等待。", "A focus session was active, so routine reminders waited."),
+    "not_fresh": ("当时没有可用于判断打扰时机的当前观测。", "There was no current activity to help time an interruption."),
+    "no_eligible_items": ("当时没有符合时间条件的提醒。", "No reminders were eligible at the time."),
+    "no_meaningful_change": ("没有需要再次提示的新进展。", "Nothing had changed enough to send another prompt."),
+    "awaiting_response": ("相关事项已提示，正在等待处理。", "This was already brought to your attention and is awaiting a response."),
+    "recent_refusal": ("这项建议近期已被拒绝。", "This suggestion was recently declined."),
+    "habit_successor_started": ("习惯已按设定开始下一阶段。", "The habit started its next phase as scheduled."),
+    "meeting_preparation": ("该事项有临近的准备时限。", "The time to prepare for this item was running short."),
+    "time_sensitive": ("继续等待会影响事项所需的时间。", "Waiting longer would leave too little time for this item."),
+    "available": ("当时符合提醒的空档条件。", "It was a suitable time for the reminder."),
+    "working": ("当时正在工作。", "You were working at the time."),
+    "disabled": ("相关设置已关闭。", "This feature is turned off."),
+    "model_unavailable": ("这次对话模型没能完成回复。", "The model could not complete its reply."),
+    "superseded": ("这条请求已经被后续操作替代。", "A later action replaced this request."),
+    "interrupted": ("上一轮未完成，已核对保存的执行结果。", "The previous turn was interrupted. Saved results were checked."),
+    "scope_changed": ("候选事项已变化，正在按最新状态重新判断。", "The available items changed. Checking the latest state."),
+    "expired_request": ("这条请求已超过可执行时限。", "This request has expired."),
 }
+# Translate known gateway messages at display time. Custom messages and stored results retain their original text.
+_RECEIPT_MESSAGES = {
+    chinese: english for chinese, english in _ACTION_LABELS.values()
+} | {
+    "内容已更新，请刷新后再试。": "This item has changed. Refresh and try again.",
+    "当前活动已变化，等待重新判断。": "Your activity changed. Waiting to reassess.",
+    "该请求已过期。": "This request has expired.",
+    "无法使用这些参数。": "These parameters are invalid.",
+    "当前状态无法执行这项操作。": "This action is unavailable in the current state.",
+    "找不到所请求的内容。": "The requested item could not be found.",
+    "不支持这项操作。": "This action is unsupported.",
+    "这项操作需要你确认。": "This action requires your confirmation.",
+    "这张确认卡已处理。": "This suggestion has already been resolved.",
+    "已由你更新的指令替代。": "A newer instruction replaced this request.",
+    "模型授权已变更，这次操作没有执行。": "Model authorization changed. The action did not run.",
+    "此功能已关闭。": "This feature is turned off.",
+    "当前无法使用这个展示渠道。": "This display channel is currently unavailable.",
+    "这次操作未完成。": "The action could not be completed.",
+    "已更新。": "Updated.",
+    "已更新提醒时间。": "Reminder time updated.",
+    "已开始。": "Timer started.",
+    "已暂停。": "Timer paused.",
+    "已继续。": "Timer resumed.",
+    "已调整时长。": "Timer duration adjusted.",
+    "已结束。": "Timer ended.",
+    "已更新习惯。": "Habit updated.",
+    "建议已加入待确认列表，当前无法显示提示。": "Suggestion added to the pending list. The prompt could not be displayed.",
+    "等待你确认。": "Awaiting your confirmation.",
+    "已拒绝建议。": "Suggestion declined.",
+    "已取消建议。": "Suggestion dismissed.",
+}
+_HANDLED = ("已处理。", "Done.")
 _STALE = {"STALE_TASK", "STALE_CONTEXT", "STALE_VERSION", "STALE_PROPOSAL"}
 
 
@@ -150,14 +183,19 @@ def _result_reply(function: str, result: dict, timezone: str | None = None) -> d
     phase_action = result.get("resolved_function") if function == "proposal.resolve" else function
     view = result.get("view")
     view = view if isinstance(view, dict) else {}
+    message = result.get("message")
+    if message:
+        message = tr(message, _RECEIPT_MESSAGES.get(message, message))
     if status in {"applied", "accepted"}:
-        text = result.get("message") or _ACTION_LABELS.get(function, "已处理。")
+        text = message or tr(*_ACTION_LABELS.get(function, _HANDLED))
         phase = view.get("phase", view)
         seconds = phase.get("planned_duration_s") if isinstance(phase, dict) else None
         if function == "habit.create":
-            text = f"已创建习惯「{title}」。" if (title := view.get("title")) else "已创建习惯。"
+            text = tr("已创建习惯。", "Habit created.")
+            if title := view.get("title"):
+                text = tr("已创建习惯「{title}」。", "Habit created for “{title}”.").format(title=title)
         elif function == "item.create" and view.get("type") == "reminder" and (title := view.get("title")):
-            text = f"已设置提醒「{title}」。"
+            text = tr("已设置提醒「{title}」。", "Reminder set for “{title}”.").format(title=title)
             if timezone and (rule := view.get("rule")):
                 earliest, latest, target = (rule.get(field) for field in ("remind_after", "remind_by", "target_at"))
                 due = latest or target or earliest
@@ -165,32 +203,49 @@ def _result_reply(function: str, result: dict, timezone: str | None = None) -> d
                     local_time = datetime.fromisoformat(due).astimezone(resolve_timezone(timezone))
                     created_at = view.get("created_at")
                     same_day = created_at and datetime.fromisoformat(created_at).astimezone(local_time.tzinfo).date() == local_time.date()
-                    label = local_time.strftime("%H:%M:%S" if same_day else "%m月%d日 %H:%M:%S")
-                    prefix = "" if earliest == latest else "最晚 " if latest else "约 " if target else "最早 "
-                    text = f"已设置提醒「{title}」，{prefix}{label}。"
+                    label = local_time.strftime("%H:%M:%S" if same_day else tr("%m月%d日 %H:%M:%S", "%Y-%m-%d %H:%M:%S"))
+                    if earliest == latest:
+                        prefix = tr("", "at " if latest else "around ")
+                    elif latest:
+                        prefix = tr("最晚 ", "by ")
+                    elif target:
+                        prefix = tr("约 ", "around ")
+                    else:
+                        prefix = tr("最早 ", "no earlier than ")
+                    text = tr("已设置提醒「{title}」，{when}。", "Reminder set for “{title}” {when}.").format(
+                        title=title, when=prefix + label,
+                    )
         if phase_action in {"phase.start", "phase.adjust"} and isinstance(seconds, (int, float)):
-            length = f"{seconds / 60:g} 分钟" if seconds % 60 == 0 else f"{seconds:g} 秒"
-            text = f"{'已调整' if phase_action == 'phase.adjust' else '已开始'} · {length}"
+            if seconds % 60 == 0:
+                amount = seconds / 60
+                unit = tr("分钟", "minute" if amount == 1 else "minutes")
+            else:
+                amount = seconds
+                unit = tr("秒", "second" if amount == 1 else "seconds")
+            action = tr("已调整", "Timer adjusted") if phase_action == "phase.adjust" else tr("已开始", "Timer started")
+            text = f"{action} · {amount:g} {unit}"
     elif status == "pending":
-        text = result.get("message") or "已提交，正在等待确认。"
+        text = message or tr("已提交，正在等待确认。", "Submitted and awaiting confirmation.")
     elif error_code in _STALE:
-        text = "相关事项或设置已经更新。请刷新后再确认。"
+        text = tr("相关事项或设置已经更新。请刷新后再确认。", "The item or settings have changed. Refresh before confirming.")
     elif status == "timeout":
-        text = "这次未能确认操作结果。"
+        text = tr("这次未能确认操作结果。", "The result of this action could not be confirmed.")
     elif error_code == "INVALID_TRANSITION" and phase_action == "phase.start":
-        text = "当前状态无法开始新的计时。"
+        text = tr("当前状态无法开始新的计时。", "A new timer cannot start in the current state.")
     elif error_code == "NOT_FOUND":
-        text = result.get("message") or "找不到所请求的内容。"
+        text = message or tr("找不到所请求的内容。", "The requested item could not be found.")
     elif error_code == "NOT_AUTHORIZED":
-        text = "这次操作未获授权，未执行。" if phase_action != "phase.start" else "这次启动请求未获授权，未开始新的计时。"
+        text = (tr("这次启动请求未获授权，未开始新的计时。", "This request was unauthorized. No new timer started.")
+                if phase_action == "phase.start" else tr("这次操作未获授权，未执行。", "This action was unauthorized and did not run."))
     elif error_code == "DUPLICATE":
-        text = "这次重复请求未再次执行。"
+        text = tr("这次重复请求未再次执行。", "This duplicate request did not run again.")
     elif error_code == "IDEMPOTENCY_MISMATCH":
-        text = "这次请求与先前的操作冲突，未执行。"
+        text = tr("这次请求与先前的操作冲突，未执行。", "This request conflicted with an earlier action and did not run.")
     elif timezone and error_code == "INVALID_ARGUMENT":
-        text = "这条事项没有保存。请核对内容和时间。" if function == "item.create" else "操作参数无效，未能保存更改。"
+        text = (tr("这条事项没有保存。请核对内容和时间。", "The item could not be saved. Check its details and time.")
+                if function == "item.create" else tr("操作参数无效，未能保存更改。", "The changes could not be saved because the parameters were invalid."))
     else:
-        text = result.get("message") or "这次没有执行成功。"
+        text = message or tr("这次没有执行成功。", "This action did not succeed.")
     return {"text": text, "status": status, "outcome": _tool_outcome(function, result),
             "command_id": result.get("call_id"), "error_code": error_code,
             "result_ref": result.get("subject_ref"), "delivery_id": result.get("delivery_id")}
@@ -902,12 +957,13 @@ class System2Host:
                 refs.append(result["subject_ref"])
             next_check = result.get("retry_at")
             explanation = (
-                _REASONS.get(code, _ACTION_LABELS.get(action, "已处理。"))
-                if _original_status(result) in _SUCCESS else "这次未能完成该操作。"
+                tr(*_REASONS.get(code, _ACTION_LABELS.get(action, _HANDLED)))
+                if _original_status(result) in _SUCCESS
+                else tr("这次未能完成该操作。", "The action could not be completed.")
             )
         elif failure:
             action = failure
-            explanation = _REASONS.get(code, "这次未能完成判断。")
+            explanation = tr(*_REASONS.get(code, ("这次未能完成判断。", "This check could not be completed.")))
         else:
             if admission.source == "background" and engine_reply.text.startswith("{"):
                 try:
@@ -919,7 +975,7 @@ class System2Host:
                     pass
             elif admission.source == "user":
                 action = "reply"
-            explanation = _REASONS[code]
+            explanation = tr(*_REASONS[code])
         if admission.source == "background" and semantic_background_enabled() and not failure:
             if action == "quiet" or action in {"reminder.recheck", "observation.wait_fresh", "decision.recheck"}:
                 level = "quiet"
@@ -957,11 +1013,11 @@ class System2Host:
             source = "program" if action["status"] in _SUCCESS else "status"
             parts.append({"source": source, "text": action["text"]})
         if failure:
-            parts.append({"source": "status", "text": _REASONS.get(failure, "这次判断没有完成。")})
+            parts.append({"source": "status", "text": tr(*_REASONS.get(failure, ("这次判断没有完成。", "This check could not be completed.")))})
         elif reply.text.strip():
             parts.append({"source": "model", "text": reply.text})
         if not parts:
-            parts.append({"source": "status", "text": "这次没有收到答复。"})
+            parts.append({"source": "status", "text": tr("这次没有收到答复。", "No reply was received.")})
         if not failure and len(actions) == len(parts) == 1:
             return {**actions[0], "parts": parts}
         status = failure
@@ -1152,7 +1208,7 @@ class System2Host:
                 return result
 
         request = TurnRequest(
-            admission.admission_id, admission.step_id, selection.text, json_text({
+            admission.admission_id, admission.step_id, selection.text + output_language_instruction(), json_text({
                 "origin": admission.source,
                 "semantic_chat": semantic_chat,
                 "semantic_background": semantic_background,

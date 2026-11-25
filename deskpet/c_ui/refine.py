@@ -15,6 +15,7 @@ from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from deskpet.desktop_profile import DESKTOP_NAME, desktop_data_dir, desktop_settings_store
+from deskpet.i18n import language, tr
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
 from deskpet.perception.macos import screen_recording_access
@@ -149,9 +150,9 @@ class RefineSession(RefineDeliveryMixin):
         self.chat.typing_requested.connect(self.pet.activate_for_input)
         self.chat.storage_error.connect(self._service_error)
         self.panels = {
-            "reminders": (DetailPanel("提醒事项", self.reminders, lambda: self._panel_details("reminders", False))
-                          if self.production else self.reminders),
-            "work": (DetailPanel("专注与回顾", self.work, lambda: self._panel_details("work", False))
+            "reminders": (DetailPanel(tr("提醒事项", "Reminders"), self.reminders,
+                                      lambda: self._panel_details("reminders", False)) if self.production else self.reminders),
+            "work": (DetailPanel(tr("专注与回顾", "Focus & review"), self.work, lambda: self._panel_details("work", False))
                      if self.production else self.work),
             "settings": self.settings_panel,
             "input": self.chat,
@@ -166,9 +167,13 @@ class RefineSession(RefineDeliveryMixin):
                 "settings": RefineSettings(voice_available=False),
             }
             self.reminders.actions_changed.connect(self.overviews["reminders"].refresh_actions)
-            for key, label in (("reminders", "管理提醒"), ("work", "管理计时"), ("settings", "更多设置")):
-                self.overviews[key].add_manage_action(label, lambda checked=False, name=key: self._panel_details(name, True))
-            back = QPushButton("返回摘要")
+            for key, label in (("reminders", tr("管理提醒", "Manage")),
+                               ("work", tr("管理计时", "Manage timer")), ("settings", tr("更多设置", "More settings"))):
+                self.overviews[key].add_manage_action(
+                    label, lambda checked=False, name=key: self._panel_details(name, True),
+                    below_title=key == "work" and language() == "en",
+                )
+            back = QPushButton(tr("返回摘要", "Back to summary"))
             back.setObjectName("refine-back-to-summary")
             back.clicked.connect(lambda: self._panel_details("settings", False))
             self.settings_panel.body.itemAt(0).layout().addWidget(back)
@@ -209,7 +214,7 @@ class RefineSession(RefineDeliveryMixin):
             if self.observer is not None:
                 self.observer.stop()
             raise
-        self.window.setWindowTitle("Mochi · 协作联调台")
+        self.window.setWindowTitle(tr("Mochi · 协作联调台", "Mochi · Diagnostics"))
         self.window.service_error.connect(self._service_error)
         self.window.finished.connect(self._finished)
         if self.production:
@@ -277,7 +282,7 @@ class RefineSession(RefineDeliveryMixin):
         overview = self.overviews["reminders"]
         task = self._current_reminder_occurrence(task_id, occurrence)
         if task is None:
-            overview.set_feedback("这次提醒已更新，请查看当前安排。")
+            overview.set_feedback(tr("这次提醒已更新，请查看当前安排。", "This reminder has changed. Check its current schedule."))
             return None
         if self._reminder_response_busy(task_id):
             return None
@@ -293,7 +298,9 @@ class RefineSession(RefineDeliveryMixin):
 
     def _customize_reminder_snooze(self, task_id, occurrence):
         if self._current_reminder_occurrence(task_id, occurrence) is None:
-            self.overviews["reminders"].set_feedback("这次提醒已更新，请查看当前安排。")
+            self.overviews["reminders"].set_feedback(tr(
+                "这次提醒已更新，请查看当前安排。", "This reminder has changed. Check its current schedule."
+            ))
             return
         self._show_reminder_details(task_id, self.reminders.snooze_controls)
 
@@ -455,7 +462,8 @@ class RefineSession(RefineDeliveryMixin):
                 if result.get("status") == "applied":
                     self._show_section("work")
                 else:
-                    self.show_message("未能开始这项习惯。请查看当前专注状态。")
+                    self.show_message(tr("未能开始这项习惯。请查看当前专注状态。",
+                                         "Could not start this habit. Check the current focus session."))
             return
         task = self._pending_seed.pop(event, None)
         if task and result.get("status") == "applied":
@@ -478,7 +486,8 @@ class RefineSession(RefineDeliveryMixin):
         if self.production:
             self._render_reminder_overview(snapshot)
             self.overviews["work"].render_snapshot(snapshot)
-            self.overviews["settings"].policy_badge.setText("开始前询问" if snapshot["settings"]["auto_adjust"] else "已关闭")
+            self.overviews["settings"].policy_badge.setText(tr("开始前询问", "Ask before starting")
+                                                           if snapshot["settings"]["auto_adjust"] else tr("已关闭", "Off"))
             self.reminders.render_snapshot({**snapshot, "presentation_pending": notes})
         else:
             self.reminders.render_snapshot(snapshot)
@@ -533,7 +542,7 @@ class RefineSession(RefineDeliveryMixin):
             if "system2_chat_version" in snapshot:
                 self.chat.refresh_projection(snapshot["system2_chat_version"])
         except sqlite3.Error:
-            self._service_error("暂时无法读取聊天记录。")
+            self._service_error(tr("暂时无法读取聊天记录。", "Could not read chat history."))
         self.chat.refresh_route(snapshot.get("system2_route_status"))
         proposals = snapshot.get("system2_proposals", ())
         self.pet.set_proposal_count(len(proposals))
@@ -866,25 +875,28 @@ def configure_system2(data_dir=None):
     app, data_dir = _desktop_profile(data_dir)
     store = desktop_settings_store(data_dir)
     editor = _RouteEditor(store.routes, SYSTEM2, None, preset_provider="bailian")
-    editor.setWindowTitle("Mochi · System 2 模型连接")
+    editor.setWindowTitle(tr("Mochi · System 2 模型连接", "Mochi · System 2 model connection"))
     buttons = editor.findChild(QDialogButtonBox)
-    buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并验证")
+    buttons.button(QDialogButtonBox.StandardButton.Save).setText(tr("保存并验证", "Save and verify"))
     if editor.exec() != QDialog.DialogCode.Accepted or store.routes.snapshot(SYSTEM2).route is None:
         return 0
 
     outcome = VerificationDialog()
-    outcome.setWindowTitle("Mochi · System 2 连接验证")
+    outcome.setWindowTitle(tr("Mochi · System 2 连接验证", "Mochi · System 2 connection verification"))
     outcome.setTextFormat(Qt.TextFormat.PlainText)
-    outcome.setText("正在使用合成数据验证文本和工具调用…")
+    outcome.setText(tr("正在使用合成数据验证文本和工具调用…", "Verifying text and tool calls with synthetic data…"))
     outcome.setStandardButtons(QMessageBox.StandardButton.Close)
-    outcome.button(QMessageBox.StandardButton.Close).setText("关闭")
+    outcome.button(QMessageBox.StandardButton.Close).setText(tr("关闭", "Close"))
 
     def finished(role):
         route = store.routes.snapshot(role)
         if route.verified and route.route:
-            outcome.setText(f"连接已验证。System 2 将使用 {route.route.model}。")
+            outcome.setText(tr("连接已验证。System 2 将使用 {model}。", "Connection verified. System 2 will use {model}.").format(
+                model=route.route.model,
+            ))
         else:
-            outcome.setText("连接已保存，验证未通过。请核对 API Key、模型权限和地域。")
+            outcome.setText(tr("连接已保存，验证未通过。请核对 API Key、模型权限和地域。",
+                               "Connection saved. Verification failed. Check the API key, model permissions, and region."))
         outcome.adjustSize()
 
     outcome.probe_finished.connect(finished)
@@ -910,11 +922,13 @@ def run_desktop(data_dir=None, *, request_screen_recording=False):
     lock = QLockFile(str(data_dir / "desktop.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock():
-        message = "Mochi 已在使用此本地数据目录。"
+        message = tr("Mochi 已在使用此本地数据目录。", "Mochi is already using this local data directory.")
         if QGuiApplication.platformName() in {"offscreen", "minimal"}:
             print(message, file=sys.stderr)
         else:
-            QMessageBox.information(None, "Mochi", message)
+            dialog = QMessageBox(QMessageBox.Icon.Information, "Mochi", message, QMessageBox.StandardButton.Ok)
+            dialog.button(QMessageBox.StandardButton.Ok).setText(tr("确定", "OK"))
+            dialog.exec()
         return 1
     session = None
     try:

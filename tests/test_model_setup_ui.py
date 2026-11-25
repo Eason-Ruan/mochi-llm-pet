@@ -246,3 +246,77 @@ def test_gui_setup_from_fresh_macos_profile_explains_raw_scope_without_granting_
     assert main(command) == 0
     editor.permission.click()
     assert "原始画面" not in prompts[-1] and not store.routes.snapshot(VISION).permission
+
+
+def test_settings_language_applies_on_reopen_and_can_be_reverted(qt_app, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QComboBox, QLabel, QPushButton
+
+    from deskpet import i18n
+    from deskpet.c_ui.settings import SettingsPanel
+
+    monkeypatch.setattr(i18n, "_language", "zh")
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    original = store.read()
+    panel = SettingsPanel(store)
+    chooser = panel.findChild(QComboBox, "settings-language")
+    status = panel.findChild(QLabel, "settings-language-status")
+    assert chooser.accessibleName() == "语言"
+    assert chooser.currentText() == "简体中文"
+
+    def select(chooser, code):
+        chooser.setCurrentIndex(chooser.findData(code))
+        chooser.activated.emit(chooser.currentIndex())
+
+    select(chooser, "en")
+    assert desktop_profile.read_desktop_language(tmp_path) == "en"
+    assert "下次启动" in status.text() and "English" in status.text()
+    assert panel.findChild(QPushButton, "settings-model-setup").text() == "配置模型连接"
+    select(chooser, "zh")
+    assert desktop_profile.read_desktop_language(tmp_path) == "zh"
+    assert "English" not in status.text()
+    select(chooser, "en")
+    panel.close()
+
+    i18n.set_language(desktop_profile.read_desktop_language(tmp_path))
+    reopened = SettingsPanel(store)
+    chooser = reopened.findChild(QComboBox, "settings-language")
+    assert chooser.accessibleName() == "Language"
+    select(chooser, "zh")
+    assert desktop_profile.read_desktop_language(tmp_path) == "zh"
+    assert "Simplified Chinese will be used" in reopened.findChild(QLabel, "settings-language-status").text()
+    assert reopened.findChild(QPushButton, "settings-model-setup").text() == "Set up model connections"
+    assert store.read() == original
+    reopened.close()
+
+
+def test_english_model_dialog_explains_scope_and_localizes_validation(qt_app, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QLabel
+
+    from deskpet import i18n
+    from deskpet.c_ui.model_setup import ModelSetupDialog
+    from deskpet.c_ui.settings import _RouteEditor
+
+    monkeypatch.setattr(i18n, "_language", "en")
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    store.update(expected_version=store.read().version, observation_screen_scope="all_displays_unfiltered")
+    configured = store.routes.configure(VISION, CloudRoute(
+        "openai_compatible", BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, "自定义接收方",
+    ))
+    dialog = ModelSetupDialog(store.routes)
+    assert dialog.windowTitle() == "Mochi · Model connections"
+    notice = dialog.findChild(QLabel, "model-setup-raw-screen-scope")
+    assert notice.wordWrap() and "raw images from all displays" in notice.text()
+    assert all(text in notice.text() for text in ("excluded apps", "domains", "private browsing windows"))
+    assert not dialog.forms[VISION].permission.isChecked()
+    dialog.forms[SYSTEM2].endpoint.setText("https://dialogue.example/v1")
+    _save(dialog)
+    assert dialog.feedback.text() == "Enter your API key for this service URL."
+    dialog.close()
+
+    editor = _RouteEditor(store.routes, VISION, None)
+    prompts = []
+    monkeypatch.setattr(editor, "_confirm_permission", lambda title, message: prompts.append(message) or False)
+    editor.permission.click()
+    assert "自定义接收方" in prompts[-1] and notice.text() in prompts[-1]
+    assert store.routes.snapshot(VISION) == configured
+    editor.close()

@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from deskpet.i18n import tr
+
 from .desktop import DesktopPet
 from .refine_icons import icon as icon
 from .refine_chat import RefineChat
@@ -207,7 +209,7 @@ class _Bubble(QFrame):
         if on_answer is None:
             label.setObjectName("refine-bubble-dismiss")
             label.setCursor(Qt.CursorShape.PointingHandCursor)
-            label.setToolTip("点击收起消息")
+            label.setToolTip(tr("点击收起消息", "Click to dismiss the message"))
             label.installEventFilter(self)
 
         if label.heightForWidth(WIDTH - 26) > 105:
@@ -229,7 +231,7 @@ class _Bubble(QFrame):
         if on_answer is not None:
             row = QHBoxLayout()
             row.setSpacing(7)
-            yes, no = answer_labels or ("是", "否")
+            yes, no = answer_labels or (tr("是", "Yes"), tr("否", "No"))
             for action, label_text, value in (("yes", yes, True), ("no", no, False)):
                 button = _button(self, f"refine-bubble-{action}", label_text, 52, 29)
                 button.setText(label_text)
@@ -240,9 +242,7 @@ class _Bubble(QFrame):
                 row.addWidget(button)
             row.addStretch()
             if on_dismiss is not None:
-                close = _button(self, "refine-bubble-close", "×", 29, 29)
-                close.setAccessibleName("关闭提示")
-                close.setToolTip("关闭提示")
+                close = _button(self, "refine-bubble-close", tr("关闭提示", "Dismiss prompt"), 29, 29)
                 close.clicked.connect(self._dismiss)
                 row.addWidget(close)
             layout.addLayout(row)
@@ -403,11 +403,11 @@ class RefinePet(DesktopPet):
         row.setSpacing(7)
         self.buttons = {}
         for key, label, width in (
-            ("reminders", "提醒事项", 68),
-            ("work", "专注与回顾", 44),
-            ("input", "语音输入", 44),
-            ("settings", "设置", 44),
-            ("collapse", "收起菜单", 34),
+            ("reminders", tr("提醒事项", "Reminders"), 68),
+            ("work", tr("专注与回顾", "Focus & review"), 44),
+            ("input", tr("语音输入", "Voice input"), 44),
+            ("settings", tr("设置", "Settings"), 44),
+            ("collapse", tr("收起菜单", "Collapse menu"), 34),
         ):
             button = _button(self.toolbar, f"refine-menu-{key}", label, width, 40, hold=key == "input")
             self.buttons[key] = button
@@ -447,7 +447,7 @@ class RefinePet(DesktopPet):
         self._proposal_badge.setStyleSheet(f"color: {TEXT}; background: {PEACH}; border-radius: 5px; font: 700 10px;")
         self._proposal_badge.hide()
 
-        self._expand = _button(self, "refine-menu-expand", "展开菜单", 32, 26)
+        self._expand = _button(self, "refine-menu-expand", tr("展开菜单", "Expand menu"), 32, 26)
         self._expand.setIcon(icon("down", INK, 14))
         self._expand.clicked.connect(self._open_toolbar)
         self._expand.hide()
@@ -554,31 +554,35 @@ class RefinePet(DesktopPet):
             color = GREEN if selected else INK
             if key == "reminders":
                 self._bell.setPixmap(icon("bell", color, 16).pixmap(QSize(16, 16), self.devicePixelRatioF()))
-                label = f"提醒事项 · {self.pending_count} 项"
+                label = tr("提醒事项 · {count} 项", "Reminders · {count}").format(count=self.pending_count)
             elif key == "input":
                 mode = self._chat_toolbar if selected else self._input_mode
                 icon_name, label = {
-                    "voice": ("mic", "语音输入"),
-                    "typing": ("keyboard", "打字输入"),
-                    None: ("back", "返回"),
+                    "voice": ("mic", tr("语音输入", "Voice input")),
+                    "typing": ("keyboard", tr("打字输入", "Text input")),
+                    None: ("back", tr("返回", "Back")),
                 }[mode]
                 if self._proposal_count:
-                    label += f" · {self._proposal_count} 条待确认提议"
+                    proposal_label = tr("{count} 条待确认提议", "{count} pending proposal" if self._proposal_count == 1
+                                        else "{count} pending proposals")
+                    label += " · " + proposal_label.format(count=self._proposal_count)
                 button.hold_enabled = self._voice_available and mode is not None
                 button.setIcon(icon(icon_name, color, 16))
             elif key == "work":
                 variants = {
-                    "focusing": ("work-focusing", "专注中"),
-                    "resting": ("work-paused", "休息中"),
-                    "paused": ("work-paused", "已暂停"),
-                    "break_due": ("work-review", "待回顾"),
-                    "ended": ("work-review", "已结束"),
+                    "focusing": ("work-focusing", tr("专注中", "Focusing")),
+                    "resting": ("work-paused", tr("休息中", "On a break")),
+                    "paused": ("work-paused", tr("已暂停", "Paused")),
+                    "break_due": ("work-review", tr("待回顾", "Ready to review")),
+                    "ended": ("work-review", tr("已结束", "Ended")),
                 }
                 glyph, state = variants.get(self._work_state, ("work", ""))
-                label = f"专注与回顾 · {state}" if state else "专注与回顾"
+                label = tr("专注与回顾", "Focus & review")
+                if state:
+                    label += f" · {state}"
                 button.setIcon(icon(glyph, color, 16))
             else:
-                label = "设置" if key == "settings" else "收起菜单"
+                label = tr("设置", "Settings") if key == "settings" else tr("收起菜单", "Collapse menu")
                 button.setIcon(icon("up" if key == "collapse" else key, color, 16))
             button.setAccessibleName(label)
             button.setToolTip(label)
@@ -888,11 +892,12 @@ class RefinePet(DesktopPet):
         if self._diagnostics:
             menu.addAction("打开原联调界面", self.diagnostics_requested.emit)
         else:
-            for key, label in (("work", "专注与回顾"), ("reminders", "提醒事项"),
-                               ("input", "聊天"), ("settings", "设置")):
+            for key, label in (("work", tr("专注与回顾", "Focus && review")),
+                               ("reminders", tr("提醒事项", "Reminders")),
+                               ("input", tr("聊天", "Chat")), ("settings", tr("设置", "Settings"))):
                 menu.addAction(label, lambda checked=False, section=key: self.section_requested.emit(section))
         menu.addSeparator()
-        menu.addAction("退出 Mochi", self.quit_requested.emit)
+        menu.addAction(tr("退出 Mochi", "Quit Mochi"), self.quit_requested.emit)
         menu.exec(event.globalPos())
 
     def activate_for_input(self) -> None:

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication
 
 from deskpet.contracts import TaskView
+from deskpet.i18n import tr
 from deskpet.m0.observation_input import DesktopObservationInput
 from deskpet.system2.semantic_policy import semantic_background_enabled
 from deskpet.task_service.presentation import EARLY_OS_TRANSFER, RELEASED_STATES, PresentationLedger, native_followup_due
@@ -41,6 +42,10 @@ def _session_locked():
         except (ImportError, OSError, RuntimeError):
             return None
     return None
+
+
+def grouped_delivery_note() -> str:
+    return tr("同批到期 · 待查看", "Due together · Ready to review")
 
 
 class DesktopPresentation(QObject):
@@ -167,7 +172,7 @@ class DesktopPresentation(QObject):
     def notification_status(self) -> str:
         status = self.notifications.status
         if self.settings.get("lock_screen_detail"):
-            status += "。此通道使用通用提醒文案。"
+            status += tr("。此通道使用通用提醒文案。", ". This channel uses generic reminder text.")
         return status
 
     def refresh_notification_permission(self):
@@ -178,9 +183,9 @@ class DesktopPresentation(QObject):
         if kind not in {"reminder", "phase_end"}:
             raise ValueError("unknown sound kind")
         if not self.native:
-            return "当前会话没有本机音频出口。"
+            return tr("当前会话没有本机音频出口。", "This session has no local audio output.")
         QApplication.beep()
-        return "已请求播放本机提示音。"
+        return tr("已请求播放本机提示音。", "Local sound requested.")
 
     def _sound_enabled(self, kind):
         setting = {"reminder": "reminder_sound", "phase_end": "phase_end_sound"}.get(kind)
@@ -537,18 +542,27 @@ class DesktopPresentation(QObject):
 
     def pending_projection(self, now):
         notes = {}
-        descriptions = {"scheduled": "已登记系统通知", "submitted": "系统已受理，等待显示",
-                        "delivered": "系统报告已送达，等待确认", "unknown": "投递结果未知 · 静默待处理",
-                        "failed": "系统通知未提交", "unavailable": "系统通知不可用", "cancelling": "等待系统撤回",
-                        "cancel_intent": "等待系统撤回", "painted": "桌宠已展示，等待确认",
-                        "badge_shown": "已显示轻提醒，打开列表查看",
-                        "grouped": "同批到期 · 待查看", "passive": "待查看"}
+        retracting = tr("等待系统撤回", "Waiting for the system to withdraw the notification")
+        descriptions = {
+            "scheduled": tr("已登记系统通知", "System notification scheduled"),
+            "submitted": tr("系统已受理，等待显示", "System accepted the notification for display"),
+            "delivered": tr("系统报告已送达，等待确认", "System reports delivery · Awaiting acknowledgement"),
+            "unknown": tr("投递结果未知 · 静默待处理", "Delivery unconfirmed · Waiting silently"),
+            "failed": tr("系统通知未提交", "System notification could not be submitted"),
+            "unavailable": tr("系统通知不可用", "System notification unavailable"),
+            "cancelling": retracting,
+            "cancel_intent": retracting,
+            "painted": tr("桌宠已展示，等待确认", "Mochi displayed the reminder · Awaiting acknowledgement"),
+            "badge_shown": tr("已显示轻提醒，打开列表查看", "Badge shown · Open the list to review"),
+            "grouped": grouped_delivery_note(),
+            "passive": tr("待查看", "Ready to review"),
+        }
         for task in self._active_tasks():
             if task.draft.expires_at and now >= task.draft.expires_at:
-                notes[task.task_id] = "提醒已失效"
+                notes[task.task_id] = tr("提醒已失效", "Reminder expired")
                 continue
             if self.snapshot.get("pending_deliveries", {}).get(task.task_id) == task.version:
-                notes[task.task_id] = "待展示"
+                notes[task.task_id] = tr("待展示", "Waiting for display")
             for row in self.rows:
                 if row["task_id"] != task.task_id or row["occurrence"] != task.occurrence:
                     continue

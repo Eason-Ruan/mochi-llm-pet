@@ -1,12 +1,17 @@
 """Exercise macOS notification actions without submitting desktop notifications."""
 from contextlib import closing
+import ctypes
 from datetime import timedelta
 import sqlite3
+import sys
 from threading import Event, Lock
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from deskpet import i18n
+from deskpet.c_ui import windows_notification_identity
 from deskpet.c_ui.native_notifications import (
     ACK_ACTION,
     GENERIC_BODY,
@@ -26,6 +31,35 @@ from deskpet.task_service.presentation import PresentationLedger
 from deskpet.task_service.sqlite import SQLiteTaskService
 
 
+@pytest.mark.parametrize("locale", ["zh", "en"])
+def test_windows_notification_identity_reports_start_menu_failures_in_desktop_language(tmp_path, monkeypatch, locale):
+    monkeypatch.setattr(i18n, "_language", locale)
+    shortcut = tmp_path / "Mochi.lnk"
+    read_error = OSError("Shortcut cannot be read")
+    verify_shortcut = Mock(side_effect=[read_error, False, True, True])
+    set_identity = Mock(side_effect=[1, 0])
+    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(com_error=OSError))
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(shell32=SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=set_identity,
+    )), raising=False)
+    monkeypatch.setattr(windows_notification_identity, "_shortcut_path", lambda: shortcut)
+    monkeypatch.setattr(windows_notification_identity, "_belongs_to_checkout", verify_shortcut)
+
+    messages = {
+        "zh": ("无法读取 Mochi Windows 开始菜单快捷方式", "系统通知需要先安装 Mochi Windows 开始菜单快捷方式",
+               "无法设置 Mochi Windows 应用标识"),
+        "en": ("Could not read the Mochi shortcut in the Windows Start menu",
+               "Install the Mochi shortcut in the Windows Start menu to use system notifications",
+               "Could not set the Mochi Windows app identity"),
+    }
+    for message in messages[locale]:
+        with pytest.raises(RuntimeError, match=message):
+            windows_notification_identity.activate_notification_identity()
+    assert windows_notification_identity.activate_notification_identity() == "Mochi.DeskPet"
+    assert all(call.args == (shortcut,) for call in verify_shortcut.call_args_list)
+    assert [call.args for call in set_identity.call_args_list] == [("Mochi.DeskPet",)] * 2
+
+
 def test_a_foreground_deadline_falls_back_and_rejects_a_late_paint():
     offered, completed = [], []
     ready = Event()
@@ -42,7 +76,13 @@ def test_a_foreground_deadline_falls_back_and_rejects_a_late_paint():
     assert not unexpected_paints
 
 
-def test_native_actions_are_authenticated_generic_and_buffered_until_ready():
+@pytest.mark.parametrize("locale,title,body,labels", [
+    ("zh", GENERIC_TITLE, GENERIC_BODY, {ACK_ACTION: "确认收到", SNOOZE_ACTION: "5 分钟后提醒"}),
+    ("en", "Mochi has a reminder", "Open Mochi to view the reminder.",
+     {ACK_ACTION: "Acknowledge", SNOOZE_ACTION: "Snooze 5 minutes"}),
+])
+def test_native_actions_are_authenticated_generic_and_buffered_until_ready(monkeypatch, locale, title, body, labels):
+    monkeypatch.setattr(i18n, "_language", locale)
     native = pytest.importorskip("UserNotifications")
     actions = MacNotifications.__new__(MacNotifications)
     actions._response_lock = Lock()
@@ -71,6 +111,8 @@ def test_native_actions_are_authenticated_generic_and_buffered_until_ready():
     }
     assert all(action.options() == native.UNNotificationActionOptionAuthenticationRequired
                for category in registered.values() for action in category.actions())
+    assert {str(action.identifier()): str(action.title()) for category in registered.values()
+            for action in category.actions()} == labels
 
     identifier = notification_id("private reminder", scope="profile A")
     assert identifier != notification_id("private reminder", scope="profile B")
@@ -81,8 +123,8 @@ def test_native_actions_are_authenticated_generic_and_buffered_until_ready():
     assert [str(request.content().categoryIdentifier()) for request in requests] == [REMINDER_CATEGORY, SNOOZE_CATEGORY]
     for request in requests:
         assert request.identifier() == identifier
-        assert request.content().title() == GENERIC_TITLE
-        assert request.content().body() == GENERIC_BODY
+        assert request.content().title() == title
+        assert request.content().body() == body
         assert request.content().sound() is None
         assert not request.content().userInfo()
 

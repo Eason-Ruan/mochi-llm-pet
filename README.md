@@ -63,6 +63,12 @@ in the local profile. The default Mac path is
 `~/Library/Application Support/Mochi/Mochi`. Pass `--data-dir PATH` to use a
 different profile. Right-click the cat and choose **退出 Mochi** to quit.
 
+Open **Settings → More settings → Language** (**设置 → 更多设置 → 语言**),
+choose English or Simplified Chinese, and reopen Mochi to apply it. To launch
+once in a particular language,
+use `open -n .mochi-native/Mochi.app --args --language en` on macOS or
+`uv run --locked python -m deskpet --language en` on Windows. Use `zh` for Chinese.
+
 ## Configure System 2 and Observation
 
 Each role has its own **API Base URL**, **API Key**, and **model**. The

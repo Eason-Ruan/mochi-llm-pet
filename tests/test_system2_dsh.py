@@ -17,6 +17,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from deskpet import i18n
 from deskpet.c_ui.refine_conversation_store import ConversationStore
 from deskpet.observation_v2.openai_cloud import store_route_credential
 from deskpet.observation_v2.routes import (
@@ -25,7 +26,10 @@ from deskpet.observation_v2.routes import (
 from deskpet.settings import SettingsStore
 from deskpet.system2.dsh import DSHEngine, verify_system2_route
 from deskpet.system2.dsh_projection import project_input, project_tool_result
-from deskpet.system2.prompt import PROMPT_CORE, PROMPT_SECTIONS, PROMPT_VERSION, SPLIT_PROMPT_VERSION, SYSTEM_PROMPT
+from deskpet.system2.prompt import (
+    PROMPT_CORE, PROMPT_SECTIONS, PROMPT_VERSION, SPLIT_PROMPT_VERSION, SYSTEM_PROMPT,
+    output_language_instruction,
+)
 from deskpet.system2.tool_schema import tool_definitions
 
 SUMMARY = "SYNTHETIC-PRIVATE-ACTIVITY"
@@ -355,13 +359,16 @@ def test_native_projection_tools_metadata_and_restart(tmp_path, endpoints, monke
         engine.close()
 
 
-@pytest.mark.parametrize("reason,semantic,split,version", [
-    ("tick", True, True, SPLIT_PROMPT_VERSION),
-    ("unrecognized", True, True, PROMPT_VERSION),
-    ("tick", False, True, PROMPT_VERSION),
-    ("tick", True, False, PROMPT_VERSION),
+@pytest.mark.parametrize("reason,semantic,split,version,locale", [
+    ("tick", True, True, SPLIT_PROMPT_VERSION, "zh"),
+    ("unrecognized", True, True, PROMPT_VERSION, "zh"),
+    ("tick", False, True, PROMPT_VERSION, "zh"),
+    ("tick", True, False, PROMPT_VERSION, "zh"),
+    ("tick", True, True, SPLIT_PROMPT_VERSION, "en"),
+    ("unrecognized", True, True, PROMPT_VERSION, "en"),
 ])
-def test_native_prompt_sections_and_fallback(tmp_path, endpoints, monkeypatch, reason, semantic, split, version):
+def test_native_prompt_sections_and_fallback(tmp_path, endpoints, monkeypatch, reason, semantic, split, version, locale):
+    monkeypatch.setattr(i18n, "_language", locale)
     monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1" if split else "0")
     monkeypatch.setenv("MOCHI_SYSTEM2_SEMANTIC_BACKGROUND", "1" if semantic else "0")
     endpoint = endpoints()
@@ -400,12 +407,16 @@ def test_native_prompt_sections_and_fallback(tmp_path, endpoints, monkeypatch, r
         system = [next(msg["content"] for msg in body["messages"] if msg["role"] == "system")
                   for body in endpoint.requests]
         assert system[0] == system[1]
+        prompt, instruction = system[0], output_language_instruction()
+        if locale == "en":
+            assert "proposal.offer display_text and pet.present text" in prompt
+            assert "Honor any explicit language request from the user" in prompt
         if version == SPLIT_PROMPT_VERSION:
-            assert system[0] == "\n\n".join((
-                PROMPT_CORE, PROMPT_SECTIONS["background_arbitration"], PROMPT_SECTIONS["periodic_check"],
+            assert prompt == "\n\n".join((
+                PROMPT_CORE + instruction, PROMPT_SECTIONS["background_arbitration"], PROMPT_SECTIONS["periodic_check"],
             ))
         else:
-            assert system[0].strip() == SYSTEM_PROMPT.strip()
+            assert prompt.strip() == (SYSTEM_PROMPT + instruction).strip()
         for body in endpoint.requests:
             assert [tool["function"]["name"] for tool in body["tools"]] == ["context_read"]
             properties = body["tools"][0]["function"]["parameters"]["properties"]
@@ -501,6 +512,43 @@ def test_native_split_chat_restores_only_recent_text_in_same_privacy_epoch(tmp_p
     assert post_revoke.session_id not in (first.session_id, second.session_id)
     assert historical not in json.dumps(endpoint.requests[-1])
     assert RECEIPT not in json.dumps(endpoint.requests[-1])
+
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_english_preference_keeps_existing_chat_context_and_updates_system_prompt(tmp_path, endpoints, monkeypatch, split):
+    monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "1" if split else "0")
+    monkeypatch.setattr(i18n, "_language", "zh")
+    endpoint = endpoints()
+    settings = SettingsStore(tmp_path / "business.sqlite")
+    install_route(settings, endpoint)
+
+    def run(message):
+        request = turn(message, tools=())
+        request.prompt_version, request.system_prompt = PROMPT_VERSION, SYSTEM_PROMPT
+        request.input_json = json.dumps({
+            "semantic_chat": True, "event": {"kind": "user_message", "trigger_reasons": ["user_message"]},
+            "user_intent": {"utterance": message}, "context": snapshot(),
+        }, ensure_ascii=False)
+        engine = DSHEngine(tmp_path, settings=settings, tools=definitions())
+        try:
+            return engine.run(request, reply)
+        finally:
+            engine.close()
+
+    previous = "请记住历史闹钟测试"
+    first = run(previous)
+    assert "desktop language preference" not in endpoint.requests[-1]["messages"][0]["content"]
+    monkeypatch.setattr(i18n, "_language", "en")
+    current = "Continue from my previous message. 请用中文回答。"
+    second = run(current)
+    assert (first.session_id != second.session_id) is split
+    messages = endpoint.requests[-1]["messages"]
+    assert "Use English by default for chat replies" in messages[0]["content"]
+    assert "takes precedence over matching the language of the user's message" in messages[0]["content"]
+    assert "Honor any explicit language request from the user" in messages[0]["content"]
+    for text in (previous, current, RECEIPT):
+        assert text in json.dumps(messages, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("version", [SPLIT_PROMPT_VERSION, PROMPT_VERSION])

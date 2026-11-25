@@ -9,6 +9,7 @@ from threading import Event
 
 import pytest
 
+from deskpet import i18n
 from deskpet.system2.host import System2Host
 from deskpet.system2.protocol import EngineReply
 from deskpet.system2.tool_schema import validate_tool_args
@@ -868,6 +869,39 @@ def test_chat_receipts_report_habit_created_and_rejected_start_attempts(runtime)
             {"source": "status", "text": "这次启动请求未获授权，未开始新的计时。"},
             {"source": "model", "text": "已开始新的计时。要等这轮结束再开始吗？"},
         ]
+    finally:
+        host.close()
+
+
+
+def test_english_chat_localizes_program_receipts_and_keeps_user_and_model_text(runtime, monkeypatch):
+    monkeypatch.setattr(i18n, "_language", "en")
+    business, create = runtime
+    title = "报告草稿 {原文}"
+    utterance = f"Create a habit called {title}, then start a 20-minute timer. 请用中文回答。"
+    model_text = "习惯已创建。"
+
+    def model(request, payload, call):
+        assert payload["user_intent"]["utterance"] == utterance
+        assert "Use English by default for chat replies" in request.system_prompt
+        habit = call("habit_create", "habit", {"title": title, "behavior": {"focus_s": 1200}})
+        assert habit["status"] == "applied"
+        timer = call("phase_start", "timer", {"planned_duration_s": 1200})
+        assert timer["message"] == "已开始。"
+        return model_text
+
+    host = create(model)
+    try:
+        host.submit_user(utterance)
+        assert host.pump()
+        answer, = host.ui_events()
+        assert answer.payload["parts"] == [
+            {"source": "program", "text": f"Habit created for “{title}”."},
+            {"source": "program", "text": "Timer started · 20 minutes"},
+            {"source": "model", "text": model_text},
+        ]
+        assert business.settings.list_habits()[0].title == title
+        assert business.phases.current_phase().planned_duration_s == 1200
     finally:
         host.close()
 

@@ -8,6 +8,8 @@ from PyQt6.QtWidgets import (
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from deskpet.i18n import tr
+
 
 PANEL_WIDTH = 292
 CREAM = "#fff7e9"
@@ -64,7 +66,7 @@ class _Panel(QWidget):
         self.body.setContentsMargins(13, 13, 13, 16)
         self.body.setSpacing(8)
 
-    def add_manage_action(self, label, callback):
+    def add_manage_action(self, label, callback, *, below_title=False):
         button = QPushButton(label)
         button.setObjectName("refine-manage")
         button.setFont(_font(11, bold=True))
@@ -75,8 +77,10 @@ class _Panel(QWidget):
             f"QPushButton:hover, QPushButton:focus {{background: {GREEN_TINT}}}"
         )
         button.clicked.connect(callback)
-        row = self.body.itemAt(0).layout()
-        row.insertWidget(1, button)
+        if below_title:
+            self.body.insertWidget(1, button, alignment=Qt.AlignmentFlag.AlignRight)
+        else:
+            self.body.itemAt(0).layout().insertWidget(1, button)
         return button
 
     def paintEvent(self, event):
@@ -157,7 +161,7 @@ class DetailPanel(_Panel):
         super().__init__()
         self.setStyleSheet(DETAIL_CONTROL_STYLE)
         row = _title(title)
-        back = QPushButton("返回摘要")
+        back = QPushButton(tr("返回摘要", "Back to summary"))
         back.setObjectName("refine-back-to-summary")
         back.clicked.connect(on_back)
         row.addWidget(back)
@@ -263,11 +267,12 @@ def stepper(editor, *, on_step=None, width=110):
         if on_step is not None:
             on_step()
 
-    for direction, glyph, action in ((-1, "−", "减少"), (1, "+", "增加")):
+    for direction, glyph, action in ((-1, "−", tr("减少{name}", "Decrease {name}")),
+                                      (1, "+", tr("增加{name}", "Increase {name}"))):
         button = QPushButton(glyph)
         button.setProperty("stepper", True)
         button.setFixedSize(16, 22)
-        button.setAccessibleName(action + editor.accessibleName())
+        button.setAccessibleName(action.format(name=editor.accessibleName()))
         button.clicked.connect(lambda _checked=False, amount=direction: step(amount))
         row.addWidget(button)
     return shell

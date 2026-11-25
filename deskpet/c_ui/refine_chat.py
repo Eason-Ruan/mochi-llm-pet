@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from deskpet.i18n import tr
+
 from .refine_dialogue import DemoConversation, DemoTurn, MILK_CONFIRM, MILK_REQUEST
 from .refine_icons import icon
 from .refine_style import _font, _scroll_area
@@ -26,10 +28,10 @@ DEFAULT_MAX_HEIGHT = 420
 MIN_HEIGHT = 134
 
 REPLY_TITLES = {
-    "model": "Mochi",
-    "program": "执行回执",
-    "status": "系统反馈",
-    "legacy": "历史回复",
+    "model": ("Mochi", "Mochi"),
+    "program": ("执行回执", "Action receipt"),
+    "status": ("系统反馈", "System feedback"),
+    "legacy": ("历史回复", "Earlier reply"),
 }
 
 
@@ -199,8 +201,8 @@ class _HeightGrip(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("refine-chat-height-grip")
-        self.setAccessibleName("调整聊天面板高度")
-        self.setToolTip("拖动调整聊天面板高度")
+        self.setAccessibleName(tr("调整聊天面板高度", "Resize chat panel"))
+        self.setToolTip(tr("拖动调整聊天面板高度", "Drag to resize the chat panel"))
         self.setFixedHeight(14)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
         self.origin = None
@@ -300,7 +302,7 @@ class RefineChat(QWidget):
         self._panel_layout.setContentsMargins(11, 7, 11, 7)
         self._panel_layout.setSpacing(5)
 
-        self._clear_button = QPushButton("清除聊天记录")
+        self._clear_button = QPushButton(tr("清除聊天记录", "Clear chat history"))
         self._clear_button.setObjectName("refine-chat-clear-history")
         self._clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._clear_button.clicked.connect(self._confirm_clear_history)
@@ -325,7 +327,7 @@ class RefineChat(QWidget):
             QScrollBar::handle:vertical:hover { background: #9a8063 }
         """)
         self._history.setObjectName("refine-chat-history")
-        self._history.setAccessibleName("聊天记录")
+        self._history.setAccessibleName(tr("聊天记录", "Chat history"))
         self._history.setMinimumHeight(0)
         self._history.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         scrollbar = self._history.verticalScrollBar()
@@ -466,7 +468,7 @@ class RefineChat(QWidget):
             self._send_system2(raw)
             return
         if self._script is None:
-            self.storage_error.emit("对话模型暂不可用。")
+            self.storage_error.emit(tr("对话模型暂不可用。", "The chat model is temporarily unavailable."))
             return
         if self._pending is not None:
             return
@@ -483,7 +485,7 @@ class RefineChat(QWidget):
                 self._pending = (self._submit(turn.action), turn)
             except (ValueError, RuntimeError):
                 self._pending = (turn.action["event_id"], turn)
-                self._finish_turn("暂时无法提交。请稍后重试。", True)
+                self._finish_turn(tr("暂时无法提交。请稍后重试。", "Could not submit the message. Try again shortly."), True)
         else:
             self._reply(turn.text, turn.follow_up)
         self._render()
@@ -494,7 +496,7 @@ class RefineChat(QWidget):
             self._system2(message_id, value, proposal=self._proposal_context,
                           supersedes_message_id=self._supersedes_message_id)
         except (sqlite3.Error, RuntimeError):
-            self.storage_error.emit("暂时无法保存并提交消息。")
+            self.storage_error.emit(tr("暂时无法保存并提交消息。", "Could not save and send the message."))
             return
         self._draft = ""
         self._supersedes_message_id = self._proposal_context = None
@@ -509,12 +511,15 @@ class RefineChat(QWidget):
         if not self._messages or self._has_pending_turn():
             return
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("清除聊天记录")
+        dialog.setWindowTitle(tr("清除聊天记录", "Clear chat history"))
         dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText("确定清除聊天记录吗？")
-        dialog.setInformativeText("将清除本机的聊天记录和这段对话的上下文。此操作无法撤销。")
-        cancel = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-        clear = dialog.addButton("清除", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.setText(tr("确定清除聊天记录吗？", "Clear your chat history?"))
+        dialog.setInformativeText(tr(
+            "将清除本机的聊天记录和这段对话的上下文。此操作无法撤销。",
+            "This permanently deletes the chat history and context stored on this device.",
+        ))
+        cancel = dialog.addButton(tr("取消", "Cancel"), QMessageBox.ButtonRole.RejectRole)
+        clear = dialog.addButton(tr("清除", "Clear"), QMessageBox.ButtonRole.DestructiveRole)
         dialog.setDefaultButton(cancel)
         dialog.setEscapeButton(cancel)
         dialog.exec()
@@ -527,10 +532,12 @@ class RefineChat(QWidget):
     def _apply_clear_history(self):
         try:
             if self._has_pending_turn() or (self._clear_history is not None and not self._clear_history()):
-                self.storage_error.emit("请等待当前回复完成后再清除聊天记录。")
+                self.storage_error.emit(tr(
+                    "请等待当前回复完成后再清除聊天记录。", "Wait for the current reply before clearing chat history."
+                ))
                 return
         except (sqlite3.Error, RuntimeError):
-            self.storage_error.emit("暂时无法清除聊天记录。")
+            self.storage_error.emit(tr("暂时无法清除聊天记录。", "Could not clear chat history."))
             return
         if self._script is not None:
             self._script.confirmation = None
@@ -595,7 +602,7 @@ class RefineChat(QWidget):
             try:
                 self._store.finish_turn(self._pending[0], text)
             except sqlite3.Error:
-                self.storage_error.emit("暂时无法保存对话结果。")
+                self.storage_error.emit(tr("暂时无法保存对话结果。", "Could not save the reply."))
                 return
         self._pending = None
         self.recovered_event = None
@@ -613,9 +620,12 @@ class RefineChat(QWidget):
                 text = f"{text[:-1]}，还剩 {minutes} 分 {seconds:02d} 秒。"
             self._finish_turn(text, turn.follow_up)
         elif result.get("status") == "result_unavailable":
-            self._finish_turn("上次操作没有已保存的结果。请查看当前计时后继续。", True)
+            self._finish_turn(tr(
+                "上次操作没有已保存的结果。请查看当前计时后继续。",
+                "The previous action has no saved result. Check the current timer before continuing.",
+            ), True)
         else:
-            self._finish_turn("未能更新。请查看最新状态后重试。", True)
+            self._finish_turn(tr("未能更新。请查看最新状态后重试。", "Could not update. Check the current status and try again."), True)
         self._render()
 
     @staticmethod
@@ -639,11 +649,17 @@ class RefineChat(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(8, 7, 8, 7)
         layout.setSpacing(2)
-        title = REPLY_TITLES.get(message.source, message.speaker)
+        title = message.speaker
+        if message.source in REPLY_TITLES:
+            title = tr(*REPLY_TITLES[message.source])
+        elif message.speaker == "你":
+            title = tr("你", "You")
+        elif message.speaker == "你 · 模拟语音":
+            title = tr("你 · 模拟语音", "You · Simulated voice")
         layout.addWidget(self._label(title, sender=True, source=message.source))
         if message.reply_to and message.reply_source:
             quotation = message.reply_source[:44] + ("…" if len(message.reply_source) > 44 else "")
-            reply = self._label(f"回复「{quotation}」", sender=True)
+            reply = self._label(tr("回复「{text}」", "Reply to “{text}”").format(text=quotation), sender=True)
             reply.setWordWrap(True)
             reply.setProperty("replyToMessageId", message.reply_to)
             layout.addWidget(reply)
@@ -651,8 +667,8 @@ class RefineChat(QWidget):
         layout.addWidget(card.body)
         if message.pending:
             status = QHBoxLayout()
-            status.addWidget(self._label("等待回复", sender=True), 1)
-            edit = QPushButton("改口")
+            status.addWidget(self._label(tr("等待回复", "Waiting for a reply"), sender=True), 1)
+            edit = QPushButton(tr("改口", "Revise"))
             edit.setObjectName("refine-chat-supersede")
             edit.clicked.connect(lambda: self._edit_message(message.id))
             status.addWidget(edit)
@@ -667,18 +683,19 @@ class RefineChat(QWidget):
         layout.setContentsMargins(9, 9, 9, 9)
         layout.setSpacing(4)
         header = QHBoxLayout()
-        heading = "语音输入中" if voice else "打字输入中"
+        heading = tr("语音输入中", "Voice input") if voice else tr("打字输入中", "Text input")
         if self._proposal_context:
-            heading = "回复提议"
+            heading = tr("回复提议", "Reply to proposal")
         if self._supersedes_message_id:
-            heading = "更正这条消息"
+            heading = tr("更正这条消息", "Revise this message")
         header.addWidget(self._label(heading, sender=True), 1)
         if self._proposal_context or self._supersedes_message_id:
-            cancel = QPushButton("取消")
+            cancel = QPushButton(tr("取消", "Cancel"))
             cancel.clicked.connect(self._cancel_context)
             header.addWidget(cancel)
         if self._voice_available:
-            mode = _GestureButton("mic" if voice else "keyboard", "长按临时切换输入方式",
+            mode = _GestureButton("mic" if voice else "keyboard",
+                                  tr("长按临时切换输入方式", "Hold to temporarily switch input mode"),
                                   accent=True, hold=True, width=30, height=26)
             mode.setObjectName("refine-chat-mode")
             mode.held.connect(self.toggle_input)
@@ -692,7 +709,7 @@ class RefineChat(QWidget):
             row.addWidget(self._elapsed, 1)
             row.addWidget(self._waveform)
             row.addStretch(1)
-            stop = _GestureButton("stop", "停止模拟语音并发送", accent=True)
+            stop = _GestureButton("stop", tr("停止模拟语音并发送", "Stop simulated voice input and send"), accent=True)
             stop.setObjectName("refine-chat-stop")
             stop.tapped.connect(self._stop_voice)
             row.addWidget(stop)
@@ -705,13 +722,13 @@ class RefineChat(QWidget):
             row.setContentsMargins(5, 5, 5, 5)
             self._editor = QLineEdit(self._draft)
             self._editor.setObjectName("refine-chat-editor")
-            self._editor.setAccessibleName("打字输入")
-            hint = "例如：开始 25 分钟"
+            self._editor.setAccessibleName(tr("打字输入", "Text input"))
+            hint = tr("例如：开始 25 分钟", "Try: Focus for 25 minutes")
             if self._voice_available:
                 hint = "确认，明晚六点提醒我。" if self._script.confirmation else "把买牛奶延后到明晚六点"
             self._editor.setPlaceholderText(hint)
             self._editor.setMaxLength(240)
-            send = _GestureButton("send", "发送", accent=True)
+            send = _GestureButton("send", tr("发送", "Send"), accent=True)
             send.setObjectName("refine-chat-send")
             send.setEnabled(bool(self._draft.strip()))
             self._editor.textChanged.connect(lambda text: send.setEnabled(bool(text.strip())))
@@ -733,7 +750,7 @@ class RefineChat(QWidget):
             try:
                 self._store.save_draft(text)
             except sqlite3.Error:
-                self.storage_error.emit("暂时无法保存草稿。")
+                self.storage_error.emit(tr("暂时无法保存草稿。", "Could not save the draft."))
 
     def _clear_widgets(self, layout):
         while layout.count():
@@ -769,12 +786,13 @@ class RefineChat(QWidget):
             self._extras.addWidget(self._proposal_card)
             self._proposal_card.show()
         if self._configure_system2 and self._route_status in {"not_configured", "unverified"}:
-            configure = QPushButton("配置对话模型" if self._route_status == "not_configured" else "验证对话模型")
+            configure = QPushButton(tr("配置对话模型", "Set up chat model") if self._route_status == "not_configured"
+                                    else tr("验证对话模型", "Verify chat model"))
             configure.setObjectName("refine-chat-configure-system2")
             configure.clicked.connect(self._configure_system2)
             self._extras.addWidget(configure)
         if self._pending is not None:
-            self._extras.addWidget(self._message_card(Message("", "正在更新…", source="status")))
+            self._extras.addWidget(self._message_card(Message("", tr("正在更新…", "Updating…"), source="status")))
         self._clear_button.setEnabled(not self._has_pending_turn())
         self._clear_button.setVisible(bool(self._messages))
         self._history.setVisible(bool(self._messages or self._extras.count()))
@@ -784,7 +802,8 @@ class RefineChat(QWidget):
             self._cards.addWidget(self._composer())
         elif self._pending is None and self._follow_up:
             mode = "keyboard" if self._preferred == "typing" else "mic"
-            button = _GestureButton(mode, "继续输入", accent=True, hold=self._voice_available, width=34)
+            button = _GestureButton(mode, tr("继续输入", "Continue input"), accent=True,
+                                    hold=self._voice_available, width=34)
             button.setObjectName("refine-chat-continue")
             button.tapped.connect(lambda: self._compose(self._preferred))
             button.held.connect(lambda: self._compose(self._other(self._preferred)))

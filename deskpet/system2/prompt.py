@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import os
 
+from deskpet.i18n import tr
+
 # Retain the full prompt for non-semantic turns, unknown wakes, and rollback.
 PROMPT_VERSION = "system2.zh.v13"
 
@@ -134,6 +136,18 @@ class PromptSelection:
         if self.version == PROMPT_VERSION:
             return SYSTEM_PROMPT
         return "\n\n".join((PROMPT_CORE, *(PROMPT_SECTIONS[name] for name in self.section_names)))
+
+
+def output_language_instruction() -> str:
+    return tr(
+        "",
+        "\n\nThe desktop language preference is English. Use English by default for chat replies "
+        "and generated user-facing text, including proposal.offer display_text and pet.present text. "
+        "This preference takes precedence over matching the language of the user's message. "
+        "Honor any explicit language request from the user for the requested reply or display. "
+        "Preserve quoted text and user-provided titles as written. Keep tool schemas, input fields, "
+        "reason codes and structured output formats unchanged.",
+    )
 
 
 def split_prompt_enabled() -> bool:
