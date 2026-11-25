@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
@@ -17,6 +17,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from deskpet.c_ui.refine_conversation_store import ConversationStore
 from deskpet.observation_v2.openai_cloud import store_route_credential
 from deskpet.observation_v2.routes import (
     BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, STATE, SYSTEM2, VISION, CloudRoute, CloudRouteError,
@@ -500,6 +501,65 @@ def test_native_split_chat_restores_only_recent_text_in_same_privacy_epoch(tmp_p
     assert post_revoke.session_id not in (first.session_id, second.session_id)
     assert historical not in json.dumps(endpoint.requests[-1])
     assert RECEIPT not in json.dumps(endpoint.requests[-1])
+
+
+@pytest.mark.parametrize("version", [SPLIT_PROMPT_VERSION, PROMPT_VERSION])
+def test_cleared_chat_stays_off_wire_after_native_restart(tmp_path, endpoints, monkeypatch, version):
+    monkeypatch.delenv("MOCHI_SYSTEM2_SPLIT_PROMPT", raising=False)
+    if version == PROMPT_VERSION:
+        monkeypatch.setenv("MOCHI_SYSTEM2_SPLIT_PROMPT", "0")
+    endpoint = endpoints()
+    database = tmp_path / "business.sqlite"
+    install_route(SettingsStore(database), endpoint, permission=True)
+    chat = ConversationStore(database)
+    old_user = "SYNTHETIC-CLEARED-USER"
+    old_answer = "SYNTHETIC-CLEARED-ANSWER"
+    new_user = "SYNTHETIC-NEW-USER"
+    new_answer = "SYNTHETIC-NEW-ANSWER"
+
+    def open_engine():
+        return closing(DSHEngine(tmp_path, settings=SettingsStore(database), tools=definitions()))
+
+    def run(engine, message, answer=RECEIPT):
+        request = turn(message, tools=())
+        request.prompt_version, request.system_prompt = PROMPT_VERSION, SYSTEM_PROMPT
+        request.input_json = json.dumps({
+            "semantic_chat": True, "event": {"kind": "user_message", "trigger_reasons": ["user_message"]},
+            "user_intent": {"utterance": message}, "context": snapshot(),
+        })
+        endpoint.respond = lambda _body: ({"content": answer}, "stop")
+        chat.queue_turn(request.admission_id, message, {})
+        result = engine.run(request, reply)
+        assert result.metadata["prompt_version"] == version
+        assert result.text == answer
+        chat.record_answer(result.answer_id, request.admission_id, result.text)
+        packet = json.dumps(endpoint.requests[-1])
+        assert message in packet
+        return packet
+
+    with open_engine() as engine:
+        run(engine, old_user, old_answer)
+        packet = run(engine, "Continue before clearing")
+        assert old_user in packet and old_answer in packet
+        old_notes = list(tmp_path.rglob("recent-chat.json"))
+        if version == SPLIT_PROMPT_VERSION:
+            assert len(old_notes) == 1 and old_user in old_notes[0].read_text(encoding="utf-8")
+
+        assert chat.clear_history()
+        packet = run(engine, new_user, new_answer)
+        assert old_user not in packet and old_answer not in packet
+        assert all(not path.exists() for path in old_notes)
+
+    with open_engine() as engine:
+        packet = run(engine, "Continue after restarting")
+        assert new_user in packet and new_answer in packet
+        assert old_user not in packet and old_answer not in packet
+        assert chat.clear_history()
+
+    with open_engine() as engine:
+        packet = run(engine, "Start again after clearing and restarting")
+        assert new_user not in packet and new_answer not in packet
+        assert old_user not in packet and old_answer not in packet
 
 
 def test_revocation_between_tool_and_follow_up_rotates_all_history(tmp_path, endpoints):

@@ -12,7 +12,7 @@ from PyQt6.QtGui import (
     QAbstractTextDocumentLayout, QColor, QFontDatabase, QPainter, QPalette, QTextDocument, QTextOption,
 )
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from .refine_dialogue import DemoConversation, DemoTurn, MILK_CONFIRM, MILK_REQUEST
@@ -71,6 +71,8 @@ QPushButton {
 QPushButton[accent="true"] { background: #DDEAD7; }
 QPushButton:pressed, QPushButton:focus { border-color: #34513A; }
 QPushButton:disabled { background: #F1E9DA; border-color: #B8A48A; }
+QPushButton#refine-chat-clear-history { font-size: 11px; padding: 3px 8px; }
+QMessageBox QPushButton { padding: 4px 12px; }
 """
 
 
@@ -239,7 +241,7 @@ class RefineChat(QWidget):
 
     def __init__(self, submit: Callable[[dict], str], snapshot: Callable[[], dict], parent=None, *,
                  store=None, conversation=None, system2=None, configure_system2=None, proposal_card=None,
-                 preferred_height=0):
+                 clear_history: Callable[[], bool] | None = None, preferred_height=0):
         super().__init__(parent)
         self.setObjectName("refine-chat")
         font = self.font()
@@ -254,6 +256,7 @@ class RefineChat(QWidget):
         self._snapshot = snapshot
         self._store = store
         self._system2 = system2
+        self._clear_history = clear_history or (store.clear_history if store is not None else None)
         self._configure_system2 = configure_system2
         self._proposal_card = proposal_card
         self._supersedes_message_id = None
@@ -296,6 +299,13 @@ class RefineChat(QWidget):
         self._panel_layout = QVBoxLayout(panel)
         self._panel_layout.setContentsMargins(11, 7, 11, 7)
         self._panel_layout.setSpacing(5)
+
+        self._clear_button = QPushButton("清除聊天记录")
+        self._clear_button.setObjectName("refine-chat-clear-history")
+        self._clear_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_button.clicked.connect(self._confirm_clear_history)
+        self._clear_button.hide()
+        self._panel_layout.addWidget(self._clear_button, alignment=Qt.AlignmentFlag.AlignRight)
 
         history = QWidget()
         self._history_layout = QVBoxLayout(history)
@@ -491,6 +501,45 @@ class RefineChat(QWidget):
         self.refresh_projection(self._store.projection_version())
         QTimer.singleShot(0, self._to_latest)
         self._request_typing_focus()
+
+    def _has_pending_turn(self):
+        return self._pending is not None or any(message.pending for message in self._messages)
+
+    def _confirm_clear_history(self):
+        if not self._messages or self._has_pending_turn():
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("清除聊天记录")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText("确定清除聊天记录吗？")
+        dialog.setInformativeText("将清除本机的聊天记录和这段对话的上下文。此操作无法撤销。")
+        cancel = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        clear = dialog.addButton("清除", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        confirmed = dialog.clickedButton() is clear
+        dialog.deleteLater()
+        if confirmed:
+            self._apply_clear_history()
+        self._request_typing_focus()
+
+    def _apply_clear_history(self):
+        try:
+            if self._has_pending_turn() or (self._clear_history is not None and not self._clear_history()):
+                self.storage_error.emit("请等待当前回复完成后再清除聊天记录。")
+                return
+        except (sqlite3.Error, RuntimeError):
+            self.storage_error.emit("暂时无法清除聊天记录。")
+            return
+        if self._script is not None:
+            self._script.confirmation = None
+        self._messages.clear()
+        self._projection_version = None
+        self._follow_up = False
+        self._supersedes_message_id = None
+        self._composition = self._composition or "typing"
+        self._render()
 
     def refresh_projection(self, version):
         if self._store is None or version == self._projection_version:
@@ -726,6 +775,8 @@ class RefineChat(QWidget):
             self._extras.addWidget(configure)
         if self._pending is not None:
             self._extras.addWidget(self._message_card(Message("", "正在更新…", source="status")))
+        self._clear_button.setEnabled(not self._has_pending_turn())
+        self._clear_button.setVisible(bool(self._messages))
         self._history.setVisible(bool(self._messages or self._extras.count()))
 
         self.toolbar_mode_changed.emit(self._composition if not self._messages else None)

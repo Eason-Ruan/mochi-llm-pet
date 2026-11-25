@@ -17,10 +17,10 @@ import sys
 from time import monotonic
 from types import SimpleNamespace
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from PyQt6.QtWidgets import QApplication, QLabel, QLineEdit, QMessageBox, QPushButton
 
 from deskpet.c_ui.refine import RefineSession
 from deskpet.c_ui.time_format import ZONE
@@ -167,6 +167,34 @@ try:
     assert chat_status("这次对话模型没能完成回复。")
     assert session.chat_store.projected_messages(include_parts=True) == [user, reply]
 
+    clear = session.chat.findChild(QPushButton, "refine-chat-clear-history")
+    assert clear.isVisible() and clear.isEnabled()
+    phase_before_clear = {key: active()[key] for key in ("id", "version", "state", "planned_duration_s")}
+
+    def answer_clear(accept):
+        dialog = app.activeModalWidget()
+        assert isinstance(dialog, QMessageBox)
+        assert dialog.defaultButton().text() == "取消"
+        if accept:
+            confirm = next(button for button in dialog.buttons()
+                           if dialog.buttonRole(button) == QMessageBox.ButtonRole.DestructiveRole)
+            QTest.mouseClick(confirm, left)
+        else:
+            QTest.keyClick(dialog, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, lambda: answer_clear(False))
+    QTest.mouseClick(clear, left)
+    assert session.chat_store.projected_messages(include_parts=True) == [user, reply]
+    assert chat_status("这次对话模型没能完成回复。")
+    QTimer.singleShot(0, lambda: answer_clear(True))
+    QTest.mouseClick(clear, left)
+    assert not clear.isVisible() and session.chat._message_cards.count() == 0
+    assert session.chat_store.load() == ([], "留待明天输入", None)
+    wait_for(editor, "composer shown after clearing chat")
+    assert editor().text() == "留待明天输入"
+    assert {key: active()[key] for key in phase_before_clear} == phase_before_clear
+    assert session.snapshot["tasks"][0]["status"] == "registered"
+
     # Estimated timing stays unchanged during a content edit. Changing to an
     # exact reminder uses the selected absolute target and starts a new occurrence.
     section("reminders")
@@ -298,6 +326,19 @@ try:
 finally:
     session.quit()
     wait_for(lambda: not session.window.thread.isRunning(), "restarted worker shutdown")
+
+session = RefineSession(app, options)
+try:
+    wait_for(lambda: session.window.ready_for_actions, "restart after clearing chat")
+    section("input")
+    wait_for(editor, "draft restored after clearing chat")
+    assert editor().text() == "留待明天输入"
+    assert not session.chat_store.projected_messages()
+    assert not session.chat.findChild(QPushButton, "refine-chat-clear-history").isVisible()
+    assert session.chat._message_cards.count() == 0
+finally:
+    session.quit()
+    wait_for(lambda: not session.window.thread.isRunning(), "final worker shutdown")
 '''
 
 

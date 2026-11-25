@@ -7,6 +7,8 @@ import json
 import sqlite3
 from uuid import uuid4
 
+from deskpet.system2.admission import clear_chat_admissions, current_chat_reply
+
 
 def _part(source, text):
     return {"source": source, "text": text}
@@ -64,8 +66,9 @@ def _outbox_parts(raw_payload, body):
 
 
 class ConversationStore:
-    def __init__(self, path):
+    def __init__(self, path, *, user_scope="default"):
         self.path = path
+        self.user_scope = user_scope
         with self._transaction() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS refine_chat_messages (
@@ -76,8 +79,12 @@ class ConversationStore:
                 db.execute("ALTER TABLE refine_chat_messages ADD COLUMN parts TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS refine_chat_state (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                draft TEXT NOT NULL DEFAULT '', event_id TEXT, turn TEXT
+                draft TEXT NOT NULL DEFAULT '', event_id TEXT, turn TEXT,
+                projection_base INTEGER NOT NULL DEFAULT 0
             )""")
+            columns = {column[1] for column in db.execute("PRAGMA table_info(refine_chat_state)")}
+            if "projection_base" not in columns:
+                db.execute("ALTER TABLE refine_chat_state ADD COLUMN projection_base INTEGER NOT NULL DEFAULT 0")
             db.execute("INSERT OR IGNORE INTO refine_chat_state(singleton) VALUES (1)")
             db.execute("""CREATE TABLE IF NOT EXISTS refine_system2_chat_turns (
                 message_id TEXT PRIMARY KEY, message_seq INTEGER NOT NULL UNIQUE,
@@ -108,6 +115,23 @@ class ConversationStore:
     def save_draft(self, draft):
         with self._transaction() as db:
             db.execute("UPDATE refine_chat_state SET draft = ? WHERE singleton = 1", (draft,))
+
+    def clear_history(self) -> bool:
+        with self._transaction() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("""SELECT 1 FROM refine_chat_state WHERE event_id IS NOT NULL
+                UNION ALL SELECT 1 FROM refine_system2_chat_turns WHERE pending = 1 LIMIT 1""").fetchone():
+                return False
+            if not clear_chat_admissions(db, self.user_scope):
+                return False
+            db.execute("""UPDATE refine_chat_state
+                SET projection_base = projection_base + 1 + (
+                    SELECT COALESCE(MAX(sequence), 0) FROM refine_chat_messages
+                ) WHERE singleton = 1""")
+            db.execute("DELETE FROM refine_system2_chat_replies")
+            db.execute("DELETE FROM refine_system2_chat_turns")
+            db.execute("DELETE FROM refine_chat_messages")
+        return True
 
     @staticmethod
     def _insert_message(db, speaker, message, parts=None):
@@ -175,10 +199,11 @@ class ConversationStore:
                              (message_id,)).fetchone()
         return row[0] if row else None
 
-    def record_status(self, answer_id, reply_to_message_id, text):
-        self.record_answer(answer_id, reply_to_message_id, parts=(_part("status", text),))
+    def record_status(self, answer_id, reply_to_message_id, text, *, outbox_sequence=None):
+        self.record_answer(answer_id, reply_to_message_id, parts=(_part("status", text),),
+                           outbox_sequence=outbox_sequence)
 
-    def record_answer(self, answer_id, reply_to_message_id, text=None, *, parts=None):
+    def record_answer(self, answer_id, reply_to_message_id, text=None, *, parts=None, outbox_sequence=None):
         """Store a host answer once, accepting flat text from pre-parts outbox rows."""
         if parts is not None:
             try:
@@ -191,6 +216,9 @@ class ConversationStore:
                 text = _joined_text(parts)
         with self._transaction() as db:
             db.execute("BEGIN IMMEDIATE")
+            if (outbox_sequence is not None and self._has_outbox(db)
+                    and not current_chat_reply(db, self.user_scope, outbox_sequence, answer_id)):
+                return
             if db.execute("SELECT 1 FROM refine_system2_chat_replies WHERE answer_id=?", (answer_id,)).fetchone():
                 return
             if not isinstance(text, str) or not text.strip():
@@ -226,7 +254,9 @@ class ConversationStore:
 
     def projection_version(self):
         with self._transaction() as db:
-            return db.execute("SELECT COALESCE(MAX(sequence), 0) FROM refine_chat_messages").fetchone()[0]
+            return db.execute("""SELECT projection_base + (
+                SELECT COALESCE(MAX(sequence), 0) FROM refine_chat_messages
+            ) FROM refine_chat_state WHERE singleton = 1""").fetchone()[0]
 
     def projected_messages(self, *, include_parts=False):
         """Read the original chronological projection with optional provenance for each message."""

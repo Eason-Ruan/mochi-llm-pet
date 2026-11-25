@@ -138,6 +138,7 @@ class RefineSession(RefineDeliveryMixin):
             system2=self._queue_chat_message if self.production else None,
             configure_system2=self._open_model_settings if self.production else None,
             proposal_card=self.proposal_card,
+            clear_history=self._clear_chat_history if self.production else None,
             preferred_height=self.settings.value("chatHeight", 0, type=int),
         )
         self.chat_store = chat_store
@@ -253,6 +254,11 @@ class RefineSession(RefineDeliveryMixin):
             context["supersedes_message_id"] = supersedes_message_id
         self.chat_store.queue_turn(message_id, text, context)
         self.window.action.emit({"kind": "system2_message", "event_id": message_id})
+
+    def _clear_chat_history(self) -> bool:
+        if self._system2 is None:
+            raise RuntimeError("Desktop System 2 is still starting")
+        return self._system2.clear_chat_history()
 
     def _panel_details(self, key, show):
         self.panels[key] = self.detail_panels[key] if show else self.overviews[key]

@@ -30,7 +30,54 @@ def timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+_CHAT_HISTORY_SCHEMA = """CREATE TABLE IF NOT EXISTS s2_chat_history(
+    user_scope TEXT PRIMARY KEY, generation INTEGER NOT NULL, admission_cutoff INTEGER NOT NULL)"""
+_CLEARED_REPLY = "{}"
+
+
+def chat_history_generation(db, scope):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='s2_chat_history'").fetchone():
+        return 0
+    row = db.execute("SELECT generation FROM s2_chat_history WHERE user_scope = ?", (scope,)).fetchone()
+    return row[0] if row else 0
+
+
+def clear_chat_admissions(db, scope):
+    """Advance the chat boundary in the same transaction as the desktop history wipe."""
+    has_admissions = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='s2_admissions'").fetchone()
+    if has_admissions and db.execute("""
+        SELECT 1 FROM s2_admissions WHERE user_scope = ? AND source = 'user'
+            AND state IN ('queued', 'running') AND json_type(user_intent, '$.utterance') = 'text' LIMIT 1
+    """, (scope,)).fetchone():
+        return False
+    cutoff = db.execute("""
+        SELECT COALESCE(MAX(sequence), 0) FROM s2_admissions WHERE user_scope = ?
+    """, (scope,)).fetchone()[0] if has_admissions else 0
+    db.execute(_CHAT_HISTORY_SCHEMA)
+    db.execute("""
+        INSERT INTO s2_chat_history VALUES (?, 1, ?) ON CONFLICT(user_scope) DO UPDATE
+        SET generation = generation + 1, admission_cutoff = excluded.admission_cutoff
+    """, (scope, cutoff))
+    if has_admissions:
+        db.execute("""
+            UPDATE s2_admissions SET user_intent = json_remove(user_intent, '$.utterance')
+            WHERE user_scope = ? AND source = 'user' AND json_type(user_intent, '$.utterance') = 'text'
+        """, (scope,))
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='s2_ui_outbox'").fetchone():
+        # The proposal card still needs the completion event ID to release its buttons.
+        db.execute("DELETE FROM s2_ui_outbox WHERE user_scope = ? AND acknowledged = 1", (scope,))
+        db.execute("UPDATE s2_ui_outbox SET payload = ? WHERE user_scope = ?", (_CLEARED_REPLY, scope))
+    return True
+
+
+def current_chat_reply(db, scope, sequence, answer_id):
+    return db.execute("""
+        SELECT 1 FROM s2_ui_outbox WHERE user_scope = ? AND sequence = ? AND answer_id = ? AND payload <> ?
+    """, (scope, sequence, answer_id, _CLEARED_REPLY)).fetchone() is not None
+
+
 _SCHEMA = (
+    _CHAT_HISTORY_SCHEMA,
     """CREATE TABLE IF NOT EXISTS s2_owners(
         user_scope TEXT PRIMARY KEY, token TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS s2_admissions(
@@ -404,9 +451,9 @@ class AdmissionStore:
         with self.write() as db:
             if not self._owned(db):
                 return
-            state = db.execute("SELECT state FROM s2_admissions WHERE admission_id = ?",
-                               (admission.admission_id,)).fetchone()
-            if not state or state[0] != expected_state:
+            row = db.execute("SELECT state, sequence FROM s2_admissions WHERE admission_id = ?",
+                             (admission.admission_id,)).fetchone()
+            if not row or row["state"] != expected_state:
                 return
             inserted = db.execute("""INSERT OR IGNORE INTO s2_decisions
                 (decision_id, user_scope, as_of, record, model_reviewed_at, jev_review) VALUES (?, ?, ?, ?, ?, ?)""",
@@ -422,10 +469,13 @@ class AdmissionStore:
                     recover_wakes(db)
             if reply is not None:
                 event_id = admission.user_intent["message_id"]
+                reset = db.execute("SELECT admission_cutoff FROM s2_chat_history WHERE user_scope = ?",
+                                   (self.scope,)).fetchone()
+                payload = _CLEARED_REPLY if reset and row["sequence"] <= reset[0] else json_text(reply)
                 db.execute("""
                     INSERT OR IGNORE INTO s2_ui_outbox(user_scope, answer_id, reply_to_message_id, payload)
                     VALUES (?, ?, ?, ?)
-                """, (self.scope, "s2r-" + stable_id(admission.admission_id), event_id, json_text(reply)))
+                """, (self.scope, "s2r-" + stable_id(admission.admission_id), event_id, payload))
             if session_id:
                 db.execute("""
                     INSERT INTO s2_sessions VALUES (?, ?, ?, ?) ON CONFLICT(user_scope)
@@ -454,20 +504,26 @@ class AdmissionStore:
             ORDER BY rowid DESC LIMIT 1
         """, (self.scope, admission_id)).fetchone()
 
-    def decisions(self, count=12, *, background_only=False, user_only=False, db=None):
+    def decisions(self, count=12, *, background_only=False, current_chat_only=False, db=None):
         with (self.connect() if db is None else nullcontext(db)) as db:
             statement = """
                 SELECT d.record FROM s2_decisions AS d
                 JOIN s2_admissions AS a ON a.admission_id = d.decision_id
-                WHERE d.user_scope = ? AND (? = 0 OR a.source = 'background') AND (? = 0 OR a.source = 'user')
+                WHERE d.user_scope = ? AND (? = 0 OR a.source = 'background')
+                AND (? = 0 OR (a.source = 'user' AND a.sequence > COALESCE((
+                    SELECT admission_cutoff FROM s2_chat_history WHERE user_scope = a.user_scope
+                ), 0)))
                 ORDER BY d.rowid DESC LIMIT ?
             """
-            return tuple(json.loads(row["record"]) for row in db.execute(statement, (self.scope, background_only, user_only, count)))
+            return tuple(json.loads(row["record"]) for row in db.execute(
+                statement, (self.scope, background_only, current_chat_only, count),
+            ))
 
     def ui_events(self):
         with self.connect() as db:
-            return tuple(UiEvent(row["sequence"], "reply", row["answer_id"], row["reply_to_message_id"],
-                                 json.loads(row["payload"])) for row in db.execute("""
+            return tuple(UiEvent(row["sequence"], "reply_cleared" if row["payload"] == _CLEARED_REPLY else "reply",
+                                 row["answer_id"], row["reply_to_message_id"], json.loads(row["payload"]))
+                         for row in db.execute("""
                 SELECT * FROM s2_ui_outbox WHERE user_scope = ? AND acknowledged = 0 ORDER BY sequence
             """, (self.scope,)))
 
@@ -475,6 +531,8 @@ class AdmissionStore:
         with self.write() as db:
             db.execute("UPDATE s2_ui_outbox SET acknowledged = 1 WHERE user_scope = ? AND sequence = ?",
                        (self.scope, sequence))
+            db.execute("DELETE FROM s2_ui_outbox WHERE user_scope = ? AND sequence = ? AND payload = ?",
+                       (self.scope, sequence, _CLEARED_REPLY))
 
 
 def _action_fence(function, subject_ref):

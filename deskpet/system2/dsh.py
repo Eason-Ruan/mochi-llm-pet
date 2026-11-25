@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import closing, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -13,9 +13,10 @@ import logging
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 
 import httpx
@@ -28,6 +29,7 @@ from deskpet.observation_v2.routes import (
 )
 from deskpet.settings import SettingsStore
 
+from .admission import chat_history_generation
 from .bailian import BailianTurn
 from .dsh_projection import observed_document_names, project_input, project_tool_result
 from .gateway import ModelGateway, SendPolicy
@@ -44,6 +46,8 @@ _MAX_MODEL_STEPS = 6
 _CHAT_HISTORY_TURNS = 4
 _CHAT_HISTORY_TEXT_LIMIT = 1200
 _CHAT_HISTORY_MAX_BYTES = 65536
+_CHAT_OWNER_FILE = ".mochi-chat-owner"
+_PROFILE_DIRECTORY = re.compile(r"[0-9a-f]{32}\Z")
 _LOG = logging.getLogger(__name__)
 
 
@@ -316,6 +320,8 @@ class DSHEngine:
         observation_guard: Callable[[], tuple[str | None, int, bool | None]] | None = None,
     ) -> None:
         self._root = Path(data_dir).resolve() / "system2-dsh"
+        self._chat_owner = sha256(settings.user_scope.encode()).hexdigest()[:32]
+        self._chat_root = self._root / "chat" / self._chat_owner
         self._settings = settings
         self._routes = settings.routes
         self._tools = _schemas(tools)
@@ -323,8 +329,10 @@ class DSHEngine:
         self._observation_guard = observation_guard or (lambda: (None, 0, None))
         self._runtimes: dict[tuple[bool, bool, bool], _Runtime] = {}
         self._recent_chat: deque[dict[str, str]] = deque(maxlen=_CHAT_HISTORY_TURNS)
+        self._chat_generation = None
         self._privacy_epoch = None
         self._serial = Lock()
+        self._chat_lock = RLock()
         self._state = Lock()
         self._closing = Event()
 
@@ -351,6 +359,8 @@ class DSHEngine:
         pending = None
         try:
             path.parent.mkdir(mode=0o700, exist_ok=True)
+            if not self._chat_generation:
+                self._mark_legacy_chat_profile(path.parent)
             with NamedTemporaryFile("w", dir=path.parent, prefix=".chat-", delete=False, encoding="utf-8") as stream:
                 pending = Path(stream.name)
                 stream.write(_json([row for row in self._recent_chat if row.keys() == {"user", "assistant"}]))
@@ -362,11 +372,62 @@ class DSHEngine:
                 with suppress(OSError):
                     pending.unlink(missing_ok=True)
 
-    def _stop_runtime(self) -> None:
+    def _stop_runtime(self, *, chat_only=False) -> None:
         with self._state:
-            runtimes, self._runtimes = self._runtimes, {}
-        for runtime in runtimes.values():
-            runtime.close()
+            keys = [key for key in self._runtimes if not chat_only or key[2]]
+            runtimes = [self._runtimes.pop(key) for key in keys]
+        for runtime in runtimes:
+            try:
+                runtime.close()
+            except OSError:
+                if not chat_only:
+                    raise
+                _LOG.warning("Could not clean up a System 2 chat runtime")
+
+    def _mark_legacy_chat_profile(self, directory: Path) -> None:
+        (directory / _CHAT_OWNER_FILE).write_text(self._chat_owner, encoding="ascii")
+
+    def _remove_old_chat_storage(self, generation: int) -> None:
+        # Untagged route notes predate chat ownership in the default desktop scope.
+        for directory in self._root.glob("*"):
+            if (not _PROFILE_DIRECTORY.fullmatch(directory.name) or directory.is_symlink()
+                    or not directory.is_dir()):
+                continue
+            marker = directory / _CHAT_OWNER_FILE
+            try:
+                if marker.is_symlink():
+                    continue
+                owner = marker.read_text(encoding="ascii") if marker.is_file() else None
+                if owner != self._chat_owner and (owner is not None or self._settings.user_scope != "default"):
+                    continue
+                (directory / "recent-chat.json").unlink(missing_ok=True)
+                for pending in directory.glob(".chat-*"):
+                    pending.unlink(missing_ok=True)
+                sessions = directory / "sessions"
+                if owner == self._chat_owner and sessions.is_dir() and not sessions.is_symlink():
+                    shutil.rmtree(sessions)
+                marker.unlink(missing_ok=True)
+            except (OSError, UnicodeError):
+                _LOG.warning("Could not remove an old System 2 chat profile")
+        for directory in self._chat_root.glob("*"):
+            if directory.name.isdecimal() and int(directory.name) < generation and not directory.is_symlink():
+                try:
+                    shutil.rmtree(directory)
+                except OSError:
+                    _LOG.warning("Could not remove an old System 2 chat generation")
+
+    def clear_chat_history(self) -> None:
+        """Apply the persisted reset without waiting for a background model turn."""
+        with self._chat_lock:
+            with closing(sqlite3.connect(self._settings.path)) as db:
+                generation = chat_history_generation(db, self._settings.user_scope)
+            if generation == self._chat_generation:
+                return
+            self._stop_runtime(chat_only=True)
+            self._recent_chat.clear()
+            self._chat_generation = generation
+            if generation:
+                self._remove_old_chat_storage(generation)
 
     def _discard_runtime(self, runtime: _Runtime) -> None:
         with self._state:
@@ -418,7 +479,8 @@ class DSHEngine:
         epoch = (snapshot.route_generation, snapshot.consent_generation, generation, marker)
         if epoch != self._privacy_epoch:
             self._stop_runtime()
-            self._recent_chat.clear()
+            with self._chat_lock:
+                self._recent_chat.clear()
             self._privacy_epoch = epoch
         policy = SendPolicy(
             self._routes, snapshot, is_observation_current=lambda db:
@@ -432,6 +494,7 @@ class DSHEngine:
             "model": snapshot.route.model, "route": snapshot.route_generation, "consent": snapshot.consent_generation,
             "activity": generation, "sharable": share, "lock": marker, "private": private,
             "background": background, "chat": chat,
+            **({"chat_history": self._chat_generation} if chat and self._chat_generation else {}),
             "prompt_version": prompt_version,
             "prompt": prompt, "tools": tools,
         }).encode()).hexdigest()
@@ -443,17 +506,22 @@ class DSHEngine:
             self._runtimes.pop(runtime_key, None)
         if current is not None:
             current.close()
-        self._root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        profile_root = (self._chat_root / str(self._chat_generation)
+                        if chat and self._chat_generation else self._root)
+        profile_root.mkdir(parents=True, mode=0o700, exist_ok=True)
         chat_history_path = None
         if chat and selection is not None and not private:
-            chat_history_path = self._root / identity[:32] / "recent-chat.json"
+            chat_history_path = profile_root / identity[:32] / "recent-chat.json"
             if not self._recent_chat:
                 self._restore_recent_chat(chat_history_path)
         # Split turns receive a single projected snapshot. Bailian background
         # also uses a fresh session when running the legacy comparison prompt.
         storage = TemporaryDirectory(prefix="mochi-observation-") if private or fresh else None
-        path = Path(storage.name) if storage is not None else self._root / identity[:32]
+        path = Path(storage.name) if storage is not None else profile_root / identity[:32]
         path.mkdir(mode=0o700, exist_ok=True)
+        if chat and storage is None and not self._chat_generation:
+            with suppress(OSError):
+                self._mark_legacy_chat_profile(path)
         runtime = _Runtime(
             path, policy, session_id=session_id, prompt=prompt, tools=tools,
             credential=self._credential, share=share, closing=self._closing, document_sources=sources,
@@ -472,9 +540,12 @@ class DSHEngine:
     def run(self, turn, call_tool: Callable[..., dict]):
         from .protocol import EngineReply
 
-        with self._serial:
+        chat = turn.source == "user"
+        with self._serial, self._chat_lock if chat else nullcontext():
             if self._closing.is_set() or turn.user_scope != self._routes.user_scope:
                 raise CloudRouteError("Invalid System 2 user or runtime")
+            if chat:
+                self.clear_chat_history()
             snapshot = self._routes.snapshot(SYSTEM2)
             runtime = None
             try:
@@ -482,7 +553,7 @@ class DSHEngine:
                 reply = runtime.run(turn, call_tool)
                 self._routes.record_result(snapshot)
                 runtime.policy.check()
-                if turn.source == "user":
+                if chat:
                     if runtime.document_disclosed:
                         # Prevent the native transcript from replaying titles
                         # in a subsequent turn that did not ask for them.

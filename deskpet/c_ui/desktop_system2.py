@@ -25,7 +25,7 @@ class DesktopSystem2:
         self.env = env
         self.settings = settings
         self.lock_probe = args.desktop_lock_probe
-        self.chat = ConversationStore(args.business_database)
+        self.chat = ConversationStore(args.business_database, user_scope=settings.user_scope)
         timezone = resolve_timezone(getattr(args, "user_timezone", None))
         items = ItemService(env.tasks, timezone=timezone.key)
         self.scheduler = Scheduler(env.tasks, items, observation=env.observation_context_reader,
@@ -92,6 +92,12 @@ class DesktopSystem2:
             "scope": "default", "patch": action["changes"], "expected_version": action["expected_version"],
         }, event_id=action["event_id"])
 
+    def clear_chat_history(self) -> bool:
+        if not self.chat.clear_history():
+            return False
+        self.host.reset_chat_context()
+        return True
+
     def pump(self):
         for message_id, body, context in self.chat.queued_turns():
             if existing := self.host.admission_for_message(message_id):
@@ -120,10 +126,12 @@ class DesktopSystem2:
                 payload = event.payload if isinstance(event.payload, dict) else {}
                 try:
                     self.chat.record_answer(event.answer_id, event.reply_to_message_id,
-                                            payload.get("text"), parts=payload.get("parts"))
+                                            payload.get("text"), parts=payload.get("parts"),
+                                            outbox_sequence=event.sequence)
                 except ValueError:
                     self.chat.record_status(event.answer_id, event.reply_to_message_id,
-                                            "无法显示这条回复。请查看当前状态后重试。")
+                                            "无法显示这条回复。请查看当前状态后重试。",
+                                            outbox_sequence=event.sequence)
             self.host.ack_ui_event(event.sequence)
             processed.append(event)
         return processed

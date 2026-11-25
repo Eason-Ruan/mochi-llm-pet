@@ -374,6 +374,14 @@ class System2Host:
     def ack_ui_event(self, sequence):
         self._store.ack_ui_event(sequence)
 
+    def reset_chat_context(self):
+        clear = getattr(self.engine, "clear_chat_history", None)
+        if clear is not None:
+            try:
+                clear()
+            except (OSError, sqlite3.Error) as error:
+                log.warning("Immediate System 2 chat cleanup could not finish (%s)", type(error).__name__)
+
     def decision_records(self, *, limit=12):
         return self._store.decisions(min(max(limit, 1), 50))
 
@@ -510,7 +518,7 @@ class System2Host:
                 if predecessor and predecessor.get("state") == "elapsed":
                     selection["phase_predecessor"] = {key: predecessor[key] for key in ("id", "version", "kind")}
             semantic = admission.source == "user" and not intent.get("proposal_button")
-            recent = self._store.decisions(6, user_only=True, db=db) if semantic else ()
+            recent = self._store.decisions(6, current_chat_only=True, db=db) if semantic else ()
             recent_actions = [{key: action[key] for key in ("action", "subject_ref", "outcome")}
                               for decision in recent for action in decision.get("action_results", ())
                               if action.get("outcome") == "committed" and action.get("subject_ref")]

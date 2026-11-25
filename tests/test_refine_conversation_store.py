@@ -1,4 +1,6 @@
 from contextlib import closing
+from datetime import UTC, datetime
+from hashlib import sha256
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -148,3 +150,116 @@ def test_legacy_backfill_requires_matching_outbox_and_exact_receipt_prefix(tmp_p
     assert restarted.projected_messages(include_parts=True)[:-1] == rows
     assert restarted.projected_messages(include_parts=True)[-1][6] == rows[1][6]
     assert restarted.projection_version() == 9
+
+
+def test_clear_history_requires_completed_turns_and_preserves_draft_across_restart(tmp_path):
+    path = tmp_path / "business.sqlite3"
+    store = ConversationStore(path)
+    store.queue_turn("old", "旧问题", {})
+    store.save_draft("未发送的草稿")
+    assert not store.clear_history()
+    assert store.load() == ([("你", "旧问题")], "未发送的草稿", None)
+    assert store.queued_turns()[0][:2] == ("old", "旧问题")
+    store.record_answer("old-answer", "old", "旧回复")
+
+    turn = SimpleNamespace(action={"event_id": "local"}, text="专注已开始", follow_up=False)
+    store.begin_turn("你", "开始专注", turn)
+    assert not store.clear_history()
+    store.finish_turn("local", turn.text)
+    store.save_draft("未发送的草稿")
+    last_version = store.projection_version()
+
+    assert store.clear_history()
+    reopened = ConversationStore(path)
+    assert reopened.load() == ([], "未发送的草稿", None)
+    assert not reopened.queued_turns()
+    assert not reopened.projected_messages(include_parts=True)
+    assert reopened.projection_version() > last_version
+
+    cleared_version = reopened.projection_version()
+    reopened.queue_turn("new", "新问题", {})
+    assert reopened.projection_version() > cleared_version
+    assert reopened.projected_messages()[0][1:4] == ("新问题", "new", 1)
+
+
+def test_desktop_clear_fences_old_replies_and_context_without_a_model_route(tmp_path, monkeypatch):
+    from deskpet.c_ui.desktop_system2 import DesktopSystem2
+    from deskpet.mocks.clock import FakeClock
+    from deskpet.settings import SettingsStore
+    from deskpet.system2.host import System2Host
+
+    path = tmp_path / "business.sqlite3"
+    now = datetime.now(UTC)
+    clock = FakeClock(now)
+    settings = SettingsStore(path)
+    store = ConversationStore(path)
+    host = System2Host(tmp_path, scheduler=None, gateway=SimpleNamespace(definitions=()),
+                       settings_store=settings, clock=clock)
+    desktop = SimpleNamespace(chat=store, host=host)
+
+    def artifact(directory, name):
+        path = tmp_path / "system2-dsh" / directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synthetic history", encoding="utf-8")
+        return path
+
+    historical_notes = [artifact(digit * 32, "recent-chat.json") for digit in ("1", "2")]
+    legacy_chat = artifact("3" * 32, "sessions/work/mochi-chat/session.v4.jsonl")
+    host.engine._mark_legacy_chat_profile(legacy_chat.parents[3])
+    background = artifact("4" * 32, "sessions/work/mochi-background/session.v4.jsonl")
+    another_scope = artifact("5" * 32, "recent-chat.json")
+    owner = artifact("5" * 32, ".mochi-chat-owner")
+    owner.write_text(sha256(b"another-scope").hexdigest()[:32], encoding="ascii")
+
+    def finish_admission(admission, text):
+        decision = {
+            "as_of": now.isoformat(),
+            "action_results": [{"action": "item.create", "subject_ref": "existing-item", "outcome": "committed"}],
+        }
+        host._store.finish(admission, decision, {"text": text}, None, "test", expected_state="running")
+
+    try:
+        host.submit_user("历史聊天文本", event_id="old")
+        assert not DesktopSystem2.clear_chat_history(desktop)
+        finish_admission(host._store.claim(now), "历史模型回复")
+        old_reply, = host.ui_events()
+        store.record_answer(old_reply.answer_id, "old", "历史模型回复", outbox_sequence=old_reply.sequence)
+        host.resolve_proposal("proposal", "accept", version=1, event_id="proposal-click")
+        proposal_admission = host._store.claim(now)
+
+        assert DesktopSystem2.clear_chat_history(desktop)
+        assert all(not path.exists() for path in (*historical_notes, legacy_chat))
+        assert background.exists() and another_scope.exists()
+        store.record_answer(old_reply.answer_id, "old", old_reply.payload["text"],
+                            outbox_sequence=old_reply.sequence)
+        assert store.load() == ([], "", None)
+        assert host._store.decisions(current_chat_only=True) == ()
+        assert len(host.decision_records()) == 1
+        old_admission_id = host.admission_for_message("old")
+        assert "utterance" not in host._store.state(old_admission_id).user_intent
+
+        finish_admission(proposal_admission, "提议已生效")
+        events = DesktopSystem2.pump(desktop)
+        assert [(event.kind, event.reply_to_message_id, event.payload) for event in events] == [
+            ("reply_cleared", "old", {}),
+            ("reply_cleared", "proposal-click", {}),
+        ]
+        assert not host.ui_events()
+        assert not store.projected_messages()
+
+        host.resolve_proposal("another-proposal", "accept", version=1, event_id="fresh-proposal-click")
+        finish_admission(host._store.claim(now), "新的提议已生效")
+        event, = DesktopSystem2.pump(desktop)
+        assert event.kind == "reply"
+        assert store.projected_messages()[0][1] == "新的提议已生效"
+        assert len(host._store.decisions(current_chat_only=True)) == 1
+
+        def unavailable_cleanup():
+            raise sqlite3.OperationalError("temporarily busy")
+
+        monkeypatch.setattr(host.engine, "clear_chat_history", unavailable_cleanup)
+        assert DesktopSystem2.clear_chat_history(desktop)
+        assert store.load() == ([], "", None)
+        assert host._store.decisions(current_chat_only=True) == ()
+    finally:
+        host.close()
