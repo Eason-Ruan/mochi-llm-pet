@@ -148,16 +148,19 @@ printf 'Mochi profile: %s\n' "$mochi_profile"
 open -n .mochi-native/Mochi.app --args --data-dir "$mochi_profile"
 ```
 
-Open the focus panel and start a short timer. Quit and relaunch with the same
-`--data-dir` to check that the focus session or its history persists. For a
-notification check, follow the Notifications step below, then create and
-confirm an **到点提醒** reminder a few minutes ahead. An eligible reminder can
+Click the focus icon to open **专注与回顾**, then choose **管理计时**. Set a short
+duration, move focus away from the field, and check the displayed value before
+choosing **开始专注**. Right-click the cat and choose **退出 Mochi**, then run the
+same `open` command with the same `--data-dir`. An unfinished session can
+reopen as **已暂停** with its title and remaining time. For a notification check,
+follow the Notifications step below, then create and confirm an **到点提醒**
+reminder a few minutes ahead. An eligible reminder can
 show **已登记系统通知**. A visible desktop card may handle delivery while the
-desktop is active. Test the system banner with the Mac locked or asleep only
-after enabling that delivery in macOS Notifications. The isolated directory
-contains its own settings and history. macOS still manages permissions for
-the app identity in the current login, so testing the first permission prompts
-requires a macOS login that has never granted them.
+desktop is active. For a Lock Screen check, enable Lock Screen delivery for
+Mochi in macOS Notifications and lock the Mac before the reminder is due. The
+isolated directory contains its own settings and history. macOS manages
+permissions for the app identity in the current login. To test first-time
+permission prompts, use a macOS login with no prior grants for this app.
 
 ### macOS permissions
 
@@ -180,8 +183,17 @@ requires a macOS login that has never granted them.
   click **请求屏幕录制权限**. In **System Settings → Privacy & Security →
   Screen & System Audio Recording** (called **Screen Recording** on older
   releases), enable this checkout's `.mochi-native/Mochi.app`. If the app is
-  absent, use **+** and navigate to that bundle. Quit and reopen Mochi, then
-  check its screen recording status in **模型与隐私**. [Apple's screen recording guide](https://support.apple.com/guide/mac-help/control-access-screen-system-audio-recording-mchld6aa7d23/mac)
+  absent, use **+**, press **Command–Shift–G**, and enter the full path to the
+  bundle's `.mochi-native` parent folder. Select **Mochi.app**, quit, and reopen
+  Mochi with the same profile. Look for **macOS 屏幕录制权限已授权** in
+  **模型与隐私**. To request the same permission from Terminal for the isolated
+  profile above, quit Mochi and run:
+
+  ```sh
+  open -n .mochi-native/Mochi.app --args --data-dir "$mochi_profile" --request-screen-recording
+  ```
+
+  [Apple's screen recording guide](https://support.apple.com/guide/mac-help/control-access-screen-system-audio-recording-mchld6aa7d23/mac)
 - **Browser Automation is optional.** The app can request access to a supported
   browser after you enable **读取浏览器域名** or opt into a supported website
   under **编辑文档名权限**. Accept only the browser you intend to use and
@@ -196,8 +208,8 @@ uv run --locked python -m deskpet
 ```
 
 After setup you can double-click `start_mochi.bat`. The focus panel accepts a
-duration and an optional title. Text chat also accepts local commands such as
-「开始 25 分钟」 and 「暂停专注」 on both platforms.
+duration and an optional title. Configure and verify System 2 to use text
+chat on either platform.
 
 ### Configure System 2 and Observation
 
@@ -272,8 +284,9 @@ Run `python -m deskpet --legacy` to open the original LLM pet, or
   `uv sync --python 3.12 --locked`. If the checkout or Python environment moved,
   Python changed, or you updated the launcher, quit Mochi and move the old
   `.mochi-native/Mochi.app` to Trash before rerunning the builder. If Qt reports
-  `Incompatible processor` and `neon` under a restricted automation sandbox,
-  retry from a regular Terminal session. [Project environment notes](docs/m0.md)
+  `Incompatible processor` and `neon` or Launch Services reports `-10827` under
+  a restricted automation sandbox, retry from a regular Terminal session in
+  the logged-in Mac desktop. [Project environment notes](docs/m0.md)
 - **macOS permission stopped working after a rebuild.** The local signature
   can change. Quit Mochi, remove the stale app entry from Screen Recording
   settings, add the current `.mochi-native/Mochi.app`, and reopen it.
@@ -306,7 +319,10 @@ shadow mode and a configured key to collect live Jev measurements. The optional
 `--system2-settings PATH` reads a verified Bailian route from a settings
 database and measures System 2 on those synthetic snapshots.
 
-### System notifications on Windows
+### System notification setup
+
+For macOS, follow the Notifications step under
+[macOS permissions](#macos-permissions).
 
 On Windows 10 or 11, install the dependencies above, then run
 `uv run --locked python -m deskpet.c_ui.windows_notification_identity install`

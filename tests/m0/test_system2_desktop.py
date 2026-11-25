@@ -381,9 +381,9 @@ def exercise_desktop():
         assert remembered["card_events"] == [("card.painted",), ("sound.skipped",)]
 
     for restored in (False, True):
-        def start(app, options):
+        def start(app, options, **kwargs):
             options.synthetic_delivery = True
-            session = real_session(app, options)
+            session = real_session(app, options, **kwargs)
 
             def exercise():
                 try:
