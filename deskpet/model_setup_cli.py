@@ -7,13 +7,12 @@ import sqlite3
 import sys
 import warnings
 
-from .desktop_profile import desktop_data_dir
+from .desktop_profile import desktop_data_dir, desktop_settings_store
 from .model_setup import (
     MODEL_ROLES, ModelInput, can_reuse_api_key, configure_models, model_input_defaults, model_setup_defaults,
     verify_models,
 )
 from .observation_v2.routes import SYSTEM2, VISION, Role, _normalize_base_url
-from .settings import SettingsStore
 
 
 _ROLE_LABELS = {SYSTEM2: "System 2", VISION: "Observation"}
@@ -68,8 +67,14 @@ def run_terminal_setup(
             return 2
 
     try:
-        routes = SettingsStore(desktop_data_dir(data_dir) / "business.sqlite3").routes
+        store = desktop_settings_store(desktop_data_dir(data_dir))
+        routes = store.routes
         snapshots = model_setup_defaults(routes)
+        if VISION in roles and overrides.get(VISION, (None, None, None))[2] is True:
+            if store.read().observation_screen_scope == "all_displays_unfiltered":
+                print("The screenshot scope is unfiltered across all displays. An authorized and verified Alibaba "
+                      "Cloud Model Studio Qwen route can receive images that include excluded apps, domains, and "
+                      "private windows.", file=sys.stderr)
     except (ImportError, OSError, RuntimeError, ValueError, sqlite3.Error):
         print("Could not open the Mochi profile. Check --data-dir and directory permissions.", file=sys.stderr)
         return 1

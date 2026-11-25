@@ -335,6 +335,7 @@ def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
     tmp_path, monkeypatch, platform, request_flag, locked, expected,
 ):
     pytest.importorskip("PyQt6.QtWidgets")
+    from deskpet import desktop_profile
     from deskpet.__main__ import main
     from deskpet.c_ui import refine
 
@@ -346,8 +347,11 @@ def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
         return SimpleNamespace(setStaleLockTime=lambda _: None, tryLock=lambda: not locked,
                                unlock=lambda: events.append("unlock"))
 
-    def launch(application, args):
+    def launch(application, args, *, settings_store, default_chat_height):
         assert application is app and args.data_dir == tmp_path
+        prefs = settings_store.read()
+        assert prefs.observation_screen_scope == "all_displays_unfiltered" and prefs.default_focus_s == 900
+        assert default_chat_height == (295 if platform == "cocoa" else 0)
         events.append("pet")
         return SimpleNamespace(quit=lambda: events.append("quit"))
 
@@ -360,6 +364,8 @@ def test_desktop_permission_launch_flag_requests_once_after_profile_lock(
     monkeypatch.setattr(refine, "QLockFile", lock_file)
     monkeypatch.setattr(refine.QGuiApplication, "platformName", lambda: "offscreen")
     monkeypatch.setattr(refine, "platform_notifications", lambda **_: None)
+    monkeypatch.setattr(desktop_profile, "platform", "darwin")
+    monkeypatch.setattr(desktop_profile, "_all_displays_available", lambda: True)
     monkeypatch.setattr(refine, "RefineSession", launch)
     monkeypatch.setattr(refine, "screen_recording_access", permission)
     flags = ["--request-screen-recording"] if request_flag else []

@@ -14,7 +14,7 @@ from PyQt6.QtCore import QLockFile, QPoint, QSettings, Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton
 
-from deskpet.desktop_profile import DESKTOP_NAME, desktop_data_dir
+from deskpet.desktop_profile import DESKTOP_NAME, desktop_data_dir, desktop_settings_store
 from deskpet.m0.composition import load_adapters
 from deskpet.perception.dpi import set_dpi_awareness
 from deskpet.perception.macos import screen_recording_access
@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 class RefineSession(RefineDeliveryMixin):
     """Compose the native pet and its shared service host in one Qt process."""
 
-    def __init__(self, app, args, *, settings=None, conversation=None):
+    def __init__(self, app, args, *, settings=None, conversation=None, settings_store=None, default_chat_height=0):
         self.production = args.profile == "realtime"
         if not self.production and args.profile != "scenario":
             raise ValueError("Mochi 需要实时或演示配置")
@@ -115,7 +115,7 @@ class RefineSession(RefineDeliveryMixin):
             from deskpet.settings import SettingsStore
             from .settings import SettingsPanel
 
-            self.settings_store = SettingsStore(self.business_db, initial_input_mode="typing")
+            self.settings_store = settings_store if settings_store is not None else SettingsStore(self.business_db)
             self._settings_changed(self.settings_store.read())
             self.settings_panel = SettingsPanel(
                 self.settings_store, submit=self._settings_submit,
@@ -139,7 +139,7 @@ class RefineSession(RefineDeliveryMixin):
             configure_system2=self._open_model_settings if self.production else None,
             proposal_card=self.proposal_card,
             clear_history=self._clear_chat_history if self.production else None,
-            preferred_height=self.settings.value("chatHeight", 0, type=int),
+            preferred_height=self.settings.value("chatHeight", default_chat_height, type=int),
         )
         self.chat_store = chat_store
         self.chat.set_preference(self.input_mode)
@@ -858,14 +858,13 @@ def configure_system2(data_dir=None):
     from PyQt6.QtCore import Qt, pyqtSignal
     from PyQt6.QtWidgets import QDialog, QDialogButtonBox
     from deskpet.observation_v2.routes import SYSTEM2
-    from deskpet.settings import SettingsStore
     from .settings import _RouteEditor, verify_route_in_background
 
     class VerificationDialog(QMessageBox):
         probe_finished = pyqtSignal(str)
 
     app, data_dir = _desktop_profile(data_dir)
-    store = SettingsStore(data_dir / "business.sqlite3")
+    store = desktop_settings_store(data_dir)
     editor = _RouteEditor(store.routes, SYSTEM2, None, preset_provider="bailian")
     editor.setWindowTitle("Mochi · System 2 模型连接")
     buttons = editor.findChild(QDialogButtonBox)
@@ -896,11 +895,10 @@ def configure_system2(data_dir=None):
 
 def configure_models(data_dir=None):
     """Open the model connections dialog without starting the pet or Observation."""
-    from deskpet.settings import SettingsStore
     from .model_setup import ModelSetupDialog
 
     app, data_dir = _desktop_profile(data_dir)
-    store = SettingsStore(data_dir / "business.sqlite3")
+    store = desktop_settings_store(data_dir)
     dialog = ModelSetupDialog(store.routes)
     dialog.exec()
     return 0
@@ -928,7 +926,7 @@ def run_desktop(data_dir=None, *, request_screen_recording=False):
             screen_recording_access(request=True)
         session = RefineSession(app, SimpleNamespace(
             profile="realtime", scenario="desktop", output=None, data_dir=data_dir, native_notifications=notifications,
-        ))
+        ), settings_store=desktop_settings_store(data_dir), default_chat_height=295 if native_macos else 0)
         return app.exec()
     finally:
         if session is not None:

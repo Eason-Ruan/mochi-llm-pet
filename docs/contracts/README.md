@@ -1,6 +1,6 @@
-# M0 公共契约 v1
+# Carrot M0 公共契约 v1
 
-本目录是四个工作包的协作入口。设计依据为[飞书任务划分及内部接口](https://d5abb0zl2u.feishu.cn/wiki/HtHXw15Ayiq6X3kPPlncc3pTnqd)（2026-11-10 读取，revision 220）。M0 是进程内 Python 接口，不是 HTTP 服务。
+本目录记录 Carrot 四个工作包的协作接口。M0 契约采用进程内 Python 接口。[飞书任务划分及内部接口](https://d5abb0zl2u.feishu.cn/wiki/HtHXw15Ayiq6X3kPPlncc3pTnqd)（2026-11-10 读取，revision 220）
 
 - [类型与所有权](interfaces.md)：每个模块接收什么、产生什么、谁负责替换。
 - [观察、证据与纠正](observation.md)覆盖采样、估计、TTL 和有效状态。

@@ -31,7 +31,8 @@ def main(argv=None) -> int:
     terminal.add_argument("--share-activity", action=argparse.BooleanOptionalAction,
                           help="allow System 2 to receive published activity summaries")
     terminal.add_argument("--share-images", action=argparse.BooleanOptionalAction,
-                          help="allow Observation vision to receive approved screenshots")
+                          help="allow the selected Observation recipient to receive screenshots in the profile's "
+                               "capture scope, including raw images when that scope is enabled")
     args = parser.parse_args(argv)
     if args.terminal and not args.configure_models:
         parser.error("--terminal requires --configure-models")

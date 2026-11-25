@@ -1,7 +1,7 @@
 import pytest
 
-from deskpet import model_setup
-from deskpet.observation_v2.routes import BAILIAN_BASE_URL, SYSTEM2, VISION, CloudRoute
+from deskpet import desktop_profile, model_setup
+from deskpet.observation_v2.routes import BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, SYSTEM2, VISION, CloudRoute
 from deskpet.settings import SettingsStore
 
 
@@ -205,3 +205,44 @@ def test_terminal_and_gui_read_each_others_changes_to_the_same_profile(qt_app, t
         "System 2 model [tool-v2]: ",
     ]
     assert stored_keys == ["synthetic-tool-key", "synthetic-vision-key"]
+
+
+def test_gui_setup_from_fresh_macos_profile_explains_raw_scope_without_granting_it(qt_app, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QDialog, QLabel
+
+    from deskpet.__main__ import main
+    from deskpet.c_ui import model_setup as ui
+    from deskpet.c_ui.settings import _RouteEditor
+
+    monkeypatch.setattr(desktop_profile, "platform", "darwin")
+    monkeypatch.setattr(desktop_profile, "_all_displays_available", lambda: True)
+
+    def open_dialog(dialog):
+        prefs = SettingsStore.read_at(dialog.routes.path)
+        notice = dialog.findChild(QLabel, "model-setup-raw-screen-scope")
+        assert (notice is not None) == (prefs.observation_screen_scope == "all_displays_unfiltered")
+        if notice is not None:
+            assert "原始画面" in notice.text() and "无痕窗口" in notice.text()
+        assert not dialog.forms[VISION].permission.isChecked()
+        assert not dialog.routes.snapshot(VISION).permission
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(ui.ModelSetupDialog, "exec", open_dialog)
+    command = ["--configure-models", "--data-dir", str(tmp_path)]
+    assert main(command) == 0
+    store = SettingsStore(tmp_path / "business.sqlite3")
+    prefs = store.read()
+    assert prefs.observation_screenshots and prefs.observation_screen_scope == "all_displays_unfiltered"
+    store.routes.configure(VISION, CloudRoute(
+        "openai_compatible", BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, "Test provider",
+    ))
+    editor = _RouteEditor(store.routes, VISION, None)
+    prompts = []
+    monkeypatch.setattr(editor, "_confirm_permission", lambda title, message: prompts.append(message) or False)
+    editor.permission.click()
+    assert "原始画面" in prompts[-1] and not store.routes.snapshot(VISION).permission
+
+    store.update(expected_version=prefs.version, observation_screen_scope="foreground_window")
+    assert main(command) == 0
+    editor.permission.click()
+    assert "原始画面" not in prompts[-1] and not store.routes.snapshot(VISION).permission

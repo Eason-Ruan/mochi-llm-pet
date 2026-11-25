@@ -130,7 +130,7 @@ class SettingsStore:
     """Use the business database for preferences and habit transition checks."""
 
     def __init__(self, path: str | Path, *, user_scope: str = "default",
-                 initial_input_mode: str = "typing"):
+                 initial_input_mode: str = "typing", initial_settings: Settings | None = None):
         if not isinstance(user_scope, str) or not user_scope.strip():
             raise ValueError("A user scope is required")
         self.path = Path(path).expanduser().resolve()
@@ -139,6 +139,10 @@ class SettingsStore:
         descriptor = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(descriptor)
         with self._write() as db:
+            # Standalone route setup can leave prior sharing grants in a database without a preferences row.
+            initial = initial_settings
+            if initial is not None and db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone():
+                initial = None
             db.execute("""
                 CREATE TABLE IF NOT EXISTS pet_settings_schema (
                     id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL
@@ -158,7 +162,8 @@ class SettingsStore:
                     PRIMARY KEY (user_scope, habit_id)
                 )
             """)
-            initial = Settings(input_mode=initial_input_mode if initial_input_mode in {"voice", "typing"} else "typing")
+            if initial is None:
+                initial = Settings(input_mode=initial_input_mode if initial_input_mode in {"voice", "typing"} else "typing")
             db.execute("INSERT OR IGNORE INTO pet_settings VALUES (?, ?)",
                        (self.user_scope, initial.model_dump_json()))
 

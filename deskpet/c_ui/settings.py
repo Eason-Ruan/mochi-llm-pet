@@ -17,9 +17,9 @@ from PyQt6.QtWidgets import (
 
 from deskpet.observation_v2.routes import BAILIAN, BAILIAN_BASE_URL, BAILIAN_MODEL, OFFICIAL_BASE_URL, SYSTEM2, VISION
 from deskpet.perception.macos import screen_recording_access
-from deskpet.settings import Habit, HabitBehavior, Settings, SettingsConflict
+from deskpet.settings import Habit, HabitBehavior, Settings, SettingsConflict, SettingsStore
 
-from .model_setup import ModelSetupDialog
+from .model_setup import RAW_SCREEN_SCOPE_NOTICE, ModelSetupDialog
 from .refine_style import (
     DETAIL_CONTROL_STYLE, MUTED, MenuField, Toggle, _CONTROL_STYLE, _Panel, _card, _scroll_area, _text, _title, stepper,
 )
@@ -905,6 +905,14 @@ class _RouteEditor(QDialog):
             message = f"允许向 {route.display_name} ({route.base_url}) {data}？"
             if self.role == "system2":
                 message += "\n文档名按「文档名权限」中的云端来源设置共享。"
+            elif self.role == VISION:
+                try:
+                    prefs = SettingsStore.read_at(self.routes.path, user_scope=self.routes.user_scope)
+                except (OSError, ValueError, sqlite3.Error):
+                    self.error.setText("无法读取当前截图范围，请重新打开设置后再操作。")
+                    return
+                if prefs.observation_screen_scope == "all_displays_unfiltered":
+                    message += "\n" + RAW_SCREEN_SCOPE_NOTICE
             if not self._confirm_permission(f"{name}授权", message):
                 return
         try:

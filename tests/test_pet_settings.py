@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import sqlite3
 from threading import Event
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +43,62 @@ def test_default_privacy_and_settings_compare_and_swap(tmp_path):
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert sum(pool.map(save, [1200, 2400])) == 1
     assert SettingsStore(path).read().version == 2
+
+
+@pytest.mark.parametrize("platform,version,has_capture_api,scope", [
+    ("darwin", "14.2", True, "all_displays_unfiltered"),
+    ("darwin", "14.1.2", True, "foreground_window"),
+    ("darwin", "15.1", False, "foreground_window"),
+    ("darwin", "", True, "foreground_window"),
+    ("win32", "", False, "foreground_window"),
+])
+def test_desktop_defaults_initialize_only_new_profiles(tmp_path, monkeypatch, platform, version, has_capture_api, scope):
+    from deskpet import desktop_profile
+    from deskpet.observation_v2.routes import STATE, SYSTEM2, VISION
+
+    monkeypatch.setattr(desktop_profile, "platform", platform)
+    monkeypatch.setattr(desktop_profile, "mac_ver", lambda: (version, (), ""))
+    manager = SimpleNamespace(captureImageWithFilter_configuration_completionHandler_=object())
+    monkeypatch.setitem(sys.modules, "ScreenCaptureKit", SimpleNamespace(SCScreenshotManager=manager)
+                        if has_capture_api else None)
+
+    desktop = desktop_profile.desktop_settings_store(tmp_path)
+    expected = Settings(
+        default_focus_s=900, auto_adjust=True, allow_system_notifications=True, lock_screen_detail=True,
+        observation_screenshots=True, observation_screen_scope=scope,
+    ) if platform == "darwin" else Settings()
+    assert desktop.read() == SettingsStore.read_at(desktop.path) == expected
+    for role in (SYSTEM2, VISION, STATE):
+        route = desktop.routes.snapshot(role)
+        assert route.route is None and not route.permission and not route.vision_signals_permission
+        assert route.route_generation == route.consent_generation == 0 and not route.verified
+    assert not (tmp_path / "observation.sqlite3").exists()
+
+    existing_dir = tmp_path / "existing"
+    existing = SettingsStore(existing_dir / "business.sqlite3")
+    assert desktop_profile.desktop_settings_store(existing_dir).read() == Settings()
+    saved = existing.update(expected_version=0, default_focus_s=1350, lock_screen_detail=False,
+                            observation_excluded_apps=("private editor",))
+    assert desktop_profile.desktop_settings_store(existing_dir).read() == saved
+
+
+def test_desktop_setup_preserves_the_scope_of_standalone_observation_consent(tmp_path, monkeypatch):
+    from deskpet import desktop_profile
+    from deskpet.observation_v2.routes import BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, VISION
+    from deskpet.observation_v2.routes import CloudRoute, ObservationCloudSettings
+
+    monkeypatch.setattr(desktop_profile, "platform", "darwin")
+    monkeypatch.setattr(desktop_profile, "_all_displays_available", lambda: True)
+    routes = ObservationCloudSettings(tmp_path / "business.sqlite3")
+    configured = routes.configure(VISION, CloudRoute(
+        "openai_compatible", BAILIAN_BASE_URL, BAILIAN_OBSERVATION_MODEL, "Test provider",
+    ))
+    allowed = routes.set_permission(VISION, True, expected=configured)
+    verified = routes.record_result(allowed, probe=True)
+
+    desktop = desktop_profile.desktop_settings_store(tmp_path)
+    assert desktop.read() == Settings()
+    assert desktop.routes.snapshot(VISION) == verified
 
 
 def test_legacy_screenshot_scope_defaults_to_foreground_and_scope_changes_advance_generation(tmp_path):

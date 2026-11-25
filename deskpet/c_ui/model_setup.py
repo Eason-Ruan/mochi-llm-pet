@@ -12,6 +12,7 @@ from deskpet.model_setup import (
     model_setup_defaults, verify_models,
 )
 from deskpet.observation_v2.routes import SYSTEM2, VISION, _normalize_base_url
+from deskpet.settings import SettingsStore
 
 from .refine_style import MUTED, _CONTROL_STYLE, _card, _text
 
@@ -25,6 +26,10 @@ _PROBE_STATUS = {
     "permission_required": "连接已保存。授权截图后可验证识图能力。",
     "failed": "连接已保存，验证未通过。请核对 API Base URL、API Key 和模型权限。",
 }
+RAW_SCREEN_SCOPE_NOTICE = (
+    "当前截图范围为所有显示器的原始画面。获准并验证的阿里云百炼通义千问可接收画面，"
+    "其中可能包含排除列表中的应用、域名和无痕窗口。"
+)
 
 
 def _endpoint_identity(base_url):
@@ -35,7 +40,7 @@ def _endpoint_identity(base_url):
 
 
 class _ModelRoleForm:
-    def __init__(self, role, snapshot):
+    def __init__(self, role, snapshot, *, unfiltered_desktop=False):
         self.snapshot = snapshot
         self._permission = None
         label, permission = _LABELS[role]
@@ -68,6 +73,10 @@ class _ModelRoleForm:
         self.permission = QCheckBox(permission)
         self.permission.setObjectName(f"model-setup-permission-{role}")
         fields.addWidget(self.permission)
+        if unfiltered_desktop:
+            scope_notice = _text(RAW_SCREEN_SCOPE_NOTICE, size=11, color=MUTED, wrap=True)
+            scope_notice.setObjectName("model-setup-raw-screen-scope")
+            fields.addWidget(scope_notice)
         self.status = _text(size=11, color=MUTED, wrap=True)
         self.status.setObjectName(f"model-setup-status-{role}")
         body.addWidget(self.fields)
@@ -162,9 +171,13 @@ class ModelSetupDialog(QDialog):
         body = QVBoxLayout(self)
         body.addWidget(_text("勾选要保存和验证的模型连接。", size=11, color=MUTED, wrap=True))
 
+        preferences = SettingsStore.read_at(routes.path, user_scope=routes.user_scope)
         self.forms = {}
         for role in MODEL_ROLES:
-            form = _ModelRoleForm(role, self._snapshots[role])
+            form = _ModelRoleForm(
+                role, self._snapshots[role],
+                unfiltered_desktop=role == VISION and preferences.observation_screen_scope == "all_displays_unfiltered",
+            )
             self.forms[role] = form
             self.finished.connect(form.key.clear)
             form.selected.toggled.connect(self._update_save_button)

@@ -27,6 +27,9 @@ htmlcov/
 # ---- DeskPet runtime ------------------------------------------------------
 # Local user config — may contain API keys. Ship config.example.toml instead.
 config.toml
+.env
+.env.*
+!.env.example
 
 # Persisted pet memory / state (per-machine, not source)
 *.db
